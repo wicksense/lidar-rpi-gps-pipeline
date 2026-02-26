@@ -37,12 +37,17 @@ GPS-to-Ouster wiring reference:
 
 ## Requirements
 
+Use a separate virtual environment on each machine (Pi and offline workstation/server).
+
 ## Raspberry Pi capture environment
 
-Python packages:
+Create and activate a venv on the Pi:
 
 ```bash
-pip install pandas numpy pyproj pynmea2 pyserial
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install pandas numpy pyproj pynmea2 pyserial
 ```
 
 Runtime dependency:
@@ -50,10 +55,13 @@ Runtime dependency:
 
 ## Offline fusion environment
 
-Python packages:
+Create and activate a venv on the offline machine:
 
 ```bash
-pip install numpy pandas pyproj laspy ouster-sdk
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install numpy pandas pyproj laspy ouster-sdk
 ```
 
 Note:
