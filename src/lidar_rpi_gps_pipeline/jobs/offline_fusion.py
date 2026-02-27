@@ -7,6 +7,8 @@ import argparse
 import glob
 import json
 import os
+import shutil
+import tempfile
 from io import StringIO
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -371,6 +373,32 @@ def _extract_first_scan(item: Any) -> Any:
     return None
 
 
+def _scan_has_range_field(scan: Any, ChanField: Any) -> bool:
+    try:
+        if ChanField.RANGE in scan.fields:
+            return True
+    except Exception:
+        pass
+    try:
+        field_names = {str(f) for f in scan.fields}
+        if "RANGE" in field_names or "ChanField.RANGE" in field_names:
+            return True
+    except Exception:
+        pass
+    try:
+        scan.field("RANGE")
+        return True
+    except Exception:
+        return False
+
+
+def _scan_get_range_field(scan: Any, ChanField: Any) -> Any:
+    try:
+        return scan.field(ChanField.RANGE)
+    except Exception:
+        return scan.field("RANGE")
+
+
 def _resolve_output_las_path(
     args: argparse.Namespace,
     *,
@@ -481,7 +509,7 @@ def _extract_scan_arrays(
     ChanField: Any,
     destagger: Any,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    range_img = scan.field(ChanField.RANGE)
+    range_img = _scan_get_range_field(scan, ChanField)
     timestamps = np.tile(np.asarray(scan.timestamp, dtype=np.int64), (scan.h, 1))
     xyz = xyzlut(range_img)
 
@@ -596,6 +624,105 @@ def _rotation_deg(rotation: np.ndarray) -> float:
     return float(np.degrees(np.arctan2(rotation[1, 0], rotation[0, 0])))
 
 
+def _parse_xyz_weights(weights: str) -> np.ndarray:
+    parts = [p for p in weights.replace(" ", "").split(",") if p]
+    if len(parts) != 3:
+        raise ValueError("Expected 3 comma-separated weights, e.g. 0.01,0.01,0.001")
+    values = np.asarray([float(p) for p in parts], dtype=np.float64)
+    if np.any(values < 0):
+        raise ValueError("All weights must be non-negative.")
+    return values
+
+
+def _build_point_cloud_from_osf(
+    osf_path: str,
+    *,
+    min_range: float,
+    max_range: float,
+    map_voxel_size: float,
+    emit_event: EventEmitter,
+    should_cancel: CancelChecker,
+) -> np.ndarray:
+    """
+    Build a global point cloud from OSF scans using per-column poses.
+    """
+    try:
+        from ouster.sdk import open_source
+        from ouster.sdk.core import ChanField, XYZLut, dewarp, voxel_downsample
+    except Exception as e:
+        raise ValueError("ouster-sdk core modules are required for OSF map extraction.") from e
+
+    source = None
+    try:
+        source = open_source(osf_path, sensor_idx=0, collate=False)
+        info = _extract_first_sensor_info(source)
+        xyzlut = XYZLut(info, use_extrinsics=True)
+
+        downsample_size = float(map_voxel_size)
+        points_accum = np.zeros((0, 3), dtype=np.float64)
+        pending_batches: List[np.ndarray] = []
+        scans_seen = 0
+
+        def flush_batches() -> None:
+            nonlocal points_accum, pending_batches
+            if not pending_batches:
+                return
+            merged = np.concatenate(pending_batches, axis=0)
+            pending_batches = []
+            if points_accum.size == 0:
+                points_accum = merged
+            else:
+                points_accum = np.concatenate([points_accum, merged], axis=0)
+            if downsample_size > 0 and points_accum.shape[0] > 0:
+                points_accum, _ = voxel_downsample(
+                    downsample_size,
+                    points_accum,
+                    np.zeros((points_accum.shape[0], 0), dtype=np.float64),
+                )
+
+        for item in source:
+            _check_cancel(should_cancel)
+            scans_seen += 1
+            scan = _extract_first_scan(item)
+            if scan is None:
+                continue
+            if not _scan_has_range_field(scan, ChanField):
+                continue
+
+            ranges = _scan_get_range_field(scan, ChanField)
+            ranges_m = np.asarray(ranges, dtype=np.float64) * 0.001
+            points = xyzlut(scan)
+            points_global = dewarp(points, scan.pose)
+
+            valid = ranges > 0
+            if min_range > 0:
+                valid = valid & (ranges_m >= min_range)
+            if max_range > 0:
+                valid = valid & (ranges_m <= max_range)
+
+            selected = points_global[valid]
+            if selected.size == 0:
+                continue
+            pending_batches.append(np.asarray(selected, dtype=np.float64))
+
+            if scans_seen % 20 == 0:
+                flush_batches()
+                _emit(
+                    emit_event,
+                    "scan_progress",
+                    scan_index=scans_seen,
+                    total_scans=scans_seen,
+                    total_points=int(points_accum.shape[0]),
+                )
+
+        flush_batches()
+        return points_accum
+    finally:
+        close_fn = getattr(source, "close", None)
+        if callable(close_fn):
+            close_fn()
+
+
 def fuse_raw_to_single_las(
     raw_paths: List[str],
     gps_df: pd.DataFrame,
@@ -660,7 +787,7 @@ def fuse_raw_to_single_las(
                     scan = _extract_first_scan(item)
                     if scan is None:
                         continue
-                    if ChanField.RANGE not in scan.fields:
+                    if not _scan_has_range_field(scan, ChanField):
                         continue
 
                     timestamp_ns, x_local, y_local, z_local = _extract_scan_arrays(
@@ -1111,6 +1238,275 @@ def slam_raw_to_gps_anchored_las(
         raise
 
 
+def slam_raw_to_gps_anchored_las_pose_optimizer(
+    raw_paths: List[str],
+    gps_df: pd.DataFrame,
+    gps_time_col: str,
+    output_las: str,
+    *,
+    time_mode: str,
+    utm_epsg: int,
+    voxel_size: float,
+    min_range: float,
+    max_range: float,
+    deskew_method: str,
+    anchor_min_motion_m: float,
+    anchor_z_mode: str,
+    poseopt_key_frame_distance: float,
+    poseopt_constraints_every_m: float,
+    poseopt_constraint_weights: str,
+    poseopt_max_iterations: int,
+    poseopt_map_voxel_size: float,
+    emit_event: EventEmitter,
+    should_cancel: CancelChecker,
+) -> Dict[str, Any]:
+    """
+    Run SLAM, optimize trajectory with GPS absolute constraints, then export anchored LAS.
+    """
+    try:
+        from ouster.sdk.mapping import (
+            AbsolutePoseConstraint,
+            PoseOptimizer,
+            SamplingMode,
+            SlamConfig,
+            SlamEngine,
+            SolverConfig,
+        )
+        from ouster.sdk.osf import Writer
+    except Exception as e:
+        raise ValueError(
+            "ouster-sdk mapping/osf bindings are required for pose optimizer anchoring."
+        ) from e
+
+    if min_range < 0 or max_range <= 0:
+        raise ValueError("SLAM min/max range must be positive.")
+    if min_range >= max_range:
+        raise ValueError("SLAM min_range must be smaller than max_range.")
+    if voxel_size < 0:
+        raise ValueError("SLAM voxel_size cannot be negative.")
+    if poseopt_constraints_every_m <= 0:
+        raise ValueError("poseopt_constraints_every_m must be > 0.")
+    if poseopt_key_frame_distance <= 0:
+        raise ValueError("poseopt_key_frame_distance must be > 0.")
+    if poseopt_max_iterations <= 0:
+        raise ValueError("poseopt_max_iterations must be > 0.")
+    if anchor_min_motion_m < 0:
+        raise ValueError("anchor_min_motion_m cannot be negative.")
+
+    weights = _parse_xyz_weights(poseopt_constraint_weights)
+
+    gps_t_raw = gps_df[gps_time_col].to_numpy(dtype=np.int64)
+    gps_e = gps_df["easting"].to_numpy(dtype=np.float64)
+    gps_n = gps_df["northing"].to_numpy(dtype=np.float64)
+    gps_z = gps_df["altitude_m"].to_numpy(dtype=np.float64)
+
+    temp_dir = tempfile.mkdtemp(prefix="lidar_poseopt_")
+    osf_initial = os.path.join(temp_dir, "slam_initial.osf")
+    osf_optimized = os.path.join(temp_dir, "slam_optimized.osf")
+    tmp_output = output_las + ".partial"
+    if os.path.exists(tmp_output):
+        os.remove(tmp_output)
+
+    slam_engine = None
+    total_scans = 0
+    constraints_added = 0
+    chosen_time_mode = "auto"
+    final_cost = None
+    writer = None
+
+    try:
+        for file_idx, raw_path in enumerate(raw_paths, start=1):
+            _check_cancel(should_cancel)
+            if not os.path.isfile(raw_path):
+                raise ValueError(f"Raw LiDAR file does not exist: {raw_path}")
+
+            _emit(
+                emit_event,
+                "file_started",
+                file_index=file_idx,
+                file_total=len(raw_paths),
+                path=raw_path,
+            )
+            log(f"Processing raw LiDAR for SLAM+GPS pose optimization: {raw_path}")
+
+            source = None
+            try:
+                source = _open_raw_source(raw_path)
+                if slam_engine is None:
+                    config = SlamConfig()
+                    config.backend = "kiss"
+                    config.deskew_method = deskew_method
+                    config.min_range = float(min_range)
+                    config.max_range = float(max_range)
+                    config.voxel_size = float(voxel_size)
+                    slam_engine = SlamEngine(infos=_source_infos(source), config=config)
+                    writer = Writer(osf_initial, _source_infos(source))
+                    _emit(
+                        emit_event,
+                        "status",
+                        message=(
+                            "SLAM configured "
+                            f"(voxel={config.voxel_size}, min={config.min_range}, "
+                            f"max={config.max_range}, deskew={config.deskew_method})"
+                        ),
+                    )
+
+                for scan_idx, scans in enumerate(source, start=1):
+                    _check_cancel(should_cancel)
+                    assert slam_engine is not None
+                    updated = slam_engine.update(scans)
+                    assert writer is not None
+                    writer.save(updated)
+                    total_scans += 1
+
+                    if scan_idx % 10 == 0:
+                        _emit(
+                            emit_event,
+                            "scan_progress",
+                            file_index=file_idx,
+                            file_total=len(raw_paths),
+                            scan_index=scan_idx,
+                            total_scans=total_scans,
+                        )
+
+                _emit(
+                    emit_event,
+                    "file_completed",
+                    file_index=file_idx,
+                    file_total=len(raw_paths),
+                    path=raw_path,
+                    total_scans=total_scans,
+                )
+            finally:
+                close_fn = getattr(source, "close", None)
+                if callable(close_fn):
+                    close_fn()
+
+        if writer is not None:
+            writer.close()
+
+        if total_scans == 0:
+            raise ValueError("No scans processed for SLAM map generation.")
+
+        _emit(emit_event, "status", message="Running pose optimization with GPS constraints...")
+
+        solver = SolverConfig()
+        solver.key_frame_distance = float(poseopt_key_frame_distance)
+        solver.fix_first_node = False
+        solver.process_printout = False
+        solver.max_num_iterations = int(poseopt_max_iterations)
+        po = PoseOptimizer(osf_initial, solver)
+
+        ts_cols = np.asarray(po.get_timestamps(SamplingMode.COLUMNS), dtype=np.int64)
+        poses_cols = np.asarray(po.get_poses(SamplingMode.COLUMNS), dtype=np.float64)
+        if ts_cols.size < 2:
+            raise ValueError("Pose optimizer trajectory has insufficient samples.")
+
+        slam_t, gps_t, chosen_time_mode = choose_time_mode(ts_cols, gps_t_raw, time_mode)
+        gps_x_interp = np.interp(slam_t, gps_t, gps_e)
+        gps_y_interp = np.interp(slam_t, gps_t, gps_n)
+        gps_z_interp = np.interp(slam_t, gps_t, gps_z)
+
+        local_xy = poses_cols[:, :2, 3]
+        last_xy = None
+        dist_since = float("inf")
+        for idx in range(len(ts_cols)):
+            xy = local_xy[idx]
+            if last_xy is not None:
+                dist_since += float(np.linalg.norm(xy - last_xy))
+            last_xy = xy
+            if constraints_added > 0 and dist_since < poseopt_constraints_every_m:
+                continue
+
+            pose = np.eye(4, dtype=np.float64)
+            pose[0, 3] = float(gps_x_interp[idx])
+            pose[1, 3] = float(gps_y_interp[idx])
+            if anchor_z_mode == "offset":
+                pose[2, 3] = float(gps_z_interp[idx])
+                w = weights
+            else:
+                w = np.array([weights[0], weights[1], 0.0], dtype=np.float64)
+
+            constraint = AbsolutePoseConstraint(
+                timestamp=np.uint64(ts_cols[idx]),
+                pose=pose,
+                rotation_weight=0.0,
+                translation_weight=w,
+            )
+            po.add_constraint(constraint)
+            constraints_added += 1
+            dist_since = 0.0
+
+        if constraints_added == 0:
+            raise ValueError("No GPS constraints were added for pose optimization.")
+
+        aligned = bool(po.initialize_trajectory_alignment())
+        _emit(
+            emit_event,
+            "status",
+            message=f"Pose optimizer constraints added: {constraints_added} (aligned={aligned})",
+        )
+
+        po.solve(int(poseopt_max_iterations))
+        final_cost = float(po.get_cost_value())
+        po.save(osf_optimized)
+
+        _emit(emit_event, "status", message="Extracting point cloud from optimized trajectory...")
+        map_points = _build_point_cloud_from_osf(
+            osf_optimized,
+            min_range=min_range,
+            max_range=max_range,
+            map_voxel_size=poseopt_map_voxel_size,
+            emit_event=emit_event,
+            should_cancel=should_cancel,
+        )
+        if map_points.size == 0:
+            raise ValueError("Optimized point cloud is empty.")
+
+        header = _new_las_header(
+            utm_epsg,
+            map_points[:, 0].min(),
+            map_points[:, 1].min(),
+            map_points[:, 2].min(),
+        )
+        las = laspy.LasData(header)
+        las.x = map_points[:, 0]
+        las.y = map_points[:, 1]
+        las.z = map_points[:, 2]
+        las.write(tmp_output)
+        os.replace(tmp_output, output_las)
+
+        _emit(emit_event, "status", message=f"Done. Final anchored LAS: {output_las}")
+        log(f"Done. Final anchored LAS: {output_las}")
+        return {
+            "mode": "slam_gps_anchor",
+            "anchor_backend": "pose_optimizer",
+            "output_las": output_las,
+            "raw_files": len(raw_paths),
+            "total_scans": total_scans,
+            "total_points": int(map_points.shape[0]),
+            "time_mode_used": chosen_time_mode,
+            "constraints_added": int(constraints_added),
+            "poseopt_cost": final_cost,
+            "slam_voxel_size": float(voxel_size),
+            "slam_min_range": float(min_range),
+            "slam_max_range": float(max_range),
+            "slam_deskew_method": deskew_method,
+        }
+    except Exception:
+        if os.path.exists(tmp_output):
+            os.remove(tmp_output)
+        raise
+    finally:
+        close_writer = getattr(writer, "close", None)
+        if callable(close_writer):
+            try:
+                close_writer()
+            except Exception:
+                pass
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
 def fuse_one_csv_chunk(
     lidar_csv: str,
     gps_df: pd.DataFrame,
@@ -1331,6 +1727,41 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="offset",
         help="How to anchor Z for SLAM+GPS mode.",
     )
+    parser.add_argument(
+        "--anchor-backend",
+        choices=["pose_optimizer", "rigid_fit"],
+        default="pose_optimizer",
+        help="Backend used for SLAM+GPS anchoring.",
+    )
+    parser.add_argument(
+        "--poseopt-key-frame-distance",
+        type=float,
+        default=1.0,
+        help="Pose optimizer key frame distance (meters).",
+    )
+    parser.add_argument(
+        "--poseopt-constraints-every-m",
+        type=float,
+        default=10.0,
+        help="Add GPS absolute constraints approximately every N meters.",
+    )
+    parser.add_argument(
+        "--poseopt-constraint-weights",
+        default="0.01,0.01,0.001",
+        help="GPS absolute constraint translation weights as WX,WY,WZ.",
+    )
+    parser.add_argument(
+        "--poseopt-max-iterations",
+        type=int,
+        default=50,
+        help="Maximum pose optimizer iterations.",
+    )
+    parser.add_argument(
+        "--poseopt-map-voxel-size",
+        type=float,
+        default=0.5,
+        help="Voxel size for downsampling optimized map before LAS export (0 disables).",
+    )
     return parser
 
 
@@ -1452,22 +1883,76 @@ def run_from_args(
         )
         _emit(emit_event, "status", message=f"Output LAS: {output_las}")
 
-        summary = slam_raw_to_gps_anchored_las(
-            raw_paths=raw_paths,
-            gps_df=gps_df,
-            gps_time_col=gps_time_col,
-            output_las=output_las,
-            time_mode=args.time_mode,
-            utm_epsg=args.utm_epsg,
-            voxel_size=args.slam_voxel_size,
-            min_range=args.slam_min_range,
-            max_range=args.slam_max_range,
-            deskew_method=args.slam_deskew_method,
-            anchor_min_motion_m=args.anchor_min_motion_m,
-            anchor_z_mode=args.anchor_z_mode,
-            emit_event=emit_event,
-            should_cancel=should_cancel,
-        )
+        if args.anchor_backend == "pose_optimizer":
+            try:
+                summary = slam_raw_to_gps_anchored_las_pose_optimizer(
+                    raw_paths=raw_paths,
+                    gps_df=gps_df,
+                    gps_time_col=gps_time_col,
+                    output_las=output_las,
+                    time_mode=args.time_mode,
+                    utm_epsg=args.utm_epsg,
+                    voxel_size=args.slam_voxel_size,
+                    min_range=args.slam_min_range,
+                    max_range=args.slam_max_range,
+                    deskew_method=args.slam_deskew_method,
+                    anchor_min_motion_m=args.anchor_min_motion_m,
+                    anchor_z_mode=args.anchor_z_mode,
+                    poseopt_key_frame_distance=args.poseopt_key_frame_distance,
+                    poseopt_constraints_every_m=args.poseopt_constraints_every_m,
+                    poseopt_constraint_weights=args.poseopt_constraint_weights,
+                    poseopt_max_iterations=args.poseopt_max_iterations,
+                    poseopt_map_voxel_size=args.poseopt_map_voxel_size,
+                    emit_event=emit_event,
+                    should_cancel=should_cancel,
+                )
+            except JobCancelledError:
+                raise
+            except Exception as e:
+                _emit(
+                    emit_event,
+                    "status",
+                    message=(
+                        "Pose optimizer anchoring failed; falling back to rigid-fit anchoring. "
+                        f"Reason: {e}"
+                    ),
+                )
+                summary = slam_raw_to_gps_anchored_las(
+                    raw_paths=raw_paths,
+                    gps_df=gps_df,
+                    gps_time_col=gps_time_col,
+                    output_las=output_las,
+                    time_mode=args.time_mode,
+                    utm_epsg=args.utm_epsg,
+                    voxel_size=args.slam_voxel_size,
+                    min_range=args.slam_min_range,
+                    max_range=args.slam_max_range,
+                    deskew_method=args.slam_deskew_method,
+                    anchor_min_motion_m=args.anchor_min_motion_m,
+                    anchor_z_mode=args.anchor_z_mode,
+                    emit_event=emit_event,
+                    should_cancel=should_cancel,
+                )
+                summary["anchor_backend"] = "rigid_fit_fallback"
+        else:
+            summary = slam_raw_to_gps_anchored_las(
+                raw_paths=raw_paths,
+                gps_df=gps_df,
+                gps_time_col=gps_time_col,
+                output_las=output_las,
+                time_mode=args.time_mode,
+                utm_epsg=args.utm_epsg,
+                voxel_size=args.slam_voxel_size,
+                min_range=args.slam_min_range,
+                max_range=args.slam_max_range,
+                deskew_method=args.slam_deskew_method,
+                anchor_min_motion_m=args.anchor_min_motion_m,
+                anchor_z_mode=args.anchor_z_mode,
+                emit_event=emit_event,
+                should_cancel=should_cancel,
+            )
+            summary["anchor_backend"] = "rigid_fit"
+
         summary["gps_samples"] = len(gps_df)
         return summary
 

@@ -120,6 +120,12 @@ class _BaseModeWidget(QWidget):
         self.anchor_min_motion.setDecimals(2)
         self.anchor_min_motion.setSingleStep(1.0)
         self.anchor_min_motion.setValue(5.0)
+        anchor_row.addWidget(QLabel("Backend"))
+        self.anchor_backend = QComboBox()
+        self.anchor_backend.addItem("pose_optimizer (recommended)", "pose_optimizer")
+        self.anchor_backend.addItem("rigid_fit", "rigid_fit")
+        anchor_row.addWidget(self.anchor_backend)
+
         anchor_row.addWidget(QLabel("Min motion (m)"))
         anchor_row.addWidget(self.anchor_min_motion)
 
@@ -127,6 +133,22 @@ class _BaseModeWidget(QWidget):
         self.anchor_z_mode.addItems(["offset", "none"])
         anchor_row.addWidget(QLabel("Z anchor"))
         anchor_row.addWidget(self.anchor_z_mode)
+
+        self.poseopt_constraints_every_m = QDoubleSpinBox()
+        self.poseopt_constraints_every_m.setRange(0.1, 10000.0)
+        self.poseopt_constraints_every_m.setDecimals(2)
+        self.poseopt_constraints_every_m.setSingleStep(1.0)
+        self.poseopt_constraints_every_m.setValue(10.0)
+        anchor_row.addWidget(QLabel("Constraints every (m)"))
+        anchor_row.addWidget(self.poseopt_constraints_every_m)
+
+        self.poseopt_map_voxel_size = QDoubleSpinBox()
+        self.poseopt_map_voxel_size.setRange(0.0, 20.0)
+        self.poseopt_map_voxel_size.setDecimals(3)
+        self.poseopt_map_voxel_size.setSingleStep(0.1)
+        self.poseopt_map_voxel_size.setValue(0.5)
+        anchor_row.addWidget(QLabel("Map voxel (m)"))
+        anchor_row.addWidget(self.poseopt_map_voxel_size)
         anchor_row.addStretch()
         anchor_container = QWidget()
         anchor_container.setLayout(anchor_row)
@@ -221,6 +243,9 @@ class _BaseModeWidget(QWidget):
         anchor_mode = mode == "slam_gps_anchor"
         self.anchor_min_motion.setEnabled(anchor_mode)
         self.anchor_z_mode.setEnabled(anchor_mode)
+        self.anchor_backend.setEnabled(anchor_mode)
+        self.poseopt_constraints_every_m.setEnabled(anchor_mode)
+        self.poseopt_map_voxel_size.setEnabled(anchor_mode)
 
     def _set_running_ui(self, running: bool) -> None:
         self.run_btn.setEnabled(not running)
@@ -388,6 +413,9 @@ class ManifestModeWidget(_BaseModeWidget):
             "slam_deskew_method": self.slam_deskew.currentText(),
             "anchor_min_motion_m": float(self.anchor_min_motion.value()),
             "anchor_z_mode": self.anchor_z_mode.currentText(),
+            "anchor_backend": str(self.anchor_backend.currentData()),
+            "poseopt_constraints_every_m": float(self.poseopt_constraints_every_m.value()),
+            "poseopt_map_voxel_size": float(self.poseopt_map_voxel_size.value()),
         }
 
         if mode in {"gps_fusion", "slam_gps_anchor"}:
@@ -442,6 +470,9 @@ class RawModeWidget(_BaseModeWidget):
             "slam_deskew_method": self.slam_deskew.currentText(),
             "anchor_min_motion_m": float(self.anchor_min_motion.value()),
             "anchor_z_mode": self.anchor_z_mode.currentText(),
+            "anchor_backend": str(self.anchor_backend.currentData()),
+            "poseopt_constraints_every_m": float(self.poseopt_constraints_every_m.value()),
+            "poseopt_map_voxel_size": float(self.poseopt_map_voxel_size.value()),
         }
 
         if gps_csv:

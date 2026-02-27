@@ -83,6 +83,7 @@ python3 offline_gui.py
 
 GUI notes:
 - Mode selector supports `SLAM + GPS Anchor`, `SLAM Map`, and `GPS Fusion`.
+- Anchor mode includes backend/options for constraint-based pose optimization.
 - Includes progress indicators while processing files/scans.
 - `Stop` asks for confirmation, cancels safely, and cleans partial LAS output.
 
@@ -184,6 +185,7 @@ python3 offline_fuse_lidar_gps.py \
 Useful anchoring parameters:
 - `--anchor-min-motion-m` (default `5.0`)
 - `--anchor-z-mode` (`offset` or `none`)
+- `--anchor-backend` (`pose_optimizer` recommended, `rigid_fit` fallback/simple)
 - `--time-mode` and `--gps-time-column` also apply in this mode
 ## 4) Manifest JSON (recommended for full sessions)
 
@@ -232,7 +234,8 @@ python3 offline_fuse_lidar_gps.py \
 
 - Raw/manifest mode writes one merged LAS file by default.
 - In `gps_fusion` mode, raw scans are processed in a streaming pipeline (memory stays bounded for long runs).
-- In `slam_gps_anchor` mode, SLAM trajectory is fit to GPS in XY (rigid) plus optional Z offset.
+- In `slam_gps_anchor` mode, default backend uses Ouster Pose Optimizer with GPS absolute constraints.
+- `slam_gps_anchor` can fall back to rigid-fit anchoring when needed (`--anchor-backend rigid_fit`).
 - If output filename already exists, a numeric suffix is added automatically (`_2`, `_3`, ...).
 - Per-scan converted CSV files are not written unless you enable `--keep-converted`.
 - If `--keep-converted` is enabled, many debug CSV files can be created.
@@ -282,6 +285,12 @@ These options apply to `--processing-mode gps_fusion` and `--processing-mode sla
 
 - `--anchor-min-motion-m` default `5.0` (below this, translation-only anchoring is used)
 - `--anchor-z-mode` default `offset` (`none` keeps SLAM Z unchanged)
+- `--anchor-backend` default `pose_optimizer`
+- `--poseopt-key-frame-distance` default `1.0`
+- `--poseopt-constraints-every-m` default `10.0`
+- `--poseopt-constraint-weights` default `0.01,0.01,0.001`
+- `--poseopt-max-iterations` default `50`
+- `--poseopt-map-voxel-size` default `0.5` (`0` disables map downsampling)
 
 ## CRS / EPSG Notes
 
