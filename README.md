@@ -185,7 +185,7 @@ python3 offline_fuse_lidar_gps.py \
 Useful anchoring parameters:
 - `--anchor-min-motion-m` (default `5.0`)
 - `--anchor-z-mode` (`offset` or `none`)
-- `--anchor-backend` (`pose_optimizer` recommended, `rigid_fit` fallback/simple)
+- `--anchor-backend` (`pose_optimizer` recommended, `rigid_fit` optional simpler method)
 - `--time-mode` and `--gps-time-column` also apply in this mode
 ## 4) Manifest JSON (recommended for full sessions)
 
@@ -235,7 +235,8 @@ python3 offline_fuse_lidar_gps.py \
 - Raw/manifest mode writes one merged LAS file by default.
 - In `gps_fusion` mode, raw scans are processed in a streaming pipeline (memory stays bounded for long runs).
 - In `slam_gps_anchor` mode, default backend uses Ouster Pose Optimizer with GPS absolute constraints.
-- `slam_gps_anchor` can fall back to rigid-fit anchoring when needed (`--anchor-backend rigid_fit`).
+- `slam_gps_anchor` does not silently switch backends; if `pose_optimizer` fails, the run fails.
+- choose `--anchor-backend rigid_fit` explicitly if you want rigid anchoring.
 - If output filename already exists, a numeric suffix is added automatically (`_2`, `_3`, ...).
 - Per-scan converted CSV files are not written unless you enable `--keep-converted`.
 - If `--keep-converted` is enabled, many debug CSV files can be created.
@@ -245,6 +246,7 @@ python3 offline_fuse_lidar_gps.py \
 
 Default raw/manifest output:
 - one merged `.las` file (LAS 1.4)
+- one QA JSON report for `slam_gps_anchor`: `*_qa.json`
 
 Advanced CSV-input mode output:
 - per input LiDAR CSV: `... .csv` and `... .las`

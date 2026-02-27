@@ -634,93 +634,255 @@ def _parse_xyz_weights(weights: str) -> np.ndarray:
     return values
 
 
-def _build_point_cloud_from_osf(
-    osf_path: str,
+def _xy_path_length(xy: np.ndarray) -> float:
+    if xy.ndim != 2 or xy.shape[1] != 2 or xy.shape[0] < 2:
+        return 0.0
+    return float(np.linalg.norm(np.diff(xy, axis=0), axis=1).sum())
+
+
+def _compute_xy_alignment_metrics(reference_xy: np.ndarray, estimated_xy: np.ndarray) -> Dict[str, float]:
+    if reference_xy.shape != estimated_xy.shape:
+        raise ValueError("Alignment metrics require matched Nx2 arrays.")
+    if reference_xy.ndim != 2 or reference_xy.shape[1] != 2:
+        raise ValueError("Alignment metrics require matched Nx2 arrays.")
+    if reference_xy.shape[0] == 0:
+        raise ValueError("Alignment metrics require at least one sample.")
+
+    residual = np.linalg.norm(estimated_xy - reference_xy, axis=1)
+    return {
+        "samples": int(reference_xy.shape[0]),
+        "xy_mean_m": float(np.mean(residual)),
+        "xy_rmse_m": float(np.sqrt(np.mean(residual**2))),
+        "xy_median_m": float(np.median(residual)),
+        "xy_p95_m": float(np.percentile(residual, 95)),
+        "xy_max_m": float(np.max(residual)),
+        "reference_path_length_m": _xy_path_length(reference_xy),
+        "estimated_path_length_m": _xy_path_length(estimated_xy),
+        "reference_span_x_m": float(reference_xy[:, 0].max() - reference_xy[:, 0].min()),
+        "reference_span_y_m": float(reference_xy[:, 1].max() - reference_xy[:, 1].min()),
+        "estimated_span_x_m": float(estimated_xy[:, 0].max() - estimated_xy[:, 0].min()),
+        "estimated_span_y_m": float(estimated_xy[:, 1].max() - estimated_xy[:, 1].min()),
+    }
+
+
+def _qa_report_path(output_las: str) -> str:
+    root, _ext = os.path.splitext(output_las)
+    return root + "_qa.json"
+
+
+def _write_anchor_qa_report(
+    output_las: str,
     *,
+    backend: str,
+    time_mode_used: str,
+    metrics: Dict[str, float],
+    extra: Optional[Dict[str, Any]] = None,
+) -> Tuple[str, bool]:
+    thresholds = {
+        "xy_median_max_m": 5.0,
+        "xy_p95_max_m": 10.0,
+    }
+    passed = bool(
+        metrics.get("xy_median_m", float("inf")) <= thresholds["xy_median_max_m"]
+        and metrics.get("xy_p95_m", float("inf")) <= thresholds["xy_p95_max_m"]
+    )
+
+    report: Dict[str, Any] = {
+        "mode": "slam_gps_anchor",
+        "backend": backend,
+        "time_mode_used": time_mode_used,
+        "pass": passed,
+        "thresholds": thresholds,
+        "metrics": metrics,
+    }
+    if extra:
+        report["extra"] = extra
+
+    qa_path = _qa_report_path(output_las)
+    with open(qa_path, "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2, sort_keys=True)
+    return qa_path, passed
+
+
+def _lookup_pose_columns(
+    scan_timestamps_ns: np.ndarray,
+    pose_timestamps_ns: np.ndarray,
+    column_poses: np.ndarray,
+    *,
+    max_allowed_delta_ns: int = 100_000_000,
+) -> Tuple[np.ndarray, Dict[str, int]]:
+    if pose_timestamps_ns.ndim != 1 or pose_timestamps_ns.size == 0:
+        raise ValueError("Optimized pose timestamps are empty.")
+    if column_poses.ndim != 3 or column_poses.shape[1:] != (4, 4):
+        raise ValueError("Optimized column poses must be shaped Nx4x4.")
+    if column_poses.shape[0] != pose_timestamps_ns.shape[0]:
+        raise ValueError("Optimized pose timestamp count does not match pose matrix count.")
+
+    ts = np.asarray(scan_timestamps_ns, dtype=np.int64)
+    if ts.ndim != 1:
+        raise ValueError("Scan timestamps must be 1D.")
+    if ts.size == 0:
+        raise ValueError("Scan has no column timestamps.")
+
+    n = pose_timestamps_ns.shape[0]
+    valid = ts > 0
+
+    idx_right = np.searchsorted(pose_timestamps_ns, ts, side="left")
+    idx_right = np.clip(idx_right, 0, n - 1)
+    idx_left = np.clip(idx_right - 1, 0, n - 1)
+
+    delta_right = np.abs(pose_timestamps_ns[idx_right] - ts)
+    delta_left = np.abs(pose_timestamps_ns[idx_left] - ts)
+    use_right = delta_right < delta_left
+    idx = np.where(use_right, idx_right, idx_left)
+    delta = np.where(use_right, delta_right, delta_left)
+
+    exact = valid & (pose_timestamps_ns[idx_right] == ts)
+    valid_count = int(valid.sum())
+    if valid_count == 0:
+        idx[:] = 0
+        delta[:] = 0
+    else:
+        first_valid_idx = int(np.flatnonzero(valid)[0])
+        idx[~valid] = idx[first_valid_idx]
+        delta[~valid] = 0
+
+    max_delta_ns = int(delta[valid].max()) if valid_count else 0
+    if valid_count and max_delta_ns > max_allowed_delta_ns:
+        raise ValueError(
+            "Optimized pose lookup drift too large: "
+            f"max delta {max_delta_ns} ns exceeds allowed {max_allowed_delta_ns} ns."
+        )
+
+    stats = {
+        "columns": int(ts.size),
+        "valid_columns": valid_count,
+        "exact_columns": int(exact.sum()),
+        "nearest_columns": int(valid_count - int(exact.sum())),
+        "max_delta_ns": max_delta_ns,
+    }
+    return column_poses[idx], stats
+
+
+def _build_point_cloud_from_raw_with_poses(
+    raw_paths: List[str],
+    *,
+    pose_timestamps_ns: np.ndarray,
+    column_poses: np.ndarray,
     min_range: float,
     max_range: float,
     map_voxel_size: float,
     emit_event: EventEmitter,
     should_cancel: CancelChecker,
-) -> np.ndarray:
+) -> Tuple[np.ndarray, Dict[str, int]]:
     """
-    Build a global point cloud from OSF scans using per-column poses.
+    Build a global point cloud by replaying raw scans and dewarping with optimized poses.
     """
     try:
-        from ouster.sdk import open_source
         from ouster.sdk.core import ChanField, XYZLut, dewarp, voxel_downsample
     except Exception as e:
-        raise ValueError("ouster-sdk core modules are required for OSF map extraction.") from e
+        raise ValueError("ouster-sdk core modules are required for raw replay map extraction.") from e
 
-    source = None
-    try:
-        source = open_source(osf_path, sensor_idx=0, collate=False)
-        info = _extract_first_sensor_info(source)
-        xyzlut = XYZLut(info, use_extrinsics=True)
+    downsample_size = float(map_voxel_size)
+    points_accum = np.zeros((0, 3), dtype=np.float64)
+    pending_batches: List[np.ndarray] = []
+    scans_seen = 0
 
-        downsample_size = float(map_voxel_size)
-        points_accum = np.zeros((0, 3), dtype=np.float64)
-        pending_batches: List[np.ndarray] = []
-        scans_seen = 0
+    lookup_stats = {
+        "columns": 0,
+        "valid_columns": 0,
+        "exact_columns": 0,
+        "nearest_columns": 0,
+        "max_delta_ns": 0,
+    }
 
-        def flush_batches() -> None:
-            nonlocal points_accum, pending_batches
-            if not pending_batches:
-                return
-            merged = np.concatenate(pending_batches, axis=0)
-            pending_batches = []
-            if points_accum.size == 0:
-                points_accum = merged
-            else:
-                points_accum = np.concatenate([points_accum, merged], axis=0)
-            if downsample_size > 0 and points_accum.shape[0] > 0:
-                points_accum, _ = voxel_downsample(
-                    downsample_size,
-                    points_accum,
-                    np.zeros((points_accum.shape[0], 0), dtype=np.float64),
+    def flush_batches() -> None:
+        nonlocal points_accum, pending_batches
+        if not pending_batches:
+            return
+        merged = np.concatenate(pending_batches, axis=0)
+        pending_batches = []
+        if points_accum.size == 0:
+            points_accum = merged
+        else:
+            points_accum = np.concatenate([points_accum, merged], axis=0)
+        if downsample_size > 0 and points_accum.shape[0] > 0:
+            points_accum, _ = voxel_downsample(
+                downsample_size,
+                points_accum,
+                np.zeros((points_accum.shape[0], 0), dtype=np.float64),
+            )
+
+    for file_idx, raw_path in enumerate(raw_paths, start=1):
+        source = None
+        try:
+            source = _open_raw_source(raw_path)
+            info = _extract_first_sensor_info(source)
+            xyzlut = XYZLut(info, use_extrinsics=True)
+            _emit(
+                emit_event,
+                "status",
+                message=(
+                    f"Replaying raw with optimized poses "
+                    f"({file_idx}/{len(raw_paths)}): {os.path.basename(raw_path)}"
+                ),
+            )
+
+            for scan_idx, item in enumerate(source, start=1):
+                _check_cancel(should_cancel)
+                scans_seen += 1
+                scan = _extract_first_scan(item)
+                if scan is None:
+                    continue
+                if not _scan_has_range_field(scan, ChanField):
+                    continue
+
+                ranges = _scan_get_range_field(scan, ChanField)
+                ranges_m = np.asarray(ranges, dtype=np.float64) * 0.001
+
+                pose_cols, stats = _lookup_pose_columns(
+                    np.asarray(scan.timestamp, dtype=np.int64),
+                    pose_timestamps_ns,
+                    column_poses,
                 )
+                lookup_stats["columns"] += stats["columns"]
+                lookup_stats["valid_columns"] += stats["valid_columns"]
+                lookup_stats["exact_columns"] += stats["exact_columns"]
+                lookup_stats["nearest_columns"] += stats["nearest_columns"]
+                lookup_stats["max_delta_ns"] = max(lookup_stats["max_delta_ns"], stats["max_delta_ns"])
 
-        for item in source:
-            _check_cancel(should_cancel)
-            scans_seen += 1
-            scan = _extract_first_scan(item)
-            if scan is None:
-                continue
-            if not _scan_has_range_field(scan, ChanField):
-                continue
+                points_local = xyzlut(ranges)
+                points_global = dewarp(points_local, pose_cols)
 
-            ranges = _scan_get_range_field(scan, ChanField)
-            ranges_m = np.asarray(ranges, dtype=np.float64) * 0.001
-            points = xyzlut(scan)
-            points_global = dewarp(points, scan.pose)
+                valid = ranges > 0
+                if min_range > 0:
+                    valid = valid & (ranges_m >= min_range)
+                if max_range > 0:
+                    valid = valid & (ranges_m <= max_range)
 
-            valid = ranges > 0
-            if min_range > 0:
-                valid = valid & (ranges_m >= min_range)
-            if max_range > 0:
-                valid = valid & (ranges_m <= max_range)
+                selected = points_global[valid]
+                if selected.size == 0:
+                    continue
+                pending_batches.append(np.asarray(selected, dtype=np.float64))
 
-            selected = points_global[valid]
-            if selected.size == 0:
-                continue
-            pending_batches.append(np.asarray(selected, dtype=np.float64))
+                if scan_idx % 20 == 0:
+                    flush_batches()
+                    _emit(
+                        emit_event,
+                        "scan_progress",
+                        file_index=file_idx,
+                        file_total=len(raw_paths),
+                        scan_index=scan_idx,
+                        total_scans=scans_seen,
+                        total_points=int(points_accum.shape[0]),
+                    )
+        finally:
+            close_fn = getattr(source, "close", None)
+            if callable(close_fn):
+                close_fn()
 
-            if scans_seen % 20 == 0:
-                flush_batches()
-                _emit(
-                    emit_event,
-                    "scan_progress",
-                    scan_index=scans_seen,
-                    total_scans=scans_seen,
-                    total_points=int(points_accum.shape[0]),
-                )
-
-        flush_batches()
-        return points_accum
-    finally:
-        close_fn = getattr(source, "close", None)
-        if callable(close_fn):
-            close_fn()
+    flush_batches()
+    return points_accum, lookup_stats
 
 
 def fuse_raw_to_single_las(
@@ -1177,11 +1339,46 @@ def slam_raw_to_gps_anchored_las(
             gps_xy,
             min_motion_m=anchor_min_motion_m,
         )
+        aligned_traj_xy = (rotation @ slam_xy.T).T + translation
 
         if anchor_z_mode == "offset":
             z_offset = float(np.median(gps_z_interp - traj_xyz[:, 2]))
         else:
             z_offset = 0.0
+        aligned_traj_z = traj_xyz[:, 2] + z_offset
+
+        qa_metrics = _compute_xy_alignment_metrics(gps_xy, aligned_traj_xy)
+        z_residual = aligned_traj_z - gps_z_interp
+        qa_metrics["z_mean_m"] = float(np.mean(z_residual))
+        qa_metrics["z_rmse_m"] = float(np.sqrt(np.mean(z_residual**2)))
+        qa_metrics["z_p95_abs_m"] = float(np.percentile(np.abs(z_residual), 95))
+
+        qa_path, qa_pass = _write_anchor_qa_report(
+            output_las,
+            backend="rigid_fit",
+            time_mode_used=chosen_time_mode,
+            metrics=qa_metrics,
+            extra={
+                "anchor_method": anchor_method,
+                "anchor_rotation_deg": _rotation_deg(rotation),
+                "anchor_translation_x": float(translation[0]),
+                "anchor_translation_y": float(translation[1]),
+                "anchor_z_offset": z_offset,
+            },
+        )
+        _emit(
+            emit_event,
+            "status",
+            message=(
+                f"Anchor QA: median={qa_metrics['xy_median_m']:.2f} m, "
+                f"p95={qa_metrics['xy_p95_m']:.2f} m, pass={qa_pass} "
+                f"({qa_path})"
+            ),
+        )
+        log(
+            f"Anchor QA: median={qa_metrics['xy_median_m']:.2f} m, "
+            f"p95={qa_metrics['xy_p95_m']:.2f} m, pass={qa_pass} ({qa_path})"
+        )
 
         _emit(
             emit_event,
@@ -1231,6 +1428,12 @@ def slam_raw_to_gps_anchored_las(
             "slam_min_range": float(min_range),
             "slam_max_range": float(max_range),
             "slam_deskew_method": deskew_method,
+            "qa_report_path": qa_path,
+            "qa_pass": qa_pass,
+            "qa_xy_rmse_m": qa_metrics["xy_rmse_m"],
+            "qa_xy_median_m": qa_metrics["xy_median_m"],
+            "qa_xy_p95_m": qa_metrics["xy_p95_m"],
+            "qa_z_rmse_m": qa_metrics["z_rmse_m"],
         }
     except Exception:
         if os.path.exists(tmp_output):
@@ -1451,9 +1654,60 @@ def slam_raw_to_gps_anchored_las_pose_optimizer(
         final_cost = float(po.get_cost_value())
         po.save(osf_optimized)
 
-        _emit(emit_event, "status", message="Extracting point cloud from optimized trajectory...")
-        map_points = _build_point_cloud_from_osf(
-            osf_optimized,
+        ts_opt = np.asarray(po.get_timestamps(SamplingMode.COLUMNS), dtype=np.int64)
+        poses_opt = np.asarray(po.get_poses(SamplingMode.COLUMNS), dtype=np.float64)
+        if ts_opt.size < 2:
+            raise ValueError("Pose optimizer output trajectory has insufficient samples.")
+        if poses_opt.ndim != 3 or poses_opt.shape[1:] != (4, 4):
+            raise ValueError("Unexpected optimized pose shape from PoseOptimizer.")
+        if poses_opt.shape[0] != ts_opt.shape[0]:
+            raise ValueError("Optimized pose/timestamp count mismatch.")
+
+        slam_t_opt, gps_t_opt, chosen_time_mode = choose_time_mode(ts_opt, gps_t_raw, time_mode)
+        gps_x_opt = np.interp(slam_t_opt, gps_t_opt, gps_e)
+        gps_y_opt = np.interp(slam_t_opt, gps_t_opt, gps_n)
+        gps_z_opt = np.interp(slam_t_opt, gps_t_opt, gps_z)
+
+        optimized_xy = poses_opt[:, :2, 3]
+        qa_metrics = _compute_xy_alignment_metrics(
+            np.column_stack([gps_x_opt, gps_y_opt]),
+            optimized_xy,
+        )
+        z_residual = poses_opt[:, 2, 3] - gps_z_opt
+        qa_metrics["z_mean_m"] = float(np.mean(z_residual))
+        qa_metrics["z_rmse_m"] = float(np.sqrt(np.mean(z_residual**2)))
+        qa_metrics["z_p95_abs_m"] = float(np.percentile(np.abs(z_residual), 95))
+
+        qa_path, qa_pass = _write_anchor_qa_report(
+            output_las,
+            backend="pose_optimizer",
+            time_mode_used=chosen_time_mode,
+            metrics=qa_metrics,
+            extra={
+                "constraints_added": int(constraints_added),
+                "poseopt_cost": final_cost,
+                "anchor_z_mode": anchor_z_mode,
+            },
+        )
+        _emit(
+            emit_event,
+            "status",
+            message=(
+                f"Anchor QA: median={qa_metrics['xy_median_m']:.2f} m, "
+                f"p95={qa_metrics['xy_p95_m']:.2f} m, pass={qa_pass} "
+                f"({qa_path})"
+            ),
+        )
+        log(
+            f"Anchor QA: median={qa_metrics['xy_median_m']:.2f} m, "
+            f"p95={qa_metrics['xy_p95_m']:.2f} m, pass={qa_pass} ({qa_path})"
+        )
+
+        _emit(emit_event, "status", message="Extracting point cloud from raw replay with optimized poses...")
+        map_points, pose_lookup = _build_point_cloud_from_raw_with_poses(
+            raw_paths,
+            pose_timestamps_ns=ts_opt,
+            column_poses=poses_opt,
             min_range=min_range,
             max_range=max_range,
             map_voxel_size=poseopt_map_voxel_size,
@@ -1492,6 +1746,15 @@ def slam_raw_to_gps_anchored_las_pose_optimizer(
             "slam_min_range": float(min_range),
             "slam_max_range": float(max_range),
             "slam_deskew_method": deskew_method,
+            "qa_report_path": qa_path,
+            "qa_pass": qa_pass,
+            "qa_xy_rmse_m": qa_metrics["xy_rmse_m"],
+            "qa_xy_median_m": qa_metrics["xy_median_m"],
+            "qa_xy_p95_m": qa_metrics["xy_p95_m"],
+            "qa_z_rmse_m": qa_metrics["z_rmse_m"],
+            "pose_lookup_exact_columns": int(pose_lookup["exact_columns"]),
+            "pose_lookup_nearest_columns": int(pose_lookup["nearest_columns"]),
+            "pose_lookup_max_delta_ns": int(pose_lookup["max_delta_ns"]),
         }
     except Exception:
         if os.path.exists(tmp_output):
@@ -1884,56 +2147,27 @@ def run_from_args(
         _emit(emit_event, "status", message=f"Output LAS: {output_las}")
 
         if args.anchor_backend == "pose_optimizer":
-            try:
-                summary = slam_raw_to_gps_anchored_las_pose_optimizer(
-                    raw_paths=raw_paths,
-                    gps_df=gps_df,
-                    gps_time_col=gps_time_col,
-                    output_las=output_las,
-                    time_mode=args.time_mode,
-                    utm_epsg=args.utm_epsg,
-                    voxel_size=args.slam_voxel_size,
-                    min_range=args.slam_min_range,
-                    max_range=args.slam_max_range,
-                    deskew_method=args.slam_deskew_method,
-                    anchor_min_motion_m=args.anchor_min_motion_m,
-                    anchor_z_mode=args.anchor_z_mode,
-                    poseopt_key_frame_distance=args.poseopt_key_frame_distance,
-                    poseopt_constraints_every_m=args.poseopt_constraints_every_m,
-                    poseopt_constraint_weights=args.poseopt_constraint_weights,
-                    poseopt_max_iterations=args.poseopt_max_iterations,
-                    poseopt_map_voxel_size=args.poseopt_map_voxel_size,
-                    emit_event=emit_event,
-                    should_cancel=should_cancel,
-                )
-            except JobCancelledError:
-                raise
-            except Exception as e:
-                _emit(
-                    emit_event,
-                    "status",
-                    message=(
-                        "Pose optimizer anchoring failed; falling back to rigid-fit anchoring. "
-                        f"Reason: {e}"
-                    ),
-                )
-                summary = slam_raw_to_gps_anchored_las(
-                    raw_paths=raw_paths,
-                    gps_df=gps_df,
-                    gps_time_col=gps_time_col,
-                    output_las=output_las,
-                    time_mode=args.time_mode,
-                    utm_epsg=args.utm_epsg,
-                    voxel_size=args.slam_voxel_size,
-                    min_range=args.slam_min_range,
-                    max_range=args.slam_max_range,
-                    deskew_method=args.slam_deskew_method,
-                    anchor_min_motion_m=args.anchor_min_motion_m,
-                    anchor_z_mode=args.anchor_z_mode,
-                    emit_event=emit_event,
-                    should_cancel=should_cancel,
-                )
-                summary["anchor_backend"] = "rigid_fit_fallback"
+            summary = slam_raw_to_gps_anchored_las_pose_optimizer(
+                raw_paths=raw_paths,
+                gps_df=gps_df,
+                gps_time_col=gps_time_col,
+                output_las=output_las,
+                time_mode=args.time_mode,
+                utm_epsg=args.utm_epsg,
+                voxel_size=args.slam_voxel_size,
+                min_range=args.slam_min_range,
+                max_range=args.slam_max_range,
+                deskew_method=args.slam_deskew_method,
+                anchor_min_motion_m=args.anchor_min_motion_m,
+                anchor_z_mode=args.anchor_z_mode,
+                poseopt_key_frame_distance=args.poseopt_key_frame_distance,
+                poseopt_constraints_every_m=args.poseopt_constraints_every_m,
+                poseopt_constraint_weights=args.poseopt_constraint_weights,
+                poseopt_max_iterations=args.poseopt_max_iterations,
+                poseopt_map_voxel_size=args.poseopt_map_voxel_size,
+                emit_event=emit_event,
+                should_cancel=should_cancel,
+            )
         else:
             summary = slam_raw_to_gps_anchored_las(
                 raw_paths=raw_paths,
