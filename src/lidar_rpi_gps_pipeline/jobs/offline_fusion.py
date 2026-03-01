@@ -399,33 +399,35 @@ def _scan_get_range_field(scan: Any, ChanField: Any) -> Any:
         return scan.field("RANGE")
 
 
+def _next_available_output_path(path: str) -> str:
+    """
+    Return a non-conflicting path by appending an incrementing suffix.
+
+    Example:
+    - geo_session.las
+    - geo_session_2.las
+    - geo_session_3.las
+    """
+    base_dir = os.path.dirname(path) or "."
+    filename = os.path.basename(path)
+    stem, ext = os.path.splitext(filename)
+    candidate = path
+    index = 2
+
+    while os.path.exists(candidate) or os.path.exists(candidate + ".partial"):
+        candidate = os.path.join(base_dir, f"{stem}_{index}{ext}")
+        index += 1
+    if candidate != path:
+        log(f"Output path exists; using next available file: {candidate}")
+    return candidate
+
+
 def _resolve_output_las_path(
     args: argparse.Namespace,
     *,
     raw_paths: List[str],
     manifest_json: Optional[str],
 ) -> str:
-    def next_available_output_path(path: str) -> str:
-        """
-        Return a non-conflicting LAS path by appending an incrementing suffix.
-
-        Example:
-        - geo_session.las
-        - geo_session_2.las
-        - geo_session_3.las
-        """
-        base_dir = os.path.dirname(path) or "."
-        filename = os.path.basename(path)
-        stem, ext = os.path.splitext(filename)
-        candidate = path
-        index = 2
-
-        while os.path.exists(candidate) or os.path.exists(candidate + ".partial"):
-            candidate = os.path.join(base_dir, f"{stem}_{index}{ext}")
-            index += 1
-        if candidate != path:
-            log(f"Output path exists; using next available file: {candidate}")
-        return candidate
 
     if args.output_las:
         output_las = args.output_las
@@ -450,7 +452,26 @@ def _resolve_output_las_path(
 
     out_dir = os.path.dirname(output_las) or "."
     os.makedirs(out_dir, exist_ok=True)
-    return next_available_output_path(output_las)
+    return _next_available_output_path(output_las)
+
+
+def _resolve_output_osf_path(
+    args: argparse.Namespace,
+    *,
+    output_las: str,
+) -> Optional[str]:
+    if not getattr(args, "save_osf", False) and not getattr(args, "output_osf", None):
+        return None
+
+    if args.output_osf:
+        output_osf = args.output_osf
+    else:
+        root, _ext = os.path.splitext(output_las)
+        output_osf = root + ".osf"
+
+    out_dir = os.path.dirname(output_osf) or "."
+    os.makedirs(out_dir, exist_ok=True)
+    return _next_available_output_path(output_osf)
 
 
 def _open_raw_source(raw_path: str) -> Any:
@@ -1059,6 +1080,7 @@ def slam_raw_to_single_las(
     raw_paths: List[str],
     output_las: str,
     *,
+    output_osf: Optional[str],
     voxel_size: float,
     min_range: float,
     max_range: float,
@@ -1071,6 +1093,7 @@ def slam_raw_to_single_las(
     """
     try:
         from ouster.sdk.mapping import SlamConfig, SlamEngine
+        from ouster.sdk.osf import Writer
     except Exception as e:
         raise ValueError(
             "ouster-sdk mapping bindings are not importable. Install with: pip install ouster-sdk"
@@ -1086,9 +1109,13 @@ def slam_raw_to_single_las(
     tmp_output = output_las + ".partial"
     if os.path.exists(tmp_output):
         os.remove(tmp_output)
+    tmp_output_osf = output_osf + ".partial" if output_osf else None
+    if tmp_output_osf and os.path.exists(tmp_output_osf):
+        os.remove(tmp_output_osf)
 
     slam_engine = None
     total_scans = 0
+    osf_writer = None
 
     try:
         for file_idx, raw_path in enumerate(raw_paths, start=1):
@@ -1116,6 +1143,8 @@ def slam_raw_to_single_las(
                     config.max_range = float(max_range)
                     config.voxel_size = float(voxel_size)
                     slam_engine = SlamEngine(infos=_source_infos(source), config=config)
+                    if tmp_output_osf:
+                        osf_writer = Writer(tmp_output_osf, _source_infos(source))
                     _emit(
                         emit_event,
                         "status",
@@ -1129,7 +1158,9 @@ def slam_raw_to_single_las(
                 for scan_idx, scans in enumerate(source, start=1):
                     _check_cancel(should_cancel)
                     assert slam_engine is not None
-                    slam_engine.update(scans)
+                    updated = slam_engine.update(scans)
+                    if osf_writer is not None:
+                        osf_writer.save(updated)
                     total_scans += 1
 
                     if scan_idx % 10 == 0:
@@ -1157,6 +1188,14 @@ def slam_raw_to_single_las(
 
         if slam_engine is None or total_scans == 0:
             raise ValueError("No scans processed for SLAM map generation.")
+
+        if osf_writer is not None:
+            osf_writer.close()
+            osf_writer = None
+            assert tmp_output_osf is not None and output_osf is not None
+            os.replace(tmp_output_osf, output_osf)
+            _emit(emit_event, "status", message=f"Saved SLAM OSF: {output_osf}")
+            log(f"Saved SLAM OSF: {output_osf}")
 
         _emit(emit_event, "status", message="Building final SLAM point cloud...")
         points = slam_engine.get_point_cloud()
@@ -1187,10 +1226,15 @@ def slam_raw_to_single_las(
             "slam_min_range": float(min_range),
             "slam_max_range": float(max_range),
             "slam_deskew_method": deskew_method,
+            "output_osf": output_osf,
         }
     except Exception:
+        if osf_writer is not None:
+            osf_writer.close()
         if os.path.exists(tmp_output):
             os.remove(tmp_output)
+        if tmp_output_osf and os.path.exists(tmp_output_osf):
+            os.remove(tmp_output_osf)
         raise
 
 
@@ -1200,6 +1244,7 @@ def slam_raw_to_gps_anchored_las(
     gps_time_col: str,
     output_las: str,
     *,
+    output_osf: Optional[str],
     time_mode: str,
     utm_epsg: int,
     voxel_size: float,
@@ -1216,6 +1261,7 @@ def slam_raw_to_gps_anchored_las(
     """
     try:
         from ouster.sdk.mapping import SlamConfig, SlamEngine
+        from ouster.sdk.osf import Writer
     except Exception as e:
         raise ValueError(
             "ouster-sdk mapping bindings are not importable. Install with: pip install ouster-sdk"
@@ -1240,11 +1286,15 @@ def slam_raw_to_gps_anchored_las(
     tmp_output = output_las + ".partial"
     if os.path.exists(tmp_output):
         os.remove(tmp_output)
+    tmp_output_osf = output_osf + ".partial" if output_osf else None
+    if tmp_output_osf and os.path.exists(tmp_output_osf):
+        os.remove(tmp_output_osf)
 
     slam_engine = None
     total_scans = 0
     traj_timestamps: List[int] = []
     traj_xyz_local: List[np.ndarray] = []
+    osf_writer = None
 
     try:
         for file_idx, raw_path in enumerate(raw_paths, start=1):
@@ -1272,6 +1322,8 @@ def slam_raw_to_gps_anchored_las(
                     config.max_range = float(max_range)
                     config.voxel_size = float(voxel_size)
                     slam_engine = SlamEngine(infos=_source_infos(source), config=config)
+                    if tmp_output_osf:
+                        osf_writer = Writer(tmp_output_osf, _source_infos(source))
                     _emit(
                         emit_event,
                         "status",
@@ -1286,6 +1338,8 @@ def slam_raw_to_gps_anchored_las(
                     _check_cancel(should_cancel)
                     assert slam_engine is not None
                     updated = slam_engine.update(scans)
+                    if osf_writer is not None:
+                        osf_writer.save(updated)
                     scan = _extract_first_scan(updated)
                     if scan is not None:
                         try:
@@ -1323,6 +1377,19 @@ def slam_raw_to_gps_anchored_las(
             raise ValueError("No scans processed for SLAM map generation.")
         if len(traj_timestamps) < 2:
             raise ValueError("Not enough SLAM trajectory samples to anchor map to GPS.")
+
+        if osf_writer is not None:
+            osf_writer.close()
+            osf_writer = None
+            assert tmp_output_osf is not None and output_osf is not None
+            os.replace(tmp_output_osf, output_osf)
+            _emit(emit_event, "status", message=f"Saved local SLAM OSF: {output_osf}")
+            _emit(
+                emit_event,
+                "status",
+                message="OSF stores local SLAM poses for rigid_fit backend (LAS is GPS-anchored output).",
+            )
+            log(f"Saved local SLAM OSF: {output_osf}")
 
         traj_t = np.asarray(traj_timestamps, dtype=np.int64)
         traj_xyz = np.asarray(traj_xyz_local, dtype=np.float64)
@@ -1434,10 +1501,16 @@ def slam_raw_to_gps_anchored_las(
             "qa_xy_median_m": qa_metrics["xy_median_m"],
             "qa_xy_p95_m": qa_metrics["xy_p95_m"],
             "qa_z_rmse_m": qa_metrics["z_rmse_m"],
+            "output_osf": output_osf,
+            "output_osf_kind": "local_slam_unanchored",
         }
     except Exception:
+        if osf_writer is not None:
+            osf_writer.close()
         if os.path.exists(tmp_output):
             os.remove(tmp_output)
+        if tmp_output_osf and os.path.exists(tmp_output_osf):
+            os.remove(tmp_output_osf)
         raise
 
 
@@ -1447,6 +1520,7 @@ def slam_raw_to_gps_anchored_las_pose_optimizer(
     gps_time_col: str,
     output_las: str,
     *,
+    output_osf: Optional[str],
     time_mode: str,
     utm_epsg: int,
     voxel_size: float,
@@ -1505,10 +1579,12 @@ def slam_raw_to_gps_anchored_las_pose_optimizer(
 
     temp_dir = tempfile.mkdtemp(prefix="lidar_poseopt_")
     osf_initial = os.path.join(temp_dir, "slam_initial.osf")
-    osf_optimized = os.path.join(temp_dir, "slam_optimized.osf")
     tmp_output = output_las + ".partial"
     if os.path.exists(tmp_output):
         os.remove(tmp_output)
+    tmp_output_osf = output_osf + ".partial" if output_osf else None
+    if tmp_output_osf and os.path.exists(tmp_output_osf):
+        os.remove(tmp_output_osf)
 
     slam_engine = None
     total_scans = 0
@@ -1652,7 +1728,13 @@ def slam_raw_to_gps_anchored_las_pose_optimizer(
 
         po.solve(int(poseopt_max_iterations))
         final_cost = float(po.get_cost_value())
-        po.save(osf_optimized)
+
+        if tmp_output_osf:
+            po.save(tmp_output_osf)
+            assert output_osf is not None
+            os.replace(tmp_output_osf, output_osf)
+            _emit(emit_event, "status", message=f"Saved optimized OSF: {output_osf}")
+            log(f"Saved optimized OSF: {output_osf}")
 
         ts_opt = np.asarray(po.get_timestamps(SamplingMode.COLUMNS), dtype=np.int64)
         poses_opt = np.asarray(po.get_poses(SamplingMode.COLUMNS), dtype=np.float64)
@@ -1755,10 +1837,14 @@ def slam_raw_to_gps_anchored_las_pose_optimizer(
             "pose_lookup_exact_columns": int(pose_lookup["exact_columns"]),
             "pose_lookup_nearest_columns": int(pose_lookup["nearest_columns"]),
             "pose_lookup_max_delta_ns": int(pose_lookup["max_delta_ns"]),
+            "output_osf": output_osf,
+            "output_osf_kind": "optimized_gps_anchored",
         }
     except Exception:
         if os.path.exists(tmp_output):
             os.remove(tmp_output)
+        if tmp_output_osf and os.path.exists(tmp_output_osf):
+            os.remove(tmp_output_osf)
         raise
     finally:
         close_writer = getattr(writer, "close", None)
@@ -1924,6 +2010,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Keep per-scan converted CSV debug files (can generate many files).",
     )
     parser.add_argument("--output-las", help="Final output LAS file path (preferred for raw/manifest mode).")
+    parser.add_argument(
+        "--output-osf",
+        help="Optional output OSF path for SLAM modes (playback/debug).",
+    )
+    parser.add_argument(
+        "--save-osf",
+        action="store_true",
+        help="Also save OSF next to LAS in SLAM modes.",
+    )
     parser.add_argument(
         "--output-prefix",
         help="Output prefix. Raw mode writes <prefix>.las. CSV mode writes per-file <prefix>*.csv/.las.",
@@ -2100,6 +2195,9 @@ def run_from_args(
     _check_cancel(should_cancel)
 
     mode = args.processing_mode
+    if mode == "gps_fusion" and (args.save_osf or args.output_osf):
+        raise ValueError("--save-osf/--output-osf are only supported in slam_map and slam_gps_anchor modes.")
+
     if mode == "slam_map":
         if lidar_paths and not raw_paths:
             raise ValueError("SLAM mode requires raw LiDAR (.pcap/.osf), not pre-converted CSV input.")
@@ -2112,10 +2210,14 @@ def run_from_args(
             manifest_json=args.manifest_json,
         )
         _emit(emit_event, "status", message=f"Output LAS: {output_las}")
+        output_osf = _resolve_output_osf_path(args, output_las=output_las)
+        if output_osf:
+            _emit(emit_event, "status", message=f"Output OSF: {output_osf}")
 
         summary = slam_raw_to_single_las(
             raw_paths=raw_paths,
             output_las=output_las,
+            output_osf=output_osf,
             voxel_size=args.slam_voxel_size,
             min_range=args.slam_min_range,
             max_range=args.slam_max_range,
@@ -2145,6 +2247,9 @@ def run_from_args(
             manifest_json=args.manifest_json,
         )
         _emit(emit_event, "status", message=f"Output LAS: {output_las}")
+        output_osf = _resolve_output_osf_path(args, output_las=output_las)
+        if output_osf:
+            _emit(emit_event, "status", message=f"Output OSF: {output_osf}")
 
         if args.anchor_backend == "pose_optimizer":
             summary = slam_raw_to_gps_anchored_las_pose_optimizer(
@@ -2152,6 +2257,7 @@ def run_from_args(
                 gps_df=gps_df,
                 gps_time_col=gps_time_col,
                 output_las=output_las,
+                output_osf=output_osf,
                 time_mode=args.time_mode,
                 utm_epsg=args.utm_epsg,
                 voxel_size=args.slam_voxel_size,
@@ -2174,6 +2280,7 @@ def run_from_args(
                 gps_df=gps_df,
                 gps_time_col=gps_time_col,
                 output_las=output_las,
+                output_osf=output_osf,
                 time_mode=args.time_mode,
                 utm_epsg=args.utm_epsg,
                 voxel_size=args.slam_voxel_size,

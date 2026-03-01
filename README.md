@@ -84,6 +84,8 @@ python3 offline_gui.py
 GUI notes:
 - Mode selector supports `SLAM + GPS Anchor`, `SLAM Map`, and `GPS Fusion`.
 - Anchor mode includes backend/options for constraint-based pose optimization.
+- SLAM modes can also save an `.osf` playback file.
+- `Open OSF in Viz` launches `ouster-cli source <output.osf> viz` after runs.
 - Includes progress indicators while processing files/scans.
 - `Stop` asks for confirmation, cancels safely, and cleans partial LAS output.
 
@@ -163,7 +165,8 @@ python3 offline_fuse_lidar_gps.py \
 python3 offline_fuse_lidar_gps.py \
   --processing-mode slam_map \
   --lidar-raw /path/to/raw_files_dir \
-  --output-las /path/to/output/session_001_slam.las
+  --output-las /path/to/output/session_001_slam.las \
+  --save-osf
 ```
 
 Useful SLAM parameters:
@@ -179,13 +182,15 @@ python3 offline_fuse_lidar_gps.py \
   --processing-mode slam_gps_anchor \
   --lidar-raw /path/to/raw_files_dir \
   --gps-csv /path/to/raw_gps.csv \
-  --output-las /path/to/output/session_001_anchor.las
+  --output-las /path/to/output/session_001_anchor.las \
+  --save-osf
 ```
 
 Useful anchoring parameters:
 - `--anchor-min-motion-m` (default `5.0`)
 - `--anchor-z-mode` (`offset` or `none`)
 - `--anchor-backend` (`pose_optimizer` recommended, `rigid_fit` optional simpler method)
+- `--save-osf` / `--output-osf` for playback output
 - `--time-mode` and `--gps-time-column` also apply in this mode
 ## 4) Manifest JSON (recommended for full sessions)
 
@@ -237,6 +242,10 @@ python3 offline_fuse_lidar_gps.py \
 - In `slam_gps_anchor` mode, default backend uses Ouster Pose Optimizer with GPS absolute constraints.
 - `slam_gps_anchor` does not silently switch backends; if `pose_optimizer` fails, the run fails.
 - choose `--anchor-backend rigid_fit` explicitly if you want rigid anchoring.
+- `--save-osf` writes an OSF for playback in SLAM modes.
+- In `slam_gps_anchor` mode:
+  `pose_optimizer` backend writes optimized (GPS-anchored) OSF.
+  `rigid_fit` backend writes local SLAM OSF (LAS remains GPS-anchored output).
 - If output filename already exists, a numeric suffix is added automatically (`_2`, `_3`, ...).
 - Per-scan converted CSV files are not written unless you enable `--keep-converted`.
 - If `--keep-converted` is enabled, many debug CSV files can be created.
@@ -247,6 +256,7 @@ python3 offline_fuse_lidar_gps.py \
 Default raw/manifest output:
 - one merged `.las` file (LAS 1.4)
 - one QA JSON report for `slam_gps_anchor`: `*_qa.json`
+- optional `.osf` playback file when `--save-osf`/`--output-osf` is used
 
 Advanced CSV-input mode output:
 - per input LiDAR CSV: `... .csv` and `... .las`
@@ -282,6 +292,8 @@ These options apply to `--processing-mode gps_fusion` and `--processing-mode sla
 - `--slam-min-range` default `1.0`
 - `--slam-max-range` default `150.0`
 - `--slam-deskew-method` default `auto`
+- `--save-osf` save OSF playback file for SLAM modes
+- `--output-osf` explicit OSF path (optional)
 
 ## Anchoring Options
 

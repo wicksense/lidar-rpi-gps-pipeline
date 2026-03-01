@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import os
+import shutil
+import subprocess
+import sys
 import traceback
 from typing import Any, Dict
 
@@ -64,6 +68,8 @@ class _BaseModeWidget(QWidget):
     def __init__(self, title: str):
         super().__init__()
         self._job_thread: JobThread | None = None
+        self._last_output_osf: str | None = None
+        self._viz_processes: list[subprocess.Popen] = []
 
         root = QVBoxLayout(self)
         root.addWidget(QLabel(title))
@@ -165,6 +171,9 @@ class _BaseModeWidget(QWidget):
         advanced_row.addWidget(QLabel("GPS time column"))
         advanced_row.addWidget(self.gps_time_col)
 
+        self.save_osf = QCheckBox("Save OSF playback file")
+        advanced_row.addWidget(self.save_osf)
+
         self.keep_converted = QCheckBox("Keep debug converted CSV files")
         advanced_row.addWidget(self.keep_converted)
         advanced_row.addStretch()
@@ -179,6 +188,11 @@ class _BaseModeWidget(QWidget):
         self.stop_btn.setEnabled(False)
         self.stop_btn.clicked.connect(self._on_stop_clicked)
         run_row.addWidget(self.stop_btn)
+
+        self.open_osf_btn = QPushButton("Open OSF in Viz")
+        self.open_osf_btn.setEnabled(False)
+        self.open_osf_btn.clicked.connect(self._on_open_osf_clicked)
+        run_row.addWidget(self.open_osf_btn)
         run_row.addStretch()
         root.addLayout(run_row)
 
@@ -234,6 +248,7 @@ class _BaseModeWidget(QWidget):
         self.time_mode.setEnabled(gps_needed)
         self.gps_time_col.setEnabled(gps_needed)
         self.keep_converted.setEnabled(mode == "gps_fusion")
+        self.save_osf.setEnabled(mode in {"slam_map", "slam_gps_anchor"})
 
         slam_mode = mode in {"slam_map", "slam_gps_anchor"}
         self.slam_voxel.setEnabled(slam_mode)
@@ -250,6 +265,7 @@ class _BaseModeWidget(QWidget):
     def _set_running_ui(self, running: bool) -> None:
         self.run_btn.setEnabled(not running)
         self.stop_btn.setEnabled(running)
+        self.open_osf_btn.setEnabled((not running) and bool(self._last_output_osf))
         if running:
             self.activity_progress.setRange(0, 0)
         else:
@@ -271,6 +287,7 @@ class _BaseModeWidget(QWidget):
             QMessageBox.warning(self, "Invalid inputs", str(e))
             return
 
+        self._last_output_osf = None
         self._reset_progress()
         self._set_running_ui(True)
         self.append_log("Starting job...")
@@ -301,6 +318,43 @@ class _BaseModeWidget(QWidget):
         self.status_label.setText("Cancelling")
         self.stop_btn.setEnabled(False)
         self._job_thread.request_cancel()
+
+    def _resolve_ouster_cli(self) -> str | None:
+        cli = shutil.which("ouster-cli")
+        if cli:
+            return cli
+        candidate = os.path.join(os.path.dirname(sys.executable), "ouster-cli")
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+        return None
+
+    def _on_open_osf_clicked(self) -> None:
+        if not self._last_output_osf:
+            QMessageBox.information(self, "No OSF", "No OSF output is available for this run.")
+            return
+        if not os.path.isfile(self._last_output_osf):
+            QMessageBox.warning(self, "OSF Missing", f"OSF file not found:\n{self._last_output_osf}")
+            return
+
+        ouster_cli = self._resolve_ouster_cli()
+        if not ouster_cli:
+            QMessageBox.warning(
+                self,
+                "ouster-cli not found",
+                "Could not find `ouster-cli` in PATH or current Python environment.",
+            )
+            return
+
+        cmd = [ouster_cli, "source", self._last_output_osf, "viz"]
+        try:
+            proc = subprocess.Popen(cmd)
+        except Exception as e:
+            QMessageBox.warning(self, "Launch Failed", f"Could not start Ouster Viz:\n{e}")
+            return
+
+        self._viz_processes = [p for p in self._viz_processes if p.poll() is None]
+        self._viz_processes.append(proc)
+        self.append_log(f"Launched Ouster Viz for: {self._last_output_osf}")
 
     def _on_job_event(self, event: dict) -> None:
         kind = event.get("kind", "event")
@@ -356,6 +410,13 @@ class _BaseModeWidget(QWidget):
         self.append_log("Job completed.")
         if summary.get("output_las"):
             self.append_log(f"Output LAS: {summary['output_las']}")
+        if summary.get("output_osf"):
+            self._last_output_osf = str(summary["output_osf"])
+            self.append_log(f"Output OSF: {self._last_output_osf}")
+        if summary.get("qa_report_path"):
+            self.append_log(f"QA report: {summary['qa_report_path']}")
+            if summary.get("qa_pass") is not None:
+                self.append_log(f"QA pass: {summary['qa_pass']}")
         if summary.get("total_points") is not None:
             self.append_log(f"Total points: {int(summary['total_points']):,}")
         if summary.get("total_scans") is not None:
@@ -417,6 +478,8 @@ class ManifestModeWidget(_BaseModeWidget):
             "poseopt_constraints_every_m": float(self.poseopt_constraints_every_m.value()),
             "poseopt_map_voxel_size": float(self.poseopt_map_voxel_size.value()),
         }
+        if mode in {"slam_map", "slam_gps_anchor"}:
+            cfg["save_osf"] = self.save_osf.isChecked()
 
         if mode in {"gps_fusion", "slam_gps_anchor"}:
             cfg["time_mode"] = self.time_mode.currentText()
@@ -474,6 +537,8 @@ class RawModeWidget(_BaseModeWidget):
             "poseopt_constraints_every_m": float(self.poseopt_constraints_every_m.value()),
             "poseopt_map_voxel_size": float(self.poseopt_map_voxel_size.value()),
         }
+        if mode in {"slam_map", "slam_gps_anchor"}:
+            cfg["save_osf"] = self.save_osf.isChecked()
 
         if gps_csv:
             cfg["gps_csv"] = gps_csv
