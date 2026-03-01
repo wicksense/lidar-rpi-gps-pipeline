@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QPlainTextEdit,
     QProgressBar,
+    QSpinBox,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -170,6 +171,13 @@ class _BaseModeWidget(QWidget):
         self.gps_time_col.addItems(["auto", "gps_epoch_ns", "pi_time_ns"])
         advanced_row.addWidget(QLabel("GPS time column"))
         advanced_row.addWidget(self.gps_time_col)
+
+        self.utm_epsg = QSpinBox()
+        self.utm_epsg.setRange(1000, 999999)
+        self.utm_epsg.setValue(32614)
+        self.utm_epsg.setToolTip("CRS EPSG written to LAS metadata and used by GPS-fusion outputs.")
+        advanced_row.addWidget(QLabel("UTM EPSG"))
+        advanced_row.addWidget(self.utm_epsg)
 
         self.save_osf = QCheckBox("Save OSF playback file")
         advanced_row.addWidget(self.save_osf)
@@ -468,6 +476,7 @@ class ManifestModeWidget(_BaseModeWidget):
             "manifest_json": manifest,
             "output_dir": out_dir,
             "processing_mode": mode,
+            "utm_epsg": int(self.utm_epsg.value()),
             "slam_voxel_size": float(self.slam_voxel.value()),
             "slam_min_range": float(self.slam_min_range.value()),
             "slam_max_range": float(self.slam_max_range.value()),
@@ -527,6 +536,7 @@ class RawModeWidget(_BaseModeWidget):
             "lidar_raw": [raw_dir],
             "output_dir": out_dir,
             "processing_mode": mode,
+            "utm_epsg": int(self.utm_epsg.value()),
             "slam_voxel_size": float(self.slam_voxel.value()),
             "slam_min_range": float(self.slam_min_range.value()),
             "slam_max_range": float(self.slam_max_range.value()),

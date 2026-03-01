@@ -66,14 +66,16 @@ def choose_time_mode(
 
     Modes:
     - unix_ns: direct nanosecond epoch matching
-    - relative_start: normalize both series to start at 0
+    - relative_start: normalize both series to LiDAR start timestamp
     - auto: choose unix_ns if overlap looks valid, else relative_start
     """
+    lidar_start = int(lidar_ts_ns[0])
+
     if requested_mode == "unix_ns":
         return lidar_ts_ns, gps_ts_ns, "unix_ns"
 
     if requested_mode == "relative_start":
-        return lidar_ts_ns - lidar_ts_ns[0], gps_ts_ns - gps_ts_ns[0], "relative_start"
+        return lidar_ts_ns - lidar_start, gps_ts_ns - lidar_start, "relative_start"
 
     overlap = (lidar_ts_ns.min() <= gps_ts_ns.max()) and (gps_ts_ns.min() <= lidar_ts_ns.max())
 
@@ -85,7 +87,7 @@ def choose_time_mode(
     if overlap and lidar_looks_like_epoch and gps_looks_like_epoch:
         return lidar_ts_ns, gps_ts_ns, "unix_ns"
 
-    return lidar_ts_ns - lidar_ts_ns[0], gps_ts_ns - gps_ts_ns[0], "relative_start"
+    return lidar_ts_ns - lidar_start, gps_ts_ns - lidar_start, "relative_start"
 
 
 def pick_gps_time_column(df: pd.DataFrame, requested: str) -> str:
@@ -118,18 +120,73 @@ def load_gps_for_interpolation(gps_csv: str, requested_time_col: str) -> Tuple[p
     log(f"GPS time column: {gps_time_col}")
 
     gps_df = gps_df[[gps_time_col, "easting", "northing", "altitude_m"]].copy()
-    gps_df = gps_df.dropna(subset=[gps_time_col, "easting", "northing"])
+    gps_df = gps_df.dropna(subset=[gps_time_col, "easting", "northing", "altitude_m"])
     gps_df[gps_time_col] = gps_df[gps_time_col].astype("int64")
     gps_df["easting"] = gps_df["easting"].astype("float64")
     gps_df["northing"] = gps_df["northing"].astype("float64")
     gps_df["altitude_m"] = gps_df["altitude_m"].astype("float64")
+    gps_df = gps_df[
+        np.isfinite(gps_df["easting"])
+        & np.isfinite(gps_df["northing"])
+        & np.isfinite(gps_df["altitude_m"])
+    ]
     gps_df = gps_df.sort_values(gps_time_col)
     gps_df = gps_df.drop_duplicates(subset=[gps_time_col])
 
     if len(gps_df) < 2:
-        raise ValueError("Need at least 2 GPS rows to interpolate.")
+        raise ValueError(
+            "Need at least 2 finite GPS rows to interpolate "
+            "(time/easting/northing/altitude_m are required)."
+        )
 
     return gps_df, gps_time_col
+
+
+def _interp_no_extrapolation(
+    query_t: np.ndarray,
+    ref_t: np.ndarray,
+    ref_values: np.ndarray,
+    *,
+    label: str,
+) -> np.ndarray:
+    """
+    Interpolate values for query timestamps, failing if query extends outside ref range.
+    """
+    if query_t.size == 0:
+        return np.asarray([], dtype=np.float64)
+
+    ref_min = int(ref_t.min())
+    ref_max = int(ref_t.max())
+    q_min = int(query_t.min())
+    q_max = int(query_t.max())
+
+    if q_min < ref_min or q_max > ref_max:
+        raise ValueError(
+            f"{label}: interpolation would extrapolate beyond GPS coverage. "
+            f"query=[{q_min}, {q_max}] gps=[{ref_min}, {ref_max}]"
+        )
+
+    return np.interp(query_t, ref_t, ref_values)
+
+
+def _estimate_las_header_offsets_from_gps(
+    gps_e: np.ndarray,
+    gps_n: np.ndarray,
+    gps_z: np.ndarray,
+    *,
+    sensor_offset_x: float,
+    sensor_offset_y: float,
+    sensor_offset_z: float,
+    padding_m: float = 500.0,
+) -> Tuple[float, float, float]:
+    """
+    Estimate stable LAS header offsets from full GPS trajectory (not first scan only).
+    """
+    return (
+        float(np.min(gps_e) + sensor_offset_x - padding_m),
+        float(np.min(gps_n) + sensor_offset_y - padding_m),
+        float(np.min(gps_z) + sensor_offset_z - padding_m),
+    )
 
 
 def chunk_prefix(output_dir: str, lidar_csv: str) -> str:
@@ -519,7 +576,7 @@ def _open_ouster_source(raw_path: str) -> Tuple[Any, Any, Any, Any, Any]:
     source = _open_raw_source(raw_path)
     info = _extract_first_sensor_info(source)
     infos = _source_infos(source)
-    xyzlut = XYZLut(info)
+    xyzlut = XYZLut(info, use_extrinsics=True)
     return source, info, infos, xyzlut, ChanField, destagger
 
 
@@ -943,6 +1000,14 @@ def fuse_raw_to_single_las(
     total_points = 0
     total_scans = 0
     debug_csv_count = 0
+    header_offsets = _estimate_las_header_offsets_from_gps(
+        gps_e,
+        gps_n,
+        gps_z,
+        sensor_offset_x=sensor_offset_x,
+        sensor_offset_y=sensor_offset_y,
+        sensor_offset_z=sensor_offset_z,
+    )
 
     try:
         for file_idx, raw_path in enumerate(raw_paths, start=1):
@@ -992,7 +1057,7 @@ def fuse_raw_to_single_las(
 
                         if chosen_mode == "relative_start":
                             lidar_start_ns = int(timestamp_ns[0])
-                            gps_t_mode = gps_t_raw - gps_t_raw[0]
+                            gps_t_mode = gps_t_raw - lidar_start_ns
                         else:
                             gps_t_mode = gps_t_raw
 
@@ -1003,16 +1068,40 @@ def fuse_raw_to_single_las(
                         lidar_t = timestamp_ns
 
                     assert gps_t_mode is not None
-                    e_interp = np.interp(lidar_t, gps_t_mode, gps_e)
-                    n_interp = np.interp(lidar_t, gps_t_mode, gps_n)
-                    z_interp = np.interp(lidar_t, gps_t_mode, gps_z)
+                    interp_label = f"{os.path.basename(raw_path)} scan {scan_idx}"
+                    e_interp = _interp_no_extrapolation(
+                        lidar_t,
+                        gps_t_mode,
+                        gps_e,
+                        label=f"{interp_label} easting",
+                    )
+                    n_interp = _interp_no_extrapolation(
+                        lidar_t,
+                        gps_t_mode,
+                        gps_n,
+                        label=f"{interp_label} northing",
+                    )
+                    z_interp = _interp_no_extrapolation(
+                        lidar_t,
+                        gps_t_mode,
+                        gps_z,
+                        label=f"{interp_label} altitude",
+                    )
 
                     x_global = e_interp + x_local + sensor_offset_x
                     y_global = n_interp + y_local + sensor_offset_y
                     z_global = z_interp + z_local + sensor_offset_z
 
+                    finite_global = np.isfinite(x_global) & np.isfinite(y_global) & np.isfinite(z_global)
+                    if not np.any(finite_global):
+                        continue
+                    if not np.all(finite_global):
+                        x_global = x_global[finite_global]
+                        y_global = y_global[finite_global]
+                        z_global = z_global[finite_global]
+
                     if writer is None:
-                        header = _new_las_header(utm_epsg, x_global.min(), y_global.min(), z_global.min())
+                        header = _new_las_header(utm_epsg, *header_offsets)
                         writer = laspy.open(tmp_output, mode="w", header=header)
                         _emit(emit_event, "status", message=f"Writing LAS: {output_las}")
 
@@ -1395,9 +1484,9 @@ def slam_raw_to_gps_anchored_las(
         traj_xyz = np.asarray(traj_xyz_local, dtype=np.float64)
 
         slam_t, gps_t, chosen_time_mode = choose_time_mode(traj_t, gps_t_raw, time_mode)
-        gps_x_interp = np.interp(slam_t, gps_t, gps_e)
-        gps_y_interp = np.interp(slam_t, gps_t, gps_n)
-        gps_z_interp = np.interp(slam_t, gps_t, gps_z)
+        gps_x_interp = _interp_no_extrapolation(slam_t, gps_t, gps_e, label="SLAM traj easting")
+        gps_y_interp = _interp_no_extrapolation(slam_t, gps_t, gps_n, label="SLAM traj northing")
+        gps_z_interp = _interp_no_extrapolation(slam_t, gps_t, gps_z, label="SLAM traj altitude")
 
         slam_xy = traj_xyz[:, :2]
         gps_xy = np.column_stack([gps_x_interp, gps_y_interp])
@@ -1420,32 +1509,13 @@ def slam_raw_to_gps_anchored_las(
         qa_metrics["z_rmse_m"] = float(np.sqrt(np.mean(z_residual**2)))
         qa_metrics["z_p95_abs_m"] = float(np.percentile(np.abs(z_residual), 95))
 
-        qa_path, qa_pass = _write_anchor_qa_report(
-            output_las,
-            backend="rigid_fit",
-            time_mode_used=chosen_time_mode,
-            metrics=qa_metrics,
-            extra={
-                "anchor_method": anchor_method,
-                "anchor_rotation_deg": _rotation_deg(rotation),
-                "anchor_translation_x": float(translation[0]),
-                "anchor_translation_y": float(translation[1]),
-                "anchor_z_offset": z_offset,
-            },
-        )
-        _emit(
-            emit_event,
-            "status",
-            message=(
-                f"Anchor QA: median={qa_metrics['xy_median_m']:.2f} m, "
-                f"p95={qa_metrics['xy_p95_m']:.2f} m, pass={qa_pass} "
-                f"({qa_path})"
-            ),
-        )
-        log(
-            f"Anchor QA: median={qa_metrics['xy_median_m']:.2f} m, "
-            f"p95={qa_metrics['xy_p95_m']:.2f} m, pass={qa_pass} ({qa_path})"
-        )
+        qa_extra = {
+            "anchor_method": anchor_method,
+            "anchor_rotation_deg": _rotation_deg(rotation),
+            "anchor_translation_x": float(translation[0]),
+            "anchor_translation_y": float(translation[1]),
+            "anchor_z_offset": z_offset,
+        }
 
         _emit(
             emit_event,
@@ -1476,6 +1546,27 @@ def slam_raw_to_gps_anchored_las(
         las.z = z_global
         las.write(tmp_output)
         os.replace(tmp_output, output_las)
+
+        qa_path, qa_pass = _write_anchor_qa_report(
+            output_las,
+            backend="rigid_fit",
+            time_mode_used=chosen_time_mode,
+            metrics=qa_metrics,
+            extra=qa_extra,
+        )
+        _emit(
+            emit_event,
+            "status",
+            message=(
+                f"Anchor QA: median={qa_metrics['xy_median_m']:.2f} m, "
+                f"p95={qa_metrics['xy_p95_m']:.2f} m, pass={qa_pass} "
+                f"({qa_path})"
+            ),
+        )
+        log(
+            f"Anchor QA: median={qa_metrics['xy_median_m']:.2f} m, "
+            f"p95={qa_metrics['xy_p95_m']:.2f} m, pass={qa_pass} ({qa_path})"
+        )
 
         _emit(emit_event, "status", message=f"Done. Final anchored LAS: {output_las}")
         log(f"Done. Final anchored LAS: {output_las}")
@@ -1663,6 +1754,7 @@ def slam_raw_to_gps_anchored_las_pose_optimizer(
 
         if writer is not None:
             writer.close()
+            writer = None
 
         if total_scans == 0:
             raise ValueError("No scans processed for SLAM map generation.")
@@ -1682,9 +1774,9 @@ def slam_raw_to_gps_anchored_las_pose_optimizer(
             raise ValueError("Pose optimizer trajectory has insufficient samples.")
 
         slam_t, gps_t, chosen_time_mode = choose_time_mode(ts_cols, gps_t_raw, time_mode)
-        gps_x_interp = np.interp(slam_t, gps_t, gps_e)
-        gps_y_interp = np.interp(slam_t, gps_t, gps_n)
-        gps_z_interp = np.interp(slam_t, gps_t, gps_z)
+        gps_x_interp = _interp_no_extrapolation(slam_t, gps_t, gps_e, label="PoseOpt traj easting")
+        gps_y_interp = _interp_no_extrapolation(slam_t, gps_t, gps_n, label="PoseOpt traj northing")
+        gps_z_interp = _interp_no_extrapolation(slam_t, gps_t, gps_z, label="PoseOpt traj altitude")
 
         local_xy = poses_cols[:, :2, 3]
         last_xy = None
@@ -1746,9 +1838,24 @@ def slam_raw_to_gps_anchored_las_pose_optimizer(
             raise ValueError("Optimized pose/timestamp count mismatch.")
 
         slam_t_opt, gps_t_opt, chosen_time_mode = choose_time_mode(ts_opt, gps_t_raw, time_mode)
-        gps_x_opt = np.interp(slam_t_opt, gps_t_opt, gps_e)
-        gps_y_opt = np.interp(slam_t_opt, gps_t_opt, gps_n)
-        gps_z_opt = np.interp(slam_t_opt, gps_t_opt, gps_z)
+        gps_x_opt = _interp_no_extrapolation(
+            slam_t_opt,
+            gps_t_opt,
+            gps_e,
+            label="PoseOpt optimized traj easting",
+        )
+        gps_y_opt = _interp_no_extrapolation(
+            slam_t_opt,
+            gps_t_opt,
+            gps_n,
+            label="PoseOpt optimized traj northing",
+        )
+        gps_z_opt = _interp_no_extrapolation(
+            slam_t_opt,
+            gps_t_opt,
+            gps_z,
+            label="PoseOpt optimized traj altitude",
+        )
 
         optimized_xy = poses_opt[:, :2, 3]
         qa_metrics = _compute_xy_alignment_metrics(
@@ -1760,30 +1867,11 @@ def slam_raw_to_gps_anchored_las_pose_optimizer(
         qa_metrics["z_rmse_m"] = float(np.sqrt(np.mean(z_residual**2)))
         qa_metrics["z_p95_abs_m"] = float(np.percentile(np.abs(z_residual), 95))
 
-        qa_path, qa_pass = _write_anchor_qa_report(
-            output_las,
-            backend="pose_optimizer",
-            time_mode_used=chosen_time_mode,
-            metrics=qa_metrics,
-            extra={
-                "constraints_added": int(constraints_added),
-                "poseopt_cost": final_cost,
-                "anchor_z_mode": anchor_z_mode,
-            },
-        )
-        _emit(
-            emit_event,
-            "status",
-            message=(
-                f"Anchor QA: median={qa_metrics['xy_median_m']:.2f} m, "
-                f"p95={qa_metrics['xy_p95_m']:.2f} m, pass={qa_pass} "
-                f"({qa_path})"
-            ),
-        )
-        log(
-            f"Anchor QA: median={qa_metrics['xy_median_m']:.2f} m, "
-            f"p95={qa_metrics['xy_p95_m']:.2f} m, pass={qa_pass} ({qa_path})"
-        )
+        qa_extra = {
+            "constraints_added": int(constraints_added),
+            "poseopt_cost": final_cost,
+            "anchor_z_mode": anchor_z_mode,
+        }
 
         _emit(emit_event, "status", message="Extracting point cloud from raw replay with optimized poses...")
         map_points, pose_lookup = _build_point_cloud_from_raw_with_poses(
@@ -1811,6 +1899,27 @@ def slam_raw_to_gps_anchored_las_pose_optimizer(
         las.z = map_points[:, 2]
         las.write(tmp_output)
         os.replace(tmp_output, output_las)
+
+        qa_path, qa_pass = _write_anchor_qa_report(
+            output_las,
+            backend="pose_optimizer",
+            time_mode_used=chosen_time_mode,
+            metrics=qa_metrics,
+            extra=qa_extra,
+        )
+        _emit(
+            emit_event,
+            "status",
+            message=(
+                f"Anchor QA: median={qa_metrics['xy_median_m']:.2f} m, "
+                f"p95={qa_metrics['xy_p95_m']:.2f} m, pass={qa_pass} "
+                f"({qa_path})"
+            ),
+        )
+        log(
+            f"Anchor QA: median={qa_metrics['xy_median_m']:.2f} m, "
+            f"p95={qa_metrics['xy_p95_m']:.2f} m, pass={qa_pass} ({qa_path})"
+        )
 
         _emit(emit_event, "status", message=f"Done. Final anchored LAS: {output_las}")
         log(f"Done. Final anchored LAS: {output_las}")
@@ -1887,9 +1996,24 @@ def fuse_one_csv_chunk(
     lidar_t, gps_t, chosen_mode = choose_time_mode(lidar_t_raw, gps_t_raw, time_mode)
     log(f"Time alignment mode for {os.path.basename(lidar_csv)}: {chosen_mode}")
 
-    e_interp = np.interp(lidar_t, gps_t, gps_df["easting"].to_numpy(dtype=np.float64))
-    n_interp = np.interp(lidar_t, gps_t, gps_df["northing"].to_numpy(dtype=np.float64))
-    z_interp = np.interp(lidar_t, gps_t, gps_df["altitude_m"].to_numpy(dtype=np.float64))
+    e_interp = _interp_no_extrapolation(
+        lidar_t,
+        gps_t,
+        gps_df["easting"].to_numpy(dtype=np.float64),
+        label=f"{os.path.basename(lidar_csv)} easting",
+    )
+    n_interp = _interp_no_extrapolation(
+        lidar_t,
+        gps_t,
+        gps_df["northing"].to_numpy(dtype=np.float64),
+        label=f"{os.path.basename(lidar_csv)} northing",
+    )
+    z_interp = _interp_no_extrapolation(
+        lidar_t,
+        gps_t,
+        gps_df["altitude_m"].to_numpy(dtype=np.float64),
+        label=f"{os.path.basename(lidar_csv)} altitude",
+    )
 
     lidar_df["x_global"] = e_interp + lidar_df["x_local"] + sensor_offset_x
     lidar_df["y_global"] = n_interp + lidar_df["y_local"] + sensor_offset_y
