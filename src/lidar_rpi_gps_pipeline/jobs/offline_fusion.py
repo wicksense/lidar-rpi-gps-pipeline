@@ -142,31 +142,108 @@ def load_gps_for_interpolation(gps_csv: str, requested_time_col: str) -> Tuple[p
     return gps_df, gps_time_col
 
 
-def _interp_no_extrapolation(
-    query_t: np.ndarray,
-    ref_t: np.ndarray,
-    ref_values: np.ndarray,
-    *,
-    label: str,
-) -> np.ndarray:
-    """
-    Interpolate values for query timestamps, failing if query extends outside ref range.
-    """
+def _gps_in_range_mask(query_t: np.ndarray, ref_t: np.ndarray) -> np.ndarray:
     if query_t.size == 0:
-        return np.asarray([], dtype=np.float64)
-
+        return np.zeros((0,), dtype=bool)
     ref_min = int(ref_t.min())
     ref_max = int(ref_t.max())
-    q_min = int(query_t.min())
-    q_max = int(query_t.max())
+    return (query_t >= ref_min) & (query_t <= ref_max)
 
-    if q_min < ref_min or q_max > ref_max:
+
+def _trim_query_to_gps_range(
+    query_t: np.ndarray,
+    ref_t: np.ndarray,
+    *,
+    label: str,
+    min_points: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Trim query timestamps to GPS-supported range.
+
+    Returns:
+      - trimmed query timestamps
+      - boolean mask (same length as original query)
+    """
+    mask = _gps_in_range_mask(query_t, ref_t)
+    kept = int(mask.sum())
+    dropped = int(mask.size - kept)
+    if dropped > 0:
+        log(f"{label}: trimming {dropped} samples outside GPS time coverage.")
+    if kept < min_points:
+        ref_min = int(ref_t.min())
+        ref_max = int(ref_t.max())
         raise ValueError(
-            f"{label}: interpolation would extrapolate beyond GPS coverage. "
-            f"query=[{q_min}, {q_max}] gps=[{ref_min}, {ref_max}]"
+            f"{label}: only {kept} samples remain after GPS-range trimming "
+            f"(need >= {min_points}). gps=[{ref_min}, {ref_max}]"
+        )
+    return query_t[mask], mask
+
+
+def _compute_path_tangent_heading(
+    easting: np.ndarray,
+    northing: np.ndarray,
+    *,
+    fallback_heading_rad: float,
+) -> np.ndarray:
+    """
+    Compute heading (rad) from GPS trajectory tangent in EN coordinates.
+    """
+    if easting.size == 0:
+        return np.asarray([], dtype=np.float64)
+    if easting.size == 1:
+        return np.asarray([fallback_heading_rad], dtype=np.float64)
+
+    de = np.gradient(easting)
+    dn = np.gradient(northing)
+    motion = np.hypot(de, dn)
+    heading = np.arctan2(dn, de)
+
+    valid = motion > 1e-9
+    if not np.any(valid):
+        return np.full_like(easting, fallback_heading_rad, dtype=np.float64)
+
+    first_valid = int(np.flatnonzero(valid)[0])
+    heading[:first_valid] = heading[first_valid]
+    for idx in range(first_valid + 1, heading.size):
+        if not valid[idx]:
+            heading[idx] = heading[idx - 1]
+    return heading
+
+
+def _rotate_local_xy_for_gps_fusion(
+    x_local: np.ndarray,
+    y_local: np.ndarray,
+    e_interp: np.ndarray,
+    n_interp: np.ndarray,
+    *,
+    orientation_mode: str,
+    sensor_yaw_deg: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Rotate local XY before adding to GPS coordinates.
+
+    - fixed_yaw: use one constant yaw (deg) for all points.
+    - path_tangent: heading follows GPS trajectory tangent + yaw offset.
+    """
+    yaw_rad = float(np.deg2rad(sensor_yaw_deg))
+    if orientation_mode == "fixed_yaw":
+        theta = np.full_like(x_local, yaw_rad, dtype=np.float64)
+    elif orientation_mode == "path_tangent":
+        theta = _compute_path_tangent_heading(
+            e_interp,
+            n_interp,
+            fallback_heading_rad=yaw_rad,
+        ) + yaw_rad
+    else:
+        raise ValueError(
+            "gps_fusion_orientation must be one of: fixed_yaw, path_tangent"
         )
 
-    return np.interp(query_t, ref_t, ref_values)
+    cos_t = np.cos(theta)
+    sin_t = np.sin(theta)
+    x_rot = (cos_t * x_local) - (sin_t * y_local)
+    y_rot = (sin_t * x_local) + (cos_t * y_local)
+    return x_rot, y_rot
 
 
 def _estimate_las_header_offsets_from_gps(
@@ -974,6 +1051,8 @@ def fuse_raw_to_single_las(
     sensor_offset_x: float,
     sensor_offset_y: float,
     sensor_offset_z: float,
+    gps_fusion_orientation: str,
+    sensor_yaw_deg: float,
     keep_converted: bool,
     converted_csv_dir: Optional[str],
     emit_event: EventEmitter,
@@ -1000,6 +1079,8 @@ def fuse_raw_to_single_las(
     total_points = 0
     total_scans = 0
     debug_csv_count = 0
+    trimmed_time_samples = 0
+    trimmed_scans = 0
     header_offsets = _estimate_las_header_offsets_from_gps(
         gps_e,
         gps_n,
@@ -1068,28 +1149,37 @@ def fuse_raw_to_single_las(
                         lidar_t = timestamp_ns
 
                     assert gps_t_mode is not None
-                    interp_label = f"{os.path.basename(raw_path)} scan {scan_idx}"
-                    e_interp = _interp_no_extrapolation(
+                    lidar_t_trimmed, in_range = _trim_query_to_gps_range(
                         lidar_t,
                         gps_t_mode,
-                        gps_e,
-                        label=f"{interp_label} easting",
+                        label=f"{os.path.basename(raw_path)} scan {scan_idx}",
+                        min_points=0,
                     )
-                    n_interp = _interp_no_extrapolation(
-                        lidar_t,
-                        gps_t_mode,
-                        gps_n,
-                        label=f"{interp_label} northing",
-                    )
-                    z_interp = _interp_no_extrapolation(
-                        lidar_t,
-                        gps_t_mode,
-                        gps_z,
-                        label=f"{interp_label} altitude",
+                    dropped_now = int(in_range.size - int(in_range.sum()))
+                    if dropped_now > 0:
+                        trimmed_time_samples += dropped_now
+                        trimmed_scans += 1
+                        x_local = x_local[in_range]
+                        y_local = y_local[in_range]
+                        z_local = z_local[in_range]
+                    if lidar_t_trimmed.size == 0:
+                        continue
+
+                    e_interp = np.interp(lidar_t_trimmed, gps_t_mode, gps_e)
+                    n_interp = np.interp(lidar_t_trimmed, gps_t_mode, gps_n)
+                    z_interp = np.interp(lidar_t_trimmed, gps_t_mode, gps_z)
+
+                    x_local_rot, y_local_rot = _rotate_local_xy_for_gps_fusion(
+                        x_local,
+                        y_local,
+                        e_interp,
+                        n_interp,
+                        orientation_mode=gps_fusion_orientation,
+                        sensor_yaw_deg=sensor_yaw_deg,
                     )
 
-                    x_global = e_interp + x_local + sensor_offset_x
-                    y_global = n_interp + y_local + sensor_offset_y
+                    x_global = e_interp + x_local_rot + sensor_offset_x
+                    y_global = n_interp + y_local_rot + sensor_offset_y
                     z_global = z_interp + z_local + sensor_offset_z
 
                     finite_global = np.isfinite(x_global) & np.isfinite(y_global) & np.isfinite(z_global)
@@ -1156,6 +1246,10 @@ def fuse_raw_to_single_las(
             "total_points": total_points,
             "debug_csv_count": debug_csv_count,
             "time_mode_used": chosen_mode or time_mode,
+            "gps_fusion_orientation": gps_fusion_orientation,
+            "sensor_yaw_deg": float(sensor_yaw_deg),
+            "trimmed_time_samples": int(trimmed_time_samples),
+            "trimmed_scans": int(trimmed_scans),
         }
     except Exception:
         if writer is not None:
@@ -1484,9 +1578,17 @@ def slam_raw_to_gps_anchored_las(
         traj_xyz = np.asarray(traj_xyz_local, dtype=np.float64)
 
         slam_t, gps_t, chosen_time_mode = choose_time_mode(traj_t, gps_t_raw, time_mode)
-        gps_x_interp = _interp_no_extrapolation(slam_t, gps_t, gps_e, label="SLAM traj easting")
-        gps_y_interp = _interp_no_extrapolation(slam_t, gps_t, gps_n, label="SLAM traj northing")
-        gps_z_interp = _interp_no_extrapolation(slam_t, gps_t, gps_z, label="SLAM traj altitude")
+        slam_t, in_range = _trim_query_to_gps_range(
+            slam_t,
+            gps_t,
+            label="SLAM trajectory",
+            min_points=2,
+        )
+        if not np.all(in_range):
+            traj_xyz = traj_xyz[in_range]
+        gps_x_interp = np.interp(slam_t, gps_t, gps_e)
+        gps_y_interp = np.interp(slam_t, gps_t, gps_n)
+        gps_z_interp = np.interp(slam_t, gps_t, gps_z)
 
         slam_xy = traj_xyz[:, :2]
         gps_xy = np.column_stack([gps_x_interp, gps_y_interp])
@@ -1774,9 +1876,18 @@ def slam_raw_to_gps_anchored_las_pose_optimizer(
             raise ValueError("Pose optimizer trajectory has insufficient samples.")
 
         slam_t, gps_t, chosen_time_mode = choose_time_mode(ts_cols, gps_t_raw, time_mode)
-        gps_x_interp = _interp_no_extrapolation(slam_t, gps_t, gps_e, label="PoseOpt traj easting")
-        gps_y_interp = _interp_no_extrapolation(slam_t, gps_t, gps_n, label="PoseOpt traj northing")
-        gps_z_interp = _interp_no_extrapolation(slam_t, gps_t, gps_z, label="PoseOpt traj altitude")
+        slam_t, constraints_in_range = _trim_query_to_gps_range(
+            slam_t,
+            gps_t,
+            label="Pose optimizer trajectory for constraints",
+            min_points=2,
+        )
+        if not np.all(constraints_in_range):
+            ts_cols = ts_cols[constraints_in_range]
+            poses_cols = poses_cols[constraints_in_range]
+        gps_x_interp = np.interp(slam_t, gps_t, gps_e)
+        gps_y_interp = np.interp(slam_t, gps_t, gps_n)
+        gps_z_interp = np.interp(slam_t, gps_t, gps_z)
 
         local_xy = poses_cols[:, :2, 3]
         last_xy = None
@@ -1838,24 +1949,18 @@ def slam_raw_to_gps_anchored_las_pose_optimizer(
             raise ValueError("Optimized pose/timestamp count mismatch.")
 
         slam_t_opt, gps_t_opt, chosen_time_mode = choose_time_mode(ts_opt, gps_t_raw, time_mode)
-        gps_x_opt = _interp_no_extrapolation(
+        slam_t_opt, qa_in_range = _trim_query_to_gps_range(
             slam_t_opt,
             gps_t_opt,
-            gps_e,
-            label="PoseOpt optimized traj easting",
+            label="Pose optimizer trajectory for QA",
+            min_points=2,
         )
-        gps_y_opt = _interp_no_extrapolation(
-            slam_t_opt,
-            gps_t_opt,
-            gps_n,
-            label="PoseOpt optimized traj northing",
-        )
-        gps_z_opt = _interp_no_extrapolation(
-            slam_t_opt,
-            gps_t_opt,
-            gps_z,
-            label="PoseOpt optimized traj altitude",
-        )
+        if not np.all(qa_in_range):
+            ts_opt = ts_opt[qa_in_range]
+            poses_opt = poses_opt[qa_in_range]
+        gps_x_opt = np.interp(slam_t_opt, gps_t_opt, gps_e)
+        gps_y_opt = np.interp(slam_t_opt, gps_t_opt, gps_n)
+        gps_z_opt = np.interp(slam_t_opt, gps_t_opt, gps_z)
 
         optimized_xy = poses_opt[:, :2, 3]
         qa_metrics = _compute_xy_alignment_metrics(
@@ -1976,6 +2081,8 @@ def fuse_one_csv_chunk(
     sensor_offset_x: float,
     sensor_offset_y: float,
     sensor_offset_z: float,
+    gps_fusion_orientation: str,
+    sensor_yaw_deg: float,
 ) -> Tuple[int, str]:
     log(f"Loading LiDAR CSV: {lidar_csv}")
     lidar_df = read_ouster_csv(lidar_csv)
@@ -1996,27 +2103,30 @@ def fuse_one_csv_chunk(
     lidar_t, gps_t, chosen_mode = choose_time_mode(lidar_t_raw, gps_t_raw, time_mode)
     log(f"Time alignment mode for {os.path.basename(lidar_csv)}: {chosen_mode}")
 
-    e_interp = _interp_no_extrapolation(
+    lidar_t, in_range = _trim_query_to_gps_range(
         lidar_t,
         gps_t,
-        gps_df["easting"].to_numpy(dtype=np.float64),
-        label=f"{os.path.basename(lidar_csv)} easting",
+        label=f"{os.path.basename(lidar_csv)}",
+        min_points=1,
     )
-    n_interp = _interp_no_extrapolation(
-        lidar_t,
-        gps_t,
-        gps_df["northing"].to_numpy(dtype=np.float64),
-        label=f"{os.path.basename(lidar_csv)} northing",
-    )
-    z_interp = _interp_no_extrapolation(
-        lidar_t,
-        gps_t,
-        gps_df["altitude_m"].to_numpy(dtype=np.float64),
-        label=f"{os.path.basename(lidar_csv)} altitude",
+    if not np.all(in_range):
+        lidar_df = lidar_df.loc[in_range].reset_index(drop=True)
+
+    e_interp = np.interp(lidar_t, gps_t, gps_df["easting"].to_numpy(dtype=np.float64))
+    n_interp = np.interp(lidar_t, gps_t, gps_df["northing"].to_numpy(dtype=np.float64))
+    z_interp = np.interp(lidar_t, gps_t, gps_df["altitude_m"].to_numpy(dtype=np.float64))
+
+    x_local_rot, y_local_rot = _rotate_local_xy_for_gps_fusion(
+        lidar_df["x_local"].to_numpy(dtype=np.float64),
+        lidar_df["y_local"].to_numpy(dtype=np.float64),
+        e_interp,
+        n_interp,
+        orientation_mode=gps_fusion_orientation,
+        sensor_yaw_deg=sensor_yaw_deg,
     )
 
-    lidar_df["x_global"] = e_interp + lidar_df["x_local"] + sensor_offset_x
-    lidar_df["y_global"] = n_interp + lidar_df["y_local"] + sensor_offset_y
+    lidar_df["x_global"] = e_interp + x_local_rot + sensor_offset_x
+    lidar_df["y_global"] = n_interp + y_local_rot + sensor_offset_y
     lidar_df["z_global"] = z_interp + lidar_df["z_local"] + sensor_offset_z
 
     out_csv = output_prefix + ".csv"
@@ -2049,6 +2159,8 @@ def fuse_csv_chunks(
     sensor_offset_x: float,
     sensor_offset_y: float,
     sensor_offset_z: float,
+    gps_fusion_orientation: str,
+    sensor_yaw_deg: float,
     emit_event: EventEmitter,
     should_cancel: CancelChecker,
 ) -> Dict[str, Any]:
@@ -2069,6 +2181,8 @@ def fuse_csv_chunks(
                 sensor_offset_x=sensor_offset_x,
                 sensor_offset_y=sensor_offset_y,
                 sensor_offset_z=sensor_offset_z,
+                gps_fusion_orientation=gps_fusion_orientation,
+                sensor_yaw_deg=sensor_yaw_deg,
             )
             total_points += points
             log(
@@ -2177,6 +2291,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sensor-offset-x", type=float, default=0.0, help="Sensor offset X in meters.")
     parser.add_argument("--sensor-offset-y", type=float, default=0.0, help="Sensor offset Y in meters.")
     parser.add_argument("--sensor-offset-z", type=float, default=0.0, help="Sensor offset Z in meters.")
+    parser.add_argument(
+        "--gps-fusion-orientation",
+        choices=["fixed_yaw", "path_tangent"],
+        default="path_tangent",
+        help=(
+            "How to orient local LiDAR XY in gps_fusion mode. "
+            "'fixed_yaw' uses constant --sensor-yaw-deg. "
+            "'path_tangent' uses GPS trajectory direction plus --sensor-yaw-deg."
+        ),
+    )
+    parser.add_argument(
+        "--sensor-yaw-deg",
+        type=float,
+        default=0.0,
+        help="Additional yaw offset (degrees) applied in gps_fusion orientation handling.",
+    )
     parser.add_argument(
         "--slam-voxel-size",
         type=float,
@@ -2452,6 +2582,8 @@ def run_from_args(
             sensor_offset_x=args.sensor_offset_x,
             sensor_offset_y=args.sensor_offset_y,
             sensor_offset_z=args.sensor_offset_z,
+            gps_fusion_orientation=args.gps_fusion_orientation,
+            sensor_yaw_deg=args.sensor_yaw_deg,
             keep_converted=bool(args.keep_converted),
             converted_csv_dir=args.converted_csv_dir,
             emit_event=emit_event,
@@ -2485,6 +2617,8 @@ def run_from_args(
         sensor_offset_x=args.sensor_offset_x,
         sensor_offset_y=args.sensor_offset_y,
         sensor_offset_z=args.sensor_offset_z,
+        gps_fusion_orientation=args.gps_fusion_orientation,
+        sensor_yaw_deg=args.sensor_yaw_deg,
         emit_event=emit_event,
         should_cancel=should_cancel,
     )

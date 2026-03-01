@@ -18,6 +18,29 @@ Validated setup:
 GPS-to-Ouster wiring reference:
 - https://data.ouster.io/downloads/hardware-user-manual/hardware-user-manual-revd-os0.pdf
 
+## Mounting and Orientation
+
+How to align (step-by-step):
+1. Mount the GNSS antenna so it faces open sky.
+2. Rigidly mount antenna and LiDAR to the same structure (avoid flex/wobble).
+3. Estimate LiDAR center and antenna phase-center location.
+4. Measure offsets in meters: `dx`, `dy`, `dz`.
+5. Pass offsets in offline processing:
+   - `--sensor-offset-x`
+   - `--sensor-offset-y`
+   - `--sensor-offset-z`
+
+What matters vs what does not:
+- For this pipeline, antenna position relative to LiDAR is the key reference.
+- ZED-F9P board/chip orientation is usually not critical.
+- `gps_fusion` now supports orientation handling; tune yaw/orientation options when needed.
+- For handheld capture with changing heading, prefer `slam_gps_anchor` (recommended).
+
+Antenna type (pillar vs flat patch/puck):
+- Both can work; do not switch only for shape.
+- Keep whichever gives better fix quality and stable track in your environment.
+- In practice, priorities are: sky visibility, rigid mounting, phase-center stability, and dual-band GNSS quality.
+
 ## Workflow Overview
 
 1. Run `pi_capture_raw.py` on the Pi
@@ -278,6 +301,19 @@ Guidance:
 - use `unix_ns` when both LiDAR and GPS are true epoch-ns timestamps
 - use `relative_start` when clocks are not directly aligned
 
+## GPS Fusion Orientation Options
+
+These options apply to `--processing-mode gps_fusion`:
+
+- `--gps-fusion-orientation path_tangent` (default): rotate local XY by GPS path direction
+- `--gps-fusion-orientation fixed_yaw`: use one fixed yaw for all points
+- `--sensor-yaw-deg`: additional yaw offset in degrees (used in both modes)
+
+Guidance:
+- For moving captures where heading changes, `path_tangent` is usually better than fixed assumptions.
+- If your LiDAR has a known fixed heading offset, set `--sensor-yaw-deg` accordingly.
+- If orientation behavior is still not satisfactory for handheld data, use `slam_gps_anchor`.
+
 ## GPS Time Column Options
 
 - `--gps-time-column auto` (default; prefers `gps_epoch_ns`, falls back to `pi_time_ns`)
@@ -326,6 +362,7 @@ Values are in meters and applied during fusion.
 ## Common Pitfalls
 
 - GPS CSV must contain at least 2 usable rows for interpolation.
+- GPS-fusion interpolation trims points/samples outside GPS time coverage (instead of extrapolating).
 - Manifest paths from Pi can be absolute and may need remapping with `--manifest-base-dir`.
 - Enabling `--keep-converted` can generate many debug CSV files.
 - Large captures can produce large LAS files; make sure the output drive has enough free space.

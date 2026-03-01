@@ -172,6 +172,24 @@ class _BaseModeWidget(QWidget):
         advanced_row.addWidget(QLabel("GPS time column"))
         advanced_row.addWidget(self.gps_time_col)
 
+        self.gps_fusion_orientation = QComboBox()
+        self.gps_fusion_orientation.addItem("path_tangent", "path_tangent")
+        self.gps_fusion_orientation.addItem("fixed_yaw", "fixed_yaw")
+        self.gps_fusion_orientation.setToolTip(
+            "gps_fusion orientation mode: path_tangent follows GPS trajectory, fixed_yaw uses only yaw offset."
+        )
+        advanced_row.addWidget(QLabel("Fusion orientation"))
+        advanced_row.addWidget(self.gps_fusion_orientation)
+
+        self.sensor_yaw_deg = QDoubleSpinBox()
+        self.sensor_yaw_deg.setRange(-360.0, 360.0)
+        self.sensor_yaw_deg.setDecimals(2)
+        self.sensor_yaw_deg.setSingleStep(1.0)
+        self.sensor_yaw_deg.setValue(0.0)
+        self.sensor_yaw_deg.setToolTip("Additional yaw offset (degrees) for gps_fusion orientation.")
+        advanced_row.addWidget(QLabel("Sensor yaw (deg)"))
+        advanced_row.addWidget(self.sensor_yaw_deg)
+
         self.utm_epsg = QSpinBox()
         self.utm_epsg.setRange(1000, 999999)
         self.utm_epsg.setValue(32614)
@@ -256,6 +274,8 @@ class _BaseModeWidget(QWidget):
         self.time_mode.setEnabled(gps_needed)
         self.gps_time_col.setEnabled(gps_needed)
         self.keep_converted.setEnabled(mode == "gps_fusion")
+        self.gps_fusion_orientation.setEnabled(mode == "gps_fusion")
+        self.sensor_yaw_deg.setEnabled(mode == "gps_fusion")
         self.save_osf.setEnabled(mode in {"slam_map", "slam_gps_anchor"})
 
         slam_mode = mode in {"slam_map", "slam_gps_anchor"}
@@ -495,6 +515,8 @@ class ManifestModeWidget(_BaseModeWidget):
             cfg["gps_time_column"] = self.gps_time_col.currentText()
         if mode == "gps_fusion":
             cfg["keep_converted"] = self.keep_converted.isChecked()
+            cfg["gps_fusion_orientation"] = str(self.gps_fusion_orientation.currentData())
+            cfg["sensor_yaw_deg"] = float(self.sensor_yaw_deg.value())
 
         if self.manifest_base_dir.text().strip():
             cfg["manifest_base_dir"] = self.manifest_base_dir.text().strip()
@@ -557,6 +579,8 @@ class RawModeWidget(_BaseModeWidget):
             cfg["gps_time_column"] = self.gps_time_col.currentText()
         if mode == "gps_fusion":
             cfg["keep_converted"] = self.keep_converted.isChecked()
+            cfg["gps_fusion_orientation"] = str(self.gps_fusion_orientation.currentData())
+            cfg["sensor_yaw_deg"] = float(self.sensor_yaw_deg.value())
         if mode == "gps_fusion" and self.converted_csv_dir.text().strip():
             cfg["converted_csv_dir"] = self.converted_csv_dir.text().strip()
         return cfg
