@@ -36,10 +36,6 @@ What matters vs what does not:
 - `gps_fusion` now supports orientation handling; tune yaw/orientation options when needed.
 - For handheld capture with changing heading, prefer `slam_gps_anchor` (recommended).
 
-Antenna type (pillar vs flat patch/puck):
-- Both can work; do not switch only for shape.
-- Keep whichever gives better fix quality and stable track in your environment.
-- In practice, priorities are: sky visibility, rigid mounting, phase-center stability, and dual-band GNSS quality.
 
 ## Workflow Overview
 
@@ -341,6 +337,60 @@ These options apply to `--processing-mode gps_fusion` and `--processing-mode sla
 - `--poseopt-constraint-weights` default `0.01,0.01,0.001`
 - `--poseopt-max-iterations` default `50`
 - `--poseopt-map-voxel-size` default `0.5` (`0` disables map downsampling)
+
+## Parameter Tuning Guide
+
+Use this as a practical starting point before fine-tuning:
+
+1. Start with `slam_gps_anchor` + `pose_optimizer` backend.
+2. Keep defaults for the first run.
+3. Check QA (`*_qa.json`) and map quality.
+4. Adjust one parameter group at a time.
+
+Recommended starting profiles:
+
+- Handheld urban walk:
+  `--slam-min-range 1.5 --slam-max-range 120 --poseopt-constraints-every-m 8 --poseopt-map-voxel-size 0.25`
+- Slow push-cart / stable rig:
+  `--slam-min-range 1.0 --slam-max-range 150 --poseopt-constraints-every-m 10 --poseopt-map-voxel-size 0.5`
+- Dense downtown / heavy multipath:
+  `--slam-min-range 1.5 --slam-max-range 80 --poseopt-constraints-every-m 6 --poseopt-map-voxel-size 0.2`
+
+What each knob changes:
+
+- `--slam-voxel-size`:
+  lower = denser map, more compute; higher = smoother/coarser map, faster runtime.
+- `--slam-min-range`:
+  raise this to remove near-body/operator points and close-in artifacts.
+- `--slam-max-range`:
+  lower this in clutter/multipath environments to reduce unstable far returns.
+- `--slam-deskew-method`:
+  start with `auto`; use `constant_velocity` if motion distortion is visible and `auto` underperforms.
+- `--poseopt-constraints-every-m`:
+  lower value = more GPS constraints (more correction, more sensitivity to noisy GPS);
+  higher value = fewer constraints (smoother but less anchored).
+- `--poseopt-map-voxel-size`:
+  lower value = larger LAS files with more detail; higher value = smaller/faster outputs.
+- `--anchor-min-motion-m`:
+  raise this if short/noisy tracks are over-rotated by rigid fallback.
+- `--sensor-offset-x/y/z`:
+  use measured antenna-to-LiDAR offsets; incorrect signs produce consistent spatial bias.
+- `--gps-fusion-orientation` and `--sensor-yaw-deg` (gps_fusion mode):
+  use `path_tangent` for changing heading;
+  use `fixed_yaw` only when sensor heading relative to map is known and stable.
+
+Symptoms and likely fixes:
+
+- Thick/ghosted walls:
+  increase `--slam-min-range`; try `--slam-deskew-method constant_velocity`.
+- Map looks too sparse:
+  decrease `--poseopt-map-voxel-size`; verify `--slam-max-range` is not too low.
+- QA XY errors high:
+  lower `--poseopt-constraints-every-m` moderately; verify GPS quality and offsets.
+- Output file too large:
+  increase `--poseopt-map-voxel-size`; increase `--slam-voxel-size`.
+- gps_fusion looks directionally skewed:
+  switch to `--gps-fusion-orientation path_tangent` or adjust `--sensor-yaw-deg`.
 
 ## CRS / EPSG Notes
 
