@@ -9,7 +9,7 @@ import sys
 import traceback
 from typing import Any, Dict
 
-from PySide6.QtCore import QThread, Signal
+from PySide6.QtCore import QThread, Signal, Qt
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QPlainTextEdit,
     QProgressBar,
+    QScrollArea,
     QSpinBox,
     QTabWidget,
     QVBoxLayout,
@@ -72,8 +73,18 @@ class _BaseModeWidget(QWidget):
         self._last_output_osf: str | None = None
         self._viz_processes: list[subprocess.Popen] = []
 
-        root = QVBoxLayout(self)
-        root.addWidget(QLabel(title))
+        outer = QVBoxLayout(self)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.NoFrame)
+        outer.addWidget(scroll)
+
+        content = QWidget()
+        scroll.setWidget(content)
+
+        root = QVBoxLayout(content)
+        self.mode_title_label = QLabel(title)
+        root.addWidget(self.mode_title_label)
 
         self.form = QFormLayout()
         root.addLayout(self.form)
@@ -161,16 +172,51 @@ class _BaseModeWidget(QWidget):
         anchor_container.setLayout(anchor_row)
         self.form.addRow("Anchor options", anchor_container)
 
-        advanced_row = QHBoxLayout()
+        advanced_row_1 = QHBoxLayout()
         self.time_mode = QComboBox()
         self.time_mode.addItems(["auto", "unix_ns", "relative_start"])
-        advanced_row.addWidget(QLabel("Time mode"))
-        advanced_row.addWidget(self.time_mode)
+        advanced_row_1.addWidget(QLabel("Time mode"))
+        advanced_row_1.addWidget(self.time_mode)
 
         self.gps_time_col = QComboBox()
         self.gps_time_col.addItems(["auto", "gps_epoch_ns", "pi_time_ns"])
-        advanced_row.addWidget(QLabel("GPS time column"))
-        advanced_row.addWidget(self.gps_time_col)
+        advanced_row_1.addWidget(QLabel("GPS time column"))
+        advanced_row_1.addWidget(self.gps_time_col)
+
+        self.gps_outlier_filter = QCheckBox("Filter GPS outliers")
+        self.gps_outlier_filter.setChecked(True)
+        self.gps_outlier_filter.setToolTip(
+            "Drops GPS rows with implausible speed jumps before interpolation."
+        )
+        self.gps_outlier_filter.stateChanged.connect(self._on_processing_mode_changed)
+        advanced_row_1.addWidget(self.gps_outlier_filter)
+
+        self.gps_outlier_max_speed = QDoubleSpinBox()
+        self.gps_outlier_max_speed.setRange(1.0, 120.0)
+        self.gps_outlier_max_speed.setDecimals(1)
+        self.gps_outlier_max_speed.setSingleStep(1.0)
+        self.gps_outlier_max_speed.setValue(30.0)
+        self.gps_outlier_max_speed.setToolTip("Maximum allowed GPS speed (m/s) for outlier filtering.")
+        advanced_row_1.addWidget(QLabel("Max GPS speed (m/s)"))
+        advanced_row_1.addWidget(self.gps_outlier_max_speed)
+        advanced_row_1.addStretch()
+        root.addLayout(advanced_row_1)
+
+        advanced_row_2 = QHBoxLayout()
+        self.reflectivity_filter = QCheckBox("Filter reflectivity")
+        self.reflectivity_filter.setChecked(False)
+        self.reflectivity_filter.setToolTip(
+            "Drops points below minimum reflectivity in raw replay point export paths."
+        )
+        self.reflectivity_filter.stateChanged.connect(self._on_processing_mode_changed)
+        advanced_row_2.addWidget(self.reflectivity_filter)
+
+        self.min_reflectivity = QSpinBox()
+        self.min_reflectivity.setRange(1, 255)
+        self.min_reflectivity.setValue(2)
+        self.min_reflectivity.setToolTip("Minimum reflectivity value to keep when reflectivity filtering is enabled.")
+        advanced_row_2.addWidget(QLabel("Min reflectivity"))
+        advanced_row_2.addWidget(self.min_reflectivity)
 
         self.gps_fusion_orientation = QComboBox()
         self.gps_fusion_orientation.addItem("path_tangent", "path_tangent")
@@ -178,8 +224,8 @@ class _BaseModeWidget(QWidget):
         self.gps_fusion_orientation.setToolTip(
             "gps_fusion orientation mode: path_tangent follows GPS trajectory, fixed_yaw uses only yaw offset."
         )
-        advanced_row.addWidget(QLabel("Fusion orientation"))
-        advanced_row.addWidget(self.gps_fusion_orientation)
+        advanced_row_2.addWidget(QLabel("Fusion orientation"))
+        advanced_row_2.addWidget(self.gps_fusion_orientation)
 
         self.sensor_yaw_deg = QDoubleSpinBox()
         self.sensor_yaw_deg.setRange(-360.0, 360.0)
@@ -187,23 +233,35 @@ class _BaseModeWidget(QWidget):
         self.sensor_yaw_deg.setSingleStep(1.0)
         self.sensor_yaw_deg.setValue(0.0)
         self.sensor_yaw_deg.setToolTip("Additional yaw offset (degrees) for gps_fusion orientation.")
-        advanced_row.addWidget(QLabel("Sensor yaw (deg)"))
-        advanced_row.addWidget(self.sensor_yaw_deg)
+        advanced_row_2.addWidget(QLabel("Sensor yaw (deg)"))
+        advanced_row_2.addWidget(self.sensor_yaw_deg)
+        advanced_row_2.addStretch()
+        root.addLayout(advanced_row_2)
 
+        advanced_row_3 = QHBoxLayout()
         self.utm_epsg = QSpinBox()
         self.utm_epsg.setRange(1000, 999999)
         self.utm_epsg.setValue(32614)
         self.utm_epsg.setToolTip("CRS EPSG written to LAS metadata and used by GPS-fusion outputs.")
-        advanced_row.addWidget(QLabel("UTM EPSG"))
-        advanced_row.addWidget(self.utm_epsg)
+        advanced_row_3.addWidget(QLabel("UTM EPSG"))
+        advanced_row_3.addWidget(self.utm_epsg)
 
         self.save_osf = QCheckBox("Save OSF playback file")
-        advanced_row.addWidget(self.save_osf)
+        advanced_row_3.addWidget(self.save_osf)
+
+        self.viz_accum_num = QSpinBox()
+        self.viz_accum_num.setRange(0, 5000)
+        self.viz_accum_num.setValue(100)
+        self.viz_accum_num.setToolTip(
+            "Ouster Viz accum-num used by 'Open OSF in Viz'. 0 disables explicit accum-num argument."
+        )
+        advanced_row_3.addWidget(QLabel("Viz accum-num"))
+        advanced_row_3.addWidget(self.viz_accum_num)
 
         self.keep_converted = QCheckBox("Keep debug converted CSV files")
-        advanced_row.addWidget(self.keep_converted)
-        advanced_row.addStretch()
-        root.addLayout(advanced_row)
+        advanced_row_3.addWidget(self.keep_converted)
+        advanced_row_3.addStretch()
+        root.addLayout(advanced_row_3)
 
         run_row = QHBoxLayout()
         self.run_btn = QPushButton("Run")
@@ -239,6 +297,7 @@ class _BaseModeWidget(QWidget):
 
         self.logs = QPlainTextEdit()
         self.logs.setReadOnly(True)
+        self.logs.setMinimumHeight(180)
         root.addWidget(self.logs)
         self._on_processing_mode_changed()
 
@@ -273,6 +332,11 @@ class _BaseModeWidget(QWidget):
         gps_needed = mode in {"gps_fusion", "slam_gps_anchor"}
         self.time_mode.setEnabled(gps_needed)
         self.gps_time_col.setEnabled(gps_needed)
+        self.gps_outlier_filter.setEnabled(gps_needed)
+        self.gps_outlier_max_speed.setEnabled(gps_needed and self.gps_outlier_filter.isChecked())
+        reflectivity_supported_mode = mode in {"gps_fusion", "slam_gps_anchor"}
+        self.reflectivity_filter.setEnabled(reflectivity_supported_mode)
+        self.min_reflectivity.setEnabled(reflectivity_supported_mode and self.reflectivity_filter.isChecked())
         self.keep_converted.setEnabled(mode == "gps_fusion")
         self.gps_fusion_orientation.setEnabled(mode == "gps_fusion")
         self.sensor_yaw_deg.setEnabled(mode == "gps_fusion")
@@ -374,6 +438,9 @@ class _BaseModeWidget(QWidget):
             return
 
         cmd = [ouster_cli, "source", self._last_output_osf, "viz"]
+        accum_num = int(self.viz_accum_num.value())
+        if accum_num > 0:
+            cmd.extend(["--accum-num", str(accum_num)])
         try:
             proc = subprocess.Popen(cmd)
         except Exception as e:
@@ -382,7 +449,7 @@ class _BaseModeWidget(QWidget):
 
         self._viz_processes = [p for p in self._viz_processes if p.poll() is None]
         self._viz_processes.append(proc)
-        self.append_log(f"Launched Ouster Viz for: {self._last_output_osf}")
+        self.append_log(f"Launched Ouster Viz: {' '.join(cmd)}")
 
     def _on_job_event(self, event: dict) -> None:
         kind = event.get("kind", "event")
@@ -445,6 +512,19 @@ class _BaseModeWidget(QWidget):
             self.append_log(f"QA report: {summary['qa_report_path']}")
             if summary.get("qa_pass") is not None:
                 self.append_log(f"QA pass: {summary['qa_pass']}")
+        if summary.get("pose_lookup_dropped_columns") is not None:
+            dropped = int(summary["pose_lookup_dropped_columns"])
+            inlier = int(summary.get("pose_lookup_inlier_columns", 0))
+            max_delta = int(summary.get("pose_lookup_max_delta_ns", 0))
+            self.append_log(
+                "Pose lookup columns: "
+                f"inlier={inlier:,}, dropped={dropped:,}, max_delta_ns={max_delta}"
+            )
+        if summary.get("reflectivity_scans_missing_field") is not None:
+            self.append_log(
+                "Reflectivity filter scan-field misses: "
+                f"{int(summary['reflectivity_scans_missing_field']):,}"
+            )
         if summary.get("total_points") is not None:
             self.append_log(f"Total points: {int(summary['total_points']):,}")
         if summary.get("total_scans") is not None:
@@ -513,6 +593,10 @@ class ManifestModeWidget(_BaseModeWidget):
         if mode in {"gps_fusion", "slam_gps_anchor"}:
             cfg["time_mode"] = self.time_mode.currentText()
             cfg["gps_time_column"] = self.gps_time_col.currentText()
+            cfg["gps_outlier_filter"] = "on" if self.gps_outlier_filter.isChecked() else "off"
+            cfg["gps_outlier_max_speed_mps"] = float(self.gps_outlier_max_speed.value())
+            cfg["reflectivity_filter"] = "on" if self.reflectivity_filter.isChecked() else "off"
+            cfg["min_reflectivity"] = int(self.min_reflectivity.value())
         if mode == "gps_fusion":
             cfg["keep_converted"] = self.keep_converted.isChecked()
             cfg["gps_fusion_orientation"] = str(self.gps_fusion_orientation.currentData())
@@ -532,11 +616,18 @@ class RawModeWidget(_BaseModeWidget):
         super().__init__("Mode: Raw Folder -> Process (SLAM/SLAM+GPS/GPS Fusion)")
 
         self.raw_dir = QLineEdit()
+        self.lidar_session_filter = QLineEdit()
+        self.lidar_session_filter.setPlaceholderText("Optional: 20260317_094022")
+        self.lidar_session_filter.setToolTip(
+            "Optional session id to filter raw files in this folder. "
+            "If empty, session id is auto-inferred from GPS CSV filename when possible."
+        )
         self.gps_csv = QLineEdit()
         self.output_dir = QLineEdit()
         self.converted_csv_dir = QLineEdit()
 
         self.add_path_row("Raw input dir", self.raw_dir, pick_dir=True)
+        self.form.addRow("Raw session filter (optional)", self.lidar_session_filter)
         self.add_path_row("GPS CSV (required for gps_fusion/anchor)", self.gps_csv, pick_file=True)
         self.add_path_row("Output dir", self.output_dir, pick_dir=True)
         self.add_path_row("Debug converted CSV dir (optional)", self.converted_csv_dir, pick_dir=True)
@@ -577,12 +668,51 @@ class RawModeWidget(_BaseModeWidget):
         if mode in {"gps_fusion", "slam_gps_anchor"}:
             cfg["time_mode"] = self.time_mode.currentText()
             cfg["gps_time_column"] = self.gps_time_col.currentText()
+            cfg["gps_outlier_filter"] = "on" if self.gps_outlier_filter.isChecked() else "off"
+            cfg["gps_outlier_max_speed_mps"] = float(self.gps_outlier_max_speed.value())
+            cfg["reflectivity_filter"] = "on" if self.reflectivity_filter.isChecked() else "off"
+            cfg["min_reflectivity"] = int(self.min_reflectivity.value())
         if mode == "gps_fusion":
             cfg["keep_converted"] = self.keep_converted.isChecked()
             cfg["gps_fusion_orientation"] = str(self.gps_fusion_orientation.currentData())
             cfg["sensor_yaw_deg"] = float(self.sensor_yaw_deg.value())
         if mode == "gps_fusion" and self.converted_csv_dir.text().strip():
             cfg["converted_csv_dir"] = self.converted_csv_dir.text().strip()
+        if self.lidar_session_filter.text().strip():
+            cfg["lidar_session_filter"] = self.lidar_session_filter.text().strip()
+        return cfg
+
+
+class RawMergeLocalWidget(RawModeWidget):
+    """Dedicated raw chunk merge tab: fixed local SLAM map, no GPS fusion/georeference."""
+
+    def __init__(self):
+        super().__init__()
+        self.mode_title_label.setText("Mode: Raw Folder -> Merge Chunks (Local SLAM, No GPS)")
+
+        slam_map_index = self.processing_mode.findData("slam_map")
+        if slam_map_index >= 0:
+            self.processing_mode.setCurrentIndex(slam_map_index)
+        self.processing_mode.setEnabled(False)
+        self.processing_mode.setToolTip(
+            "Fixed mode: SLAM Map (Local). Merges raw chunks into one local map without GPS fusion."
+        )
+
+        self.gps_csv.clear()
+        self.gps_csv.setPlaceholderText("Not used in this tab")
+        self.gps_csv.setEnabled(False)
+        self.converted_csv_dir.clear()
+        self.converted_csv_dir.setEnabled(False)
+        self.keep_converted.setChecked(False)
+        self.keep_converted.setEnabled(False)
+        self.save_osf.setChecked(True)
+        self._on_processing_mode_changed()
+
+    def build_config(self) -> Dict[str, Any]:
+        cfg = super().build_config()
+        cfg["processing_mode"] = "slam_map"
+        cfg.pop("gps_csv", None)
+        cfg.pop("converted_csv_dir", None)
         return cfg
 
 
@@ -590,16 +720,18 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("LiDAR RPi GPS Pipeline")
+        self.setWindowFlag(Qt.WindowMaximizeButtonHint, True)
         self.resize(1024, 760)
 
         tabs = QTabWidget()
         tabs.addTab(ManifestModeWidget(), "Manifest -> Process")
         tabs.addTab(RawModeWidget(), "Raw -> Process")
+        tabs.addTab(RawMergeLocalWidget(), "Raw -> Merge Chunks")
         self.setCentralWidget(tabs)
 
 
 def run_gui() -> None:
     app = QApplication([])
     win = MainWindow()
-    win.show()
+    win.showMaximized()
     app.exec()

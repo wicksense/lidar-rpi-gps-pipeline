@@ -94,19 +94,110 @@ Optional GUI dependency:
 python -m pip install pyside6
 ```
 
+Optional test dependency:
+
+```bash
+python -m pip install pytest
+```
+
 Run GUI:
 
 ```bash
 python3 offline_gui.py
 ```
 
+## GUI quick start
+
+The GUI has three tabs:
+- `Manifest -> Process`: use when you have `capture_manifest_*.json`
+- `Raw -> Process`: use when you have a folder of `.pcap/.osf` files directly
+- `Raw -> Merge Chunks`: local SLAM merge only (no GPS fusion/georeference)
+
+### Recommended flow (Raw tab)
+
+1. Open `Raw -> Process`.
+2. Set `Processing mode` to `SLAM + GPS Anchor (Recommended)`.
+3. Fill:
+   - `Raw input dir`: folder containing your raw LiDAR chunks (`.pcap/.osf`)
+   - `Raw session filter (optional)`: session id like `20260317_094022`
+   - `GPS CSV`: matching `raw_gps_*.csv`
+   - `Output dir`: where output LAS/QA files should be written
+4. Keep defaults for first run:
+   - `Backend`: `pose_optimizer (recommended)`
+   - `Time mode`: `auto`
+   - `GPS time column`: `auto`
+   - `Filter GPS outliers`: enabled
+   - `Max GPS speed (m/s)`: `30.0`
+   - `Filter reflectivity`: disabled (enable for crisper maps on noisy data)
+   - `Min reflectivity`: `2` when enabled
+   - `UTM EPSG`: `32614` (change only if your project CRS differs)
+   - Leave `Raw session filter` empty to auto-infer session id from GPS CSV filename
+5. Click `Run`.
+6. Watch progress/logs in the bottom panel. On success, output paths are printed in the log.
+
+### Merge-only flow (Raw -> Merge Chunks tab)
+
+Use this when you want to combine chunked raw captures into one local map without GPS fusion.
+
+1. Open `Raw -> Merge Chunks`.
+2. Fill:
+   - `Raw input dir`: folder containing your raw LiDAR chunks (`.pcap/.osf`)
+   - `Raw session filter (optional)`: session id like `20260317_094022`
+   - `Output dir`: where merged outputs should be written
+3. Click `Run`.
+
+Notes:
+- This tab is fixed to `SLAM Map (Local)` mode.
+- GPS CSV is not used.
+- Output is local-frame (not georeferenced to map coordinates).
+
+### Manifest tab flow
+
+1. Open `Manifest -> Process`.
+2. Fill:
+   - `Manifest JSON`: `capture_manifest_*.json`
+   - `Output dir`: destination for outputs
+3. Optional:
+   - `Manifest base dir`: use when manifest paths are from another machine
+   - `GPS CSV override`: force a specific GPS CSV for `gps_fusion` or `slam_gps_anchor`
+4. Click `Run`.
+
+### Which mode to choose
+
+- `SLAM + GPS Anchor`: best default for moving vehicle captures
+- `SLAM Map`: local map only (no GPS georeference)
+- `GPS Fusion`: direct GPS georeference, more sensitive to GPS/heading quality
+
+### Buttons and behavior
+
+- `Run`: starts processing in-process (no CLI subprocess).
+- `Stop`: requests safe cancellation; partial outputs are cleaned up.
+- `Open OSF in Viz`: enabled after runs that produce OSF (`save_osf` in SLAM modes).
+  Uses `Viz accum-num` value when launching Ouster Viz.
+
+### Example values (your March 17 data)
+
+In `Raw -> Process`:
+- `Raw input dir`: `/home/spriteadmin/Documents/LiDAR-Object-Detection/SampleData/3-17`
+- `Raw session filter (optional)`: `20260317_094022`
+- `GPS CSV`: `/home/spriteadmin/Documents/LiDAR-Object-Detection/SampleData/3-17/raw_gps_20260317_094022.csv`
+- `Output dir`: `/home/spriteadmin/Documents/ lidar-rpi-gps-pipeline/test_outputs`
+- `Processing mode`: `SLAM + GPS Anchor (Recommended)`
+- `Backend`: `pose_optimizer (recommended)`
+
 GUI notes:
 - Mode selector supports `SLAM + GPS Anchor`, `SLAM Map`, and `GPS Fusion`.
 - Anchor mode includes backend/options for constraint-based pose optimization.
 - SLAM modes can also save an `.osf` playback file.
-- `Open OSF in Viz` launches `ouster-cli source <output.osf> viz` after runs.
+- `Open OSF in Viz` launches `ouster-cli source <output.osf> viz --accum-num <N>` when `Viz accum-num > 0`.
 - Includes progress indicators while processing files/scans.
 - `Stop` asks for confirmation, cancels safely, and cleans partial LAS output.
+
+Run unit tests:
+
+```bash
+PYTHONPATH=src python -m pytest -q
+```
 
 ## Capture on Raspberry Pi
 
@@ -123,16 +214,33 @@ python3 pi_capture_raw.py --wait-for-gps-fix
 python3 pi_capture_raw.py --no-wait-for-gps-fix
 ```
 
+Optional runtime override for lidar mode:
+
+```bash
+python3 pi_capture_raw.py --lidar-mode 1024x20
+python3 pi_capture_raw.py --lidar-mode 2048x10
+python3 pi_capture_raw.py --lidar-mode 4096x5
+```
+
 ### Key capture settings (inside `pi_capture_raw.py`)
 
 - `OUSTER_HOST`: sensor IP on Pi Ethernet link
 - `LIDAR_OUTPUT_MODE`: `pcap_raw` (default) or `csv`
+- `LIDAR_MODE`: sensor mode applied before capture, for example `1024x20`, `2048x10`, or `4096x5`
 - `CAPTURE_DURATION_SEC`: seconds per chunk (default `30`)
 - `CONTINUOUS_CHUNKS`: keep chunking until `Ctrl+C`
 - `WAIT_FOR_GPS_FIX_BEFORE_CAPTURE`: wait for first fix before LiDAR start
 - `GPS_PORT`, `GPS_BAUD`: GPS serial settings
 - `OUTPUT_DIR`: output folder on Pi
 - `UTM_EPSG`: projected CRS used for GPS easting/northing
+
+Notes:
+- The Pi script uses `ouster-cli source <sensor> config lidar_mode <mode>` before capture starts.
+- Set `LIDAR_MODE = None` (or pass an empty override by editing the file) to leave the current sensor mode unchanged.
+- Useful defaults:
+  `1024x20` for walking / strongest pose robustness,
+  `2048x10` as the balanced option,
+  `4096x5` for maximum spatial crispness with smoother motion.
 
 ### Choosing chunk duration
 
@@ -209,6 +317,12 @@ Useful anchoring parameters:
 - `--anchor-min-motion-m` (default `5.0`)
 - `--anchor-z-mode` (`offset` or `none`)
 - `--anchor-backend` (`pose_optimizer` recommended, `rigid_fit` optional simpler method)
+- `--gps-outlier-filter` (`on`/`off`, default `on`)
+- `--gps-outlier-max-speed-mps` (default `30.0`)
+- `--reflectivity-filter` (`on`/`off`, default `off`)
+- `--min-reflectivity` (default `2`, used when reflectivity filter is on)
+  Ouster example `filter REFLECTIVITY 1:1` means "remove points with reflectivity exactly 1".
+  In this pipeline, `--min-reflectivity 2` is equivalent behavior (keep values >= 2, so 1 is dropped).
 - `--save-osf` / `--output-osf` for playback output
 - `--time-mode` and `--gps-time-column` also apply in this mode
 ## 4) Manifest JSON (recommended for full sessions)
@@ -261,6 +375,8 @@ python3 offline_fuse_lidar_gps.py \
 - In `slam_gps_anchor` mode, default backend uses Ouster Pose Optimizer with GPS absolute constraints.
 - `slam_gps_anchor` does not silently switch backends; if `pose_optimizer` fails, the run fails.
 - choose `--anchor-backend rigid_fit` explicitly if you want rigid anchoring.
+- Reflectivity filtering applies to raw replay export paths (`gps_fusion` and `slam_gps_anchor` with `pose_optimizer`).
+  It is not applied in `slam_map` or `slam_gps_anchor` with `rigid_fit`.
 - `--save-osf` writes an OSF for playback in SLAM modes.
 - In `slam_gps_anchor` mode:
   `pose_optimizer` backend writes optimized (GPS-anchored) OSF.

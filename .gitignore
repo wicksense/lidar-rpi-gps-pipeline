@@ -9,10 +9,12 @@ venv/
 .DS_Store
 .vscode/
 .idea/
+.pytest_cache/
 
 # Pipeline outputs and scratch data
 output/
 outputs/
+test_outputs/
 converted_csv/
 *.las
 *.laz

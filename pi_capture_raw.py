@@ -9,7 +9,7 @@ Run this on the Raspberry Pi during data collection.
 This script does only the field-capture work:
 1. Read GPS fixes from the u-blox receiver over serial.
 2. Save those GPS fixes to a CSV log file.
-3. Run one Ouster capture and save the raw LiDAR CSV.
+3. Run one Ouster capture and save raw LiDAR chunks.
 4. Save a small "manifest" JSON file that tells you which files belong together.
 
 Important: this script does NOT georeference point clouds on the Pi.
@@ -26,7 +26,6 @@ import signal
 import subprocess
 import threading
 import time
-import zipfile
 from typing import Optional
 
 import pynmea2
@@ -45,6 +44,10 @@ OUSTER_HOST = "169.254.237.207"
 # - "pcap_raw": raw UDP packets via `save_raw` (recommended for Pi reliability).
 # - "csv": direct point CSV via `save` (heavier; more likely to drop scans on Pi).
 LIDAR_OUTPUT_MODE = "pcap_raw"
+# Optional Ouster lidar mode applied before capture starts.
+# Examples: "1024x20", "2048x10", "4096x5"
+# Set to None or "" to leave the current sensor mode unchanged.
+LIDAR_MODE: Optional[str] = "4096x5"
 # Each LiDAR file will contain this many seconds.
 # Why 30s:
 # - Shorter chunks are safer in the field (less data loss if power/network drops).
@@ -67,10 +70,6 @@ OUTPUT_DIR = "/home/urp-pi5/capture_output"
 # Projected CRS EPSG code used to convert lat/lon to easting/northing meters.
 # Example: 32614 = WGS84 / UTM Zone 14N.
 UTM_EPSG = 32614
-# True = create a session zip archive when capture ends.
-ZIP_SESSION_ON_EXIT = True
-
-
 def log(message: str) -> None:
     """Simple timestamped logger so terminal output is easy to follow."""
     now = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -103,19 +102,14 @@ def parse_cli_args() -> argparse.Namespace:
         help="Override and start LiDAR capture immediately.",
     )
     parser.add_argument(
-        "--zip-session",
-        dest="zip_session",
-        action="store_true",
-        help="Create a zip archive with all session files when capture ends.",
-    )
-    parser.add_argument(
-        "--no-zip-session",
-        dest="zip_session",
-        action="store_false",
-        help="Do not create a session zip archive when capture ends.",
+        "--lidar-mode",
+        default=None,
+        help=(
+            "Optional Ouster lidar mode override, for example 1024x20, 2048x10, or 4096x5. "
+            "If omitted, uses the hardcoded LIDAR_MODE setting."
+        ),
     )
     parser.set_defaults(wait_for_gps_fix=None)
-    parser.set_defaults(zip_session=None)
     return parser.parse_args()
 
 
@@ -310,68 +304,53 @@ def find_chunk_files(requested_output_path: str) -> list:
     return sorted([p for p in glob.glob(stem + "*") if os.path.isfile(p)])
 
 
-def collect_session_files(
-    session_id: str,
-    gps_csv_path: str,
-    manifest_path: str,
-    chunks: list,
-) -> list:
+def normalize_lidar_mode(mode: Optional[str]) -> Optional[str]:
+    """Normalize lidar mode strings like 1024x20 or leave unset."""
+    if mode is None:
+        return None
+    normalized = mode.strip().lower()
+    if not normalized:
+        return None
+    if "x" not in normalized:
+        raise ValueError(f"Invalid LIDAR_MODE '{mode}'. Expected values like 1024x20, 2048x10, or 4096x5.")
+    left, right = normalized.split("x", 1)
+    if not (left.isdigit() and right.isdigit()):
+        raise ValueError(f"Invalid LIDAR_MODE '{mode}'. Expected values like 1024x20, 2048x10, or 4096x5.")
+    return f"{int(left)}x{int(right)}"
+
+
+def configure_ouster_sensor(host: str, lidar_mode: Optional[str]) -> None:
     """
-    Collect session files to include in archive.
+    Apply lightweight sensor config before capture starts.
+
+    Uses the Ouster CLI config command so the Pi script can choose a capture mode
+    without requiring any extra Python SDK bindings beyond `ouster-cli`.
     """
-    files = []
-    if os.path.isfile(gps_csv_path):
-        files.append(gps_csv_path)
-    if os.path.isfile(manifest_path):
-        files.append(manifest_path)
+    if not lidar_mode:
+        log("Sensor config: leaving current lidar mode unchanged.")
+        return
 
-    for chunk in chunks:
-        if not isinstance(chunk, dict):
-            continue
-        for path in chunk.get("produced_files", []):
-            if isinstance(path, str) and os.path.isfile(path):
-                files.append(path)
-
-    # Safety net: include any session chunk files that may not be listed.
-    session_chunk_glob = os.path.join(OUTPUT_DIR, f"raw_lidar_{session_id}_chunk*")
-    for path in glob.glob(session_chunk_glob):
-        if os.path.isfile(path):
-            files.append(path)
-
-    # Preserve order while removing duplicates.
-    seen = set()
-    ordered = []
-    for path in files:
-        if path not in seen:
-            seen.add(path)
-            ordered.append(path)
-    return ordered
-
-
-def build_session_archive(
-    session_files: list,
-    archive_path: str,
-    base_dir: str,
-) -> bool:
-    """
-    Create zip archive containing session files.
-    """
-    if not session_files:
-        log("No session files found to archive; skipping zip creation.")
-        return False
-
-    os.makedirs(os.path.dirname(archive_path) or ".", exist_ok=True)
-    with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for path in session_files:
-            if not os.path.isfile(path):
-                continue
-            arcname = os.path.relpath(path, start=base_dir)
-            if arcname.startswith(".."):
-                arcname = os.path.basename(path)
-            zf.write(path, arcname=arcname)
-
-    log(f"Session archive created: {archive_path} ({len(session_files)} files)")
-    return True
+    cmd = [
+        "ouster-cli",
+        "source",
+        host,
+        "config",
+        "lidar_mode",
+        lidar_mode,
+    ]
+    log("Applying Ouster sensor config:")
+    log("  " + " ".join(cmd))
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.stdout.strip():
+        log(f"[ouster config out] {result.stdout.strip()}")
+    if result.stderr.strip():
+        log(f"[ouster config err] {result.stderr.strip()}")
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Failed to configure Ouster lidar_mode={lidar_mode}. "
+            f"`ouster-cli` exited with code {result.returncode}."
+        )
+    log(f"Ouster lidar mode configured: {lidar_mode}")
 
 
 def run_ouster_capture(
@@ -464,11 +443,7 @@ def main() -> None:
         if cli.wait_for_gps_fix is None
         else cli.wait_for_gps_fix
     )
-    zip_session = (
-        ZIP_SESSION_ON_EXIT
-        if cli.zip_session is None
-        else cli.zip_session
-    )
+    lidar_mode = normalize_lidar_mode(cli.lidar_mode if cli.lidar_mode is not None else LIDAR_MODE)
 
     ensure_dir(OUTPUT_DIR)
 
@@ -476,8 +451,6 @@ def main() -> None:
     session_id = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     gps_csv_path = os.path.join(OUTPUT_DIR, f"raw_gps_{session_id}.csv")
     manifest_path = os.path.join(OUTPUT_DIR, f"capture_manifest_{session_id}.json")
-    archive_path = os.path.join(OUTPUT_DIR, f"session_{session_id}.zip")
-
     stop_event = threading.Event()
 
     def handle_signal(_sig, _frame) -> None:
@@ -486,6 +459,8 @@ def main() -> None:
 
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
+
+    configure_ouster_sensor(host=OUSTER_HOST, lidar_mode=lidar_mode)
 
     # Start GPS logging before LiDAR capture so time ranges overlap.
     gps_logger = GpsLogger(
@@ -519,6 +494,7 @@ def main() -> None:
                 "run_end_ns": run_end_ns,
                 "ouster_host": OUSTER_HOST,
                 "lidar_output_mode": LIDAR_OUTPUT_MODE,
+                "lidar_mode": lidar_mode,
                 "chunk_duration_sec": CAPTURE_DURATION_SEC,
                 "continuous_chunks": CONTINUOUS_CHUNKS,
                 "wait_for_gps_fix_before_capture": wait_for_gps_fix,
@@ -528,34 +504,14 @@ def main() -> None:
                 "gps_csv_path": gps_csv_path,
                 "gps_rows_written": gps_logger.rows_written,
                 "gps_first_fix_time_ns": gps_logger.first_fix_time_ns,
-                "zip_session_on_exit": zip_session,
-                "session_archive_path": archive_path if zip_session else None,
                 "chunks_captured": 0,
                 "chunks": [],
             }
             with open(manifest_path, "w", encoding="utf-8") as f:
                 json.dump(manifest, f, indent=2)
 
-            if zip_session:
-                session_files = collect_session_files(
-                    session_id=session_id,
-                    gps_csv_path=gps_csv_path,
-                    manifest_path=manifest_path,
-                    chunks=[],
-                )
-                try:
-                    build_session_archive(
-                        session_files=session_files,
-                        archive_path=archive_path,
-                        base_dir=OUTPUT_DIR,
-                    )
-                except Exception as e:
-                    log(f"Session zip warning: {e}")
-
             log(f"GPS CSV:     {gps_csv_path}")
             log(f"Manifest:    {manifest_path}")
-            if zip_session:
-                log(f"Session ZIP: {archive_path}")
             return
 
     run_start_iso = dt.datetime.now(dt.timezone.utc).isoformat()
@@ -645,6 +601,7 @@ def main() -> None:
         "run_end_ns": run_end_ns,
         "ouster_host": OUSTER_HOST,
         "lidar_output_mode": LIDAR_OUTPUT_MODE,
+        "lidar_mode": lidar_mode,
         "chunk_duration_sec": CAPTURE_DURATION_SEC,
         "continuous_chunks": CONTINUOUS_CHUNKS,
         "wait_for_gps_fix_before_capture": wait_for_gps_fix,

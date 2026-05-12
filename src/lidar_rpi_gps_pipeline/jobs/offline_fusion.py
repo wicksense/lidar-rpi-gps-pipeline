@@ -7,6 +7,7 @@ import argparse
 import glob
 import json
 import os
+import re
 import shutil
 import tempfile
 from io import StringIO
@@ -107,7 +108,13 @@ def pick_gps_time_column(df: pd.DataFrame, requested: str) -> str:
     raise ValueError("No usable GPS time column found (need gps_epoch_ns or pi_time_ns with >=2 rows).")
 
 
-def load_gps_for_interpolation(gps_csv: str, requested_time_col: str) -> Tuple[pd.DataFrame, str]:
+def load_gps_for_interpolation(
+    gps_csv: str,
+    requested_time_col: str,
+    *,
+    apply_outlier_filter: bool = False,
+    gps_outlier_max_speed_mps: float = 30.0,
+) -> Tuple[pd.DataFrame, str]:
     log(f"Loading GPS CSV: {gps_csv}")
     gps_df = pd.read_csv(gps_csv)
 
@@ -119,12 +126,17 @@ def load_gps_for_interpolation(gps_csv: str, requested_time_col: str) -> Tuple[p
     gps_time_col = pick_gps_time_column(gps_df, requested_time_col)
     log(f"GPS time column: {gps_time_col}")
 
-    gps_df = gps_df[[gps_time_col, "easting", "northing", "altitude_m"]].copy()
+    gps_cols = [gps_time_col, "easting", "northing", "altitude_m"]
+    if "hdop" in gps_df.columns:
+        gps_cols.append("hdop")
+    gps_df = gps_df[gps_cols].copy()
     gps_df = gps_df.dropna(subset=[gps_time_col, "easting", "northing", "altitude_m"])
     gps_df[gps_time_col] = gps_df[gps_time_col].astype("int64")
     gps_df["easting"] = gps_df["easting"].astype("float64")
     gps_df["northing"] = gps_df["northing"].astype("float64")
     gps_df["altitude_m"] = gps_df["altitude_m"].astype("float64")
+    if "hdop" in gps_df.columns:
+        gps_df["hdop"] = pd.to_numeric(gps_df["hdop"], errors="coerce").astype("float64")
     gps_df = gps_df[
         np.isfinite(gps_df["easting"])
         & np.isfinite(gps_df["northing"])
@@ -133,6 +145,21 @@ def load_gps_for_interpolation(gps_csv: str, requested_time_col: str) -> Tuple[p
     gps_df = gps_df.sort_values(gps_time_col)
     gps_df = gps_df.drop_duplicates(subset=[gps_time_col])
 
+    if apply_outlier_filter:
+        gps_df, outlier_stats = filter_gps_outliers_by_speed(
+            gps_df,
+            gps_time_col,
+            max_speed_mps=float(gps_outlier_max_speed_mps),
+        )
+        log(
+            "GPS outlier filter: "
+            f"kept {outlier_stats['kept_rows']}/{outlier_stats['input_rows']} rows, "
+            f"dropped={outlier_stats['dropped_rows']} "
+            f"(speed={outlier_stats['dropped_speed']}, "
+            f"nonpositive_dt={outlier_stats['dropped_nonpositive_dt']}), "
+            f"max_speed_mps={float(gps_outlier_max_speed_mps):.2f}"
+        )
+
     if len(gps_df) < 2:
         raise ValueError(
             "Need at least 2 finite GPS rows to interpolate "
@@ -140,6 +167,57 @@ def load_gps_for_interpolation(gps_csv: str, requested_time_col: str) -> Tuple[p
         )
 
     return gps_df, gps_time_col
+
+
+def filter_gps_outliers_by_speed(
+    gps_df: pd.DataFrame,
+    gps_time_col: str,
+    *,
+    max_speed_mps: float,
+) -> Tuple[pd.DataFrame, Dict[str, int]]:
+    """
+    Remove implausible GPS rows using incremental speed from last accepted point.
+    """
+    if max_speed_mps <= 0:
+        raise ValueError("gps_outlier_max_speed_mps must be > 0.")
+    if len(gps_df) < 2:
+        return gps_df.copy(), {"input_rows": len(gps_df), "kept_rows": len(gps_df), "dropped_rows": 0}
+
+    t = gps_df[gps_time_col].to_numpy(dtype=np.int64)
+    e = gps_df["easting"].to_numpy(dtype=np.float64)
+    n = gps_df["northing"].to_numpy(dtype=np.float64)
+
+    keep = np.zeros(len(gps_df), dtype=bool)
+    keep[0] = True
+    last_kept = 0
+    dropped_nonpositive_dt = 0
+    dropped_speed = 0
+
+    for idx in range(1, len(gps_df)):
+        dt_ns = int(t[idx] - t[last_kept])
+        if dt_ns <= 0:
+            dropped_nonpositive_dt += 1
+            continue
+
+        dt_s = dt_ns * 1e-9
+        step_m = float(np.hypot(e[idx] - e[last_kept], n[idx] - n[last_kept]))
+        speed_mps = step_m / dt_s
+        if speed_mps > max_speed_mps:
+            dropped_speed += 1
+            continue
+
+        keep[idx] = True
+        last_kept = idx
+
+    filtered = gps_df.loc[keep].copy()
+    stats = {
+        "input_rows": int(len(gps_df)),
+        "kept_rows": int(len(filtered)),
+        "dropped_rows": int(len(gps_df) - len(filtered)),
+        "dropped_speed": int(dropped_speed),
+        "dropped_nonpositive_dt": int(dropped_nonpositive_dt),
+    }
+    return filtered, stats
 
 
 def _gps_in_range_mask(query_t: np.ndarray, ref_t: np.ndarray) -> np.ndarray:
@@ -347,6 +425,53 @@ def _is_raw_lidar_path(path: str) -> bool:
     return lower.endswith(".pcap") or lower.endswith(".osf")
 
 
+def _extract_session_id_from_gps_csv_path(gps_csv: str) -> Optional[str]:
+    """
+    Infer session id from a GPS CSV filename.
+
+    Expected common pattern: raw_gps_YYYYMMDD_HHMMSS.csv
+    """
+    name = os.path.splitext(os.path.basename(gps_csv))[0]
+    if name.startswith("raw_gps_"):
+        suffix = name.replace("raw_gps_", "", 1)
+        if re.fullmatch(r"\d{8}_\d{6}", suffix):
+            return suffix
+
+    match = re.search(r"(\d{8}_\d{6})", name)
+    if match:
+        return match.group(1)
+    return None
+
+
+def _filter_raw_paths_by_session(raw_paths: List[str], session_id: str) -> List[str]:
+    """
+    Keep only raw LiDAR files that belong to a specific session id.
+
+    Common filename pattern: raw_lidar_<session_id>_chunkXXXX.pcap
+    """
+    prefix = f"raw_lidar_{session_id}_"
+    filtered = []
+    for path in raw_paths:
+        base = os.path.basename(path)
+        if base.startswith(prefix):
+            filtered.append(path)
+
+    # Fallback for non-standard names that still embed the session id.
+    if not filtered:
+        token = f"_{session_id}_"
+        for path in raw_paths:
+            base = os.path.basename(path)
+            if session_id in base or token in base:
+                filtered.append(path)
+
+    if not filtered:
+        raise ValueError(
+            f"No raw LiDAR files matched session filter '{session_id}'. "
+            "Check raw input dir and GPS/session selection."
+        )
+    return filtered
+
+
 def expand_raw_lidar_inputs(raw_inputs: List[str]) -> List[str]:
     """
     Expand --lidar-raw inputs into concrete file paths.
@@ -533,6 +658,32 @@ def _scan_get_range_field(scan: Any, ChanField: Any) -> Any:
         return scan.field("RANGE")
 
 
+def _scan_has_reflectivity_field(scan: Any, ChanField: Any) -> bool:
+    try:
+        if ChanField.REFLECTIVITY in scan.fields:
+            return True
+    except Exception:
+        pass
+    try:
+        field_names = {str(f) for f in scan.fields}
+        if "REFLECTIVITY" in field_names or "ChanField.REFLECTIVITY" in field_names:
+            return True
+    except Exception:
+        pass
+    try:
+        scan.field("REFLECTIVITY")
+        return True
+    except Exception:
+        return False
+
+
+def _scan_get_reflectivity_field(scan: Any, ChanField: Any) -> Any:
+    try:
+        return scan.field(ChanField.REFLECTIVITY)
+    except Exception:
+        return scan.field("REFLECTIVITY")
+
+
 def _next_available_output_path(path: str) -> str:
     """
     Return a non-conflicting path by appending an incrementing suffix.
@@ -606,6 +757,18 @@ def _resolve_output_osf_path(
     out_dir = os.path.dirname(output_osf) or "."
     os.makedirs(out_dir, exist_ok=True)
     return _next_available_output_path(output_osf)
+
+
+def _temp_osf_path(output_osf: Optional[str]) -> Optional[str]:
+    """
+    Build a temporary OSF path that still ends with `.osf`.
+    Some Ouster save paths expect OSF-like filenames and can reject arbitrary suffixes.
+    """
+    if not output_osf:
+        return None
+    root, ext = os.path.splitext(output_osf)
+    ext = ext or ".osf"
+    return f"{root}.partial{ext}"
 
 
 def _open_raw_source(raw_path: str) -> Any:
@@ -865,7 +1028,7 @@ def _lookup_pose_columns(
     column_poses: np.ndarray,
     *,
     max_allowed_delta_ns: int = 100_000_000,
-) -> Tuple[np.ndarray, Dict[str, int]]:
+) -> Tuple[np.ndarray, np.ndarray, Dict[str, int]]:
     if pose_timestamps_ns.ndim != 1 or pose_timestamps_ns.size == 0:
         raise ValueError("Optimized pose timestamps are empty.")
     if column_poses.ndim != 3 or column_poses.shape[1:] != (4, 4):
@@ -903,20 +1066,20 @@ def _lookup_pose_columns(
         delta[~valid] = 0
 
     max_delta_ns = int(delta[valid].max()) if valid_count else 0
-    if valid_count and max_delta_ns > max_allowed_delta_ns:
-        raise ValueError(
-            "Optimized pose lookup drift too large: "
-            f"max delta {max_delta_ns} ns exceeds allowed {max_allowed_delta_ns} ns."
-        )
+    inlier_mask = valid & (delta <= max_allowed_delta_ns)
+    inlier_count = int(inlier_mask.sum())
+    dropped_due_to_drift = int(valid_count - inlier_count)
 
     stats = {
         "columns": int(ts.size),
         "valid_columns": valid_count,
+        "inlier_columns": inlier_count,
+        "dropped_columns": dropped_due_to_drift,
         "exact_columns": int(exact.sum()),
         "nearest_columns": int(valid_count - int(exact.sum())),
         "max_delta_ns": max_delta_ns,
     }
-    return column_poses[idx], stats
+    return column_poses[idx], inlier_mask, stats
 
 
 def _build_point_cloud_from_raw_with_poses(
@@ -926,6 +1089,8 @@ def _build_point_cloud_from_raw_with_poses(
     column_poses: np.ndarray,
     min_range: float,
     max_range: float,
+    reflectivity_filter: bool,
+    min_reflectivity: int,
     map_voxel_size: float,
     emit_event: EventEmitter,
     should_cancel: CancelChecker,
@@ -946,9 +1111,12 @@ def _build_point_cloud_from_raw_with_poses(
     lookup_stats = {
         "columns": 0,
         "valid_columns": 0,
+        "inlier_columns": 0,
+        "dropped_columns": 0,
         "exact_columns": 0,
         "nearest_columns": 0,
         "max_delta_ns": 0,
+        "reflectivity_scans_missing_field": 0,
     }
 
     def flush_batches() -> None:
@@ -995,13 +1163,15 @@ def _build_point_cloud_from_raw_with_poses(
                 ranges = _scan_get_range_field(scan, ChanField)
                 ranges_m = np.asarray(ranges, dtype=np.float64) * 0.001
 
-                pose_cols, stats = _lookup_pose_columns(
+                pose_cols, pose_inlier_cols, stats = _lookup_pose_columns(
                     np.asarray(scan.timestamp, dtype=np.int64),
                     pose_timestamps_ns,
                     column_poses,
                 )
                 lookup_stats["columns"] += stats["columns"]
                 lookup_stats["valid_columns"] += stats["valid_columns"]
+                lookup_stats["inlier_columns"] += stats["inlier_columns"]
+                lookup_stats["dropped_columns"] += stats["dropped_columns"]
                 lookup_stats["exact_columns"] += stats["exact_columns"]
                 lookup_stats["nearest_columns"] += stats["nearest_columns"]
                 lookup_stats["max_delta_ns"] = max(lookup_stats["max_delta_ns"], stats["max_delta_ns"])
@@ -1009,11 +1179,17 @@ def _build_point_cloud_from_raw_with_poses(
                 points_local = xyzlut(ranges)
                 points_global = dewarp(points_local, pose_cols)
 
-                valid = ranges > 0
+                valid = (ranges > 0) & pose_inlier_cols[np.newaxis, :]
                 if min_range > 0:
                     valid = valid & (ranges_m >= min_range)
                 if max_range > 0:
                     valid = valid & (ranges_m <= max_range)
+                if reflectivity_filter:
+                    if _scan_has_reflectivity_field(scan, ChanField):
+                        refl = np.asarray(_scan_get_reflectivity_field(scan, ChanField), dtype=np.float64)
+                        valid = valid & (refl >= float(min_reflectivity))
+                    else:
+                        lookup_stats["reflectivity_scans_missing_field"] += 1
 
                 selected = points_global[valid]
                 if selected.size == 0:
@@ -1053,6 +1229,8 @@ def fuse_raw_to_single_las(
     sensor_offset_z: float,
     gps_fusion_orientation: str,
     sensor_yaw_deg: float,
+    reflectivity_filter: bool,
+    min_reflectivity: int,
     keep_converted: bool,
     converted_csv_dir: Optional[str],
     emit_event: EventEmitter,
@@ -1081,6 +1259,7 @@ def fuse_raw_to_single_las(
     debug_csv_count = 0
     trimmed_time_samples = 0
     trimmed_scans = 0
+    reflectivity_scans_missing_field = 0
     header_offsets = _estimate_las_header_offsets_from_gps(
         gps_e,
         gps_n,
@@ -1189,6 +1368,28 @@ def fuse_raw_to_single_las(
                         x_global = x_global[finite_global]
                         y_global = y_global[finite_global]
                         z_global = z_global[finite_global]
+                        lidar_t_trimmed = lidar_t_trimmed[finite_global]
+
+                    if reflectivity_filter:
+                        if _scan_has_reflectivity_field(scan, ChanField):
+                            try:
+                                refl_img = _scan_get_reflectivity_field(scan, ChanField)
+                                try:
+                                    refl_img = destagger(info, refl_img)
+                                except Exception:
+                                    pass
+                                refl_flat = np.asarray(refl_img, dtype=np.float64).reshape(-1)[in_range]
+                                refl_flat = refl_flat[finite_global]
+                                refl_keep = refl_flat >= float(min_reflectivity)
+                                if not np.any(refl_keep):
+                                    continue
+                                x_global = x_global[refl_keep]
+                                y_global = y_global[refl_keep]
+                                z_global = z_global[refl_keep]
+                            except Exception:
+                                reflectivity_scans_missing_field += 1
+                        else:
+                            reflectivity_scans_missing_field += 1
 
                     if writer is None:
                         header = _new_las_header(utm_epsg, *header_offsets)
@@ -1250,6 +1451,9 @@ def fuse_raw_to_single_las(
             "sensor_yaw_deg": float(sensor_yaw_deg),
             "trimmed_time_samples": int(trimmed_time_samples),
             "trimmed_scans": int(trimmed_scans),
+            "reflectivity_filter": bool(reflectivity_filter),
+            "min_reflectivity": int(min_reflectivity),
+            "reflectivity_scans_missing_field": int(reflectivity_scans_missing_field),
         }
     except Exception:
         if writer is not None:
@@ -1292,7 +1496,7 @@ def slam_raw_to_single_las(
     tmp_output = output_las + ".partial"
     if os.path.exists(tmp_output):
         os.remove(tmp_output)
-    tmp_output_osf = output_osf + ".partial" if output_osf else None
+    tmp_output_osf = _temp_osf_path(output_osf)
     if tmp_output_osf and os.path.exists(tmp_output_osf):
         os.remove(tmp_output_osf)
 
@@ -1469,7 +1673,7 @@ def slam_raw_to_gps_anchored_las(
     tmp_output = output_las + ".partial"
     if os.path.exists(tmp_output):
         os.remove(tmp_output)
-    tmp_output_osf = output_osf + ".partial" if output_osf else None
+    tmp_output_osf = _temp_osf_path(output_osf)
     if tmp_output_osf and os.path.exists(tmp_output_osf):
         os.remove(tmp_output_osf)
 
@@ -1727,6 +1931,8 @@ def slam_raw_to_gps_anchored_las_pose_optimizer(
     poseopt_constraint_weights: str,
     poseopt_max_iterations: int,
     poseopt_map_voxel_size: float,
+    reflectivity_filter: bool,
+    min_reflectivity: int,
     emit_event: EventEmitter,
     should_cancel: CancelChecker,
 ) -> Dict[str, Any]:
@@ -1775,7 +1981,7 @@ def slam_raw_to_gps_anchored_las_pose_optimizer(
     tmp_output = output_las + ".partial"
     if os.path.exists(tmp_output):
         os.remove(tmp_output)
-    tmp_output_osf = output_osf + ".partial" if output_osf else None
+    tmp_output_osf = _temp_osf_path(output_osf)
     if tmp_output_osf and os.path.exists(tmp_output_osf):
         os.remove(tmp_output_osf)
 
@@ -1985,6 +2191,8 @@ def slam_raw_to_gps_anchored_las_pose_optimizer(
             column_poses=poses_opt,
             min_range=min_range,
             max_range=max_range,
+            reflectivity_filter=reflectivity_filter,
+            min_reflectivity=min_reflectivity,
             map_voxel_size=poseopt_map_voxel_size,
             emit_event=emit_event,
             should_cancel=should_cancel,
@@ -2048,9 +2256,14 @@ def slam_raw_to_gps_anchored_las_pose_optimizer(
             "qa_xy_median_m": qa_metrics["xy_median_m"],
             "qa_xy_p95_m": qa_metrics["xy_p95_m"],
             "qa_z_rmse_m": qa_metrics["z_rmse_m"],
+            "pose_lookup_inlier_columns": int(pose_lookup["inlier_columns"]),
+            "pose_lookup_dropped_columns": int(pose_lookup["dropped_columns"]),
             "pose_lookup_exact_columns": int(pose_lookup["exact_columns"]),
             "pose_lookup_nearest_columns": int(pose_lookup["nearest_columns"]),
             "pose_lookup_max_delta_ns": int(pose_lookup["max_delta_ns"]),
+            "reflectivity_filter": bool(reflectivity_filter),
+            "min_reflectivity": int(min_reflectivity),
+            "reflectivity_scans_missing_field": int(pose_lookup["reflectivity_scans_missing_field"]),
             "output_osf": output_osf,
             "output_osf_kind": "optimized_gps_anchored",
         }
@@ -2237,6 +2450,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         nargs="+",
         help="Raw LiDAR input(s): one or more .pcap/.osf files, directories, or glob patterns.",
     )
+    parser.add_argument(
+        "--lidar-session-filter",
+        help=(
+            "Optional raw session id filter for --lidar-raw directory/glob inputs "
+            "(example: 20260317_094022). "
+            "If omitted and --gps-csv name contains a session id, that id is used automatically."
+        ),
+    )
     parser.add_argument("--gps-csv", help="Path to raw GPS CSV from pi_capture_raw.py.")
     parser.add_argument(
         "--converted-csv-dir",
@@ -2281,6 +2502,36 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "'auto' prefers gps_epoch_ns, then falls back to pi_time_ns "
             "(gps_fusion and slam_gps_anchor modes)."
         ),
+    )
+    parser.add_argument(
+        "--reflectivity-filter",
+        choices=["on", "off"],
+        default="off",
+        help=(
+            "Enable/disable reflectivity threshold filtering in raw replay point export paths "
+            "(gps_fusion and slam_gps_anchor pose_optimizer map replay)."
+        ),
+    )
+    parser.add_argument(
+        "--min-reflectivity",
+        type=int,
+        default=2,
+        help="Minimum reflectivity value kept when --reflectivity-filter is on.",
+    )
+    parser.add_argument(
+        "--gps-outlier-filter",
+        choices=["on", "off"],
+        default="on",
+        help=(
+            "Enable/disable GPS outlier filtering before interpolation in GPS-dependent modes. "
+            "When enabled, points with implausible speed jump from the last kept point are dropped."
+        ),
+    )
+    parser.add_argument(
+        "--gps-outlier-max-speed-mps",
+        type=float,
+        default=30.0,
+        help="Maximum allowed GPS speed (m/s) used by outlier filtering.",
     )
     parser.add_argument(
         "--utm-epsg",
@@ -2446,6 +2697,23 @@ def run_from_args(
     else:
         raw_paths, lidar_paths, gps_csv = _resolve_inputs_direct(args)
 
+    if raw_paths:
+        requested_filter = (getattr(args, "lidar_session_filter", "") or "").strip()
+        inferred_filter = None
+        if not requested_filter and gps_csv:
+            inferred_filter = _extract_session_id_from_gps_csv_path(gps_csv)
+        session_filter = requested_filter or inferred_filter
+        if session_filter:
+            original_count = len(raw_paths)
+            raw_paths = _filter_raw_paths_by_session(raw_paths, session_filter)
+            source = "explicit" if requested_filter else "auto_from_gps_csv"
+            message = (
+                f"Raw session filter ({source}): {session_filter} "
+                f"-> {len(raw_paths)}/{original_count} file(s)"
+            )
+            log(message)
+            _emit(emit_event, "status", message=message)
+
     _check_cancel(should_cancel)
 
     mode = args.processing_mode
@@ -2453,6 +2721,12 @@ def run_from_args(
         raise ValueError("--save-osf/--output-osf are only supported in slam_map and slam_gps_anchor modes.")
 
     if mode == "slam_map":
+        if args.reflectivity_filter == "on":
+            _emit(
+                emit_event,
+                "status",
+                message="Reflectivity filter is not applied in slam_map mode.",
+            )
         if lidar_paths and not raw_paths:
             raise ValueError("SLAM mode requires raw LiDAR (.pcap/.osf), not pre-converted CSV input.")
         if not raw_paths:
@@ -2492,7 +2766,12 @@ def run_from_args(
             )
 
         _emit(emit_event, "status", message=f"Loading GPS: {gps_csv}")
-        gps_df, gps_time_col = load_gps_for_interpolation(gps_csv, args.gps_time_column)
+        gps_df, gps_time_col = load_gps_for_interpolation(
+            gps_csv,
+            args.gps_time_column,
+            apply_outlier_filter=(args.gps_outlier_filter == "on"),
+            gps_outlier_max_speed_mps=args.gps_outlier_max_speed_mps,
+        )
         _check_cancel(should_cancel)
 
         output_las = _resolve_output_las_path(
@@ -2525,10 +2804,21 @@ def run_from_args(
                 poseopt_constraint_weights=args.poseopt_constraint_weights,
                 poseopt_max_iterations=args.poseopt_max_iterations,
                 poseopt_map_voxel_size=args.poseopt_map_voxel_size,
+                reflectivity_filter=(args.reflectivity_filter == "on"),
+                min_reflectivity=int(args.min_reflectivity),
                 emit_event=emit_event,
                 should_cancel=should_cancel,
             )
         else:
+            if args.reflectivity_filter == "on":
+                _emit(
+                    emit_event,
+                    "status",
+                    message=(
+                        "Reflectivity filter is not applied for slam_gps_anchor rigid_fit backend "
+                        "(map points come from SLAM engine map export)."
+                    ),
+                )
             summary = slam_raw_to_gps_anchored_las(
                 raw_paths=raw_paths,
                 gps_df=gps_df,
@@ -2560,7 +2850,12 @@ def run_from_args(
         )
 
     _emit(emit_event, "status", message=f"Loading GPS: {gps_csv}")
-    gps_df, gps_time_col = load_gps_for_interpolation(gps_csv, args.gps_time_column)
+    gps_df, gps_time_col = load_gps_for_interpolation(
+        gps_csv,
+        args.gps_time_column,
+        apply_outlier_filter=(args.gps_outlier_filter == "on"),
+        gps_outlier_max_speed_mps=args.gps_outlier_max_speed_mps,
+    )
 
     _check_cancel(should_cancel)
 
@@ -2584,6 +2879,8 @@ def run_from_args(
             sensor_offset_z=args.sensor_offset_z,
             gps_fusion_orientation=args.gps_fusion_orientation,
             sensor_yaw_deg=args.sensor_yaw_deg,
+            reflectivity_filter=(args.reflectivity_filter == "on"),
+            min_reflectivity=int(args.min_reflectivity),
             keep_converted=bool(args.keep_converted),
             converted_csv_dir=args.converted_csv_dir,
             emit_event=emit_event,
@@ -2594,6 +2891,13 @@ def run_from_args(
 
     if not lidar_paths:
         raise ValueError("No LiDAR inputs found.")
+
+    if args.reflectivity_filter == "on":
+        _emit(
+            emit_event,
+            "status",
+            message="Reflectivity filter is not applied for pre-converted CSV inputs.",
+        )
 
     if args.output_prefix:
         output_prefixes = prefixed_output_paths(args.output_prefix, lidar_paths)
