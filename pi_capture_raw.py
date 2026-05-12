@@ -48,6 +48,9 @@ LIDAR_OUTPUT_MODE = "pcap_raw"
 # Examples: "1024x20", "2048x10", "4096x5"
 # Set to None or "" to leave the current sensor mode unchanged.
 LIDAR_MODE: Optional[str] = "4096x5"
+# Seconds to wait after applying sensor config before capture begins.
+# Some firmware/mode changes briefly interrupt streaming while the sensor reconfigures.
+SENSOR_CONFIG_SETTLE_SEC = 10
 # Each LiDAR file will contain this many seconds.
 # Why 30s:
 # - Shorter chunks are safer in the field (less data loss if power/network drops).
@@ -351,6 +354,9 @@ def configure_ouster_sensor(host: str, lidar_mode: Optional[str]) -> None:
             f"`ouster-cli` exited with code {result.returncode}."
         )
     log(f"Ouster lidar mode configured: {lidar_mode}")
+    if SENSOR_CONFIG_SETTLE_SEC > 0:
+        log(f"Waiting {SENSOR_CONFIG_SETTLE_SEC}s for sensor to settle after config change...")
+        time.sleep(SENSOR_CONFIG_SETTLE_SEC)
 
 
 def run_ouster_capture(
@@ -556,6 +562,7 @@ def main() -> None:
             "duration_sec": CAPTURE_DURATION_SEC,
             "ouster_exit_code": rc,
             "lidar_output_mode": LIDAR_OUTPUT_MODE,
+            "lidar_mode": lidar_mode,
             "requested_output_path": requested_output_path,
             "produced_files": generated_files,
         }
@@ -575,10 +582,14 @@ def main() -> None:
         if stop_event.is_set():
             break
 
-        # If ouster-cli failed unexpectedly, stop instead of looping forever.
+        # `save_raw` commonly exits with code 1 after our timed SIGINT stop.
+        # If the chunk produced a pcap, treat that as a successful timed capture.
         if rc != 0:
-            log(f"Stopping capture loop because ouster-cli returned non-zero exit code: {rc}")
-            break
+            if LIDAR_OUTPUT_MODE == "pcap_raw" and pcap_candidates:
+                log(f"Chunk ended (exit code {rc}) after timed stop. Continuing...")
+            else:
+                log(f"Stopping capture loop because ouster-cli returned non-zero exit code: {rc}")
+                break
 
         if not CONTINUOUS_CHUNKS:
             break
@@ -611,8 +622,6 @@ def main() -> None:
         "gps_csv_path": gps_csv_path,
         "gps_rows_written": gps_logger.rows_written,
         "gps_first_fix_time_ns": gps_logger.first_fix_time_ns,
-        "zip_session_on_exit": zip_session,
-        "session_archive_path": archive_path if zip_session else None,
         "chunks_captured": len(chunks),
         "chunks": chunks,
     }
@@ -620,28 +629,10 @@ def main() -> None:
     with open(manifest_path, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
 
-    if zip_session:
-        session_files = collect_session_files(
-            session_id=session_id,
-            gps_csv_path=gps_csv_path,
-            manifest_path=manifest_path,
-            chunks=chunks,
-        )
-        try:
-            build_session_archive(
-                session_files=session_files,
-                archive_path=archive_path,
-                base_dir=OUTPUT_DIR,
-            )
-        except Exception as e:
-            log(f"Session zip warning: {e}")
-
     log("Capture complete.")
     log(f"LiDAR chunks: {len(chunks)}")
     log(f"GPS CSV:     {gps_csv_path}")
     log(f"Manifest:    {manifest_path}")
-    if zip_session:
-        log(f"Session ZIP: {archive_path}")
 
 
 if __name__ == "__main__":
