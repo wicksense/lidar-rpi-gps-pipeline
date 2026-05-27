@@ -175,16 +175,6 @@ Notes:
 - `Open OSF in Viz`: enabled after runs that produce OSF (`save_osf` in SLAM modes).
   Uses `Viz accum-num` value when launching Ouster Viz.
 
-### Example values (your March 17 data)
-
-In `Raw -> Process`:
-- `Raw input dir`: `/home/spriteadmin/Documents/LiDAR-Object-Detection/SampleData/3-17`
-- `Raw session filter (optional)`: `20260317_094022`
-- `GPS CSV`: `/home/spriteadmin/Documents/LiDAR-Object-Detection/SampleData/3-17/raw_gps_20260317_094022.csv`
-- `Output dir`: `/home/spriteadmin/Documents/ lidar-rpi-gps-pipeline/test_outputs`
-- `Processing mode`: `SLAM + GPS Anchor (Recommended)`
-- `Backend`: `pose_optimizer (recommended)`
-
 GUI notes:
 - Mode selector supports `SLAM + GPS Anchor`, `SLAM Map`, and `GPS Fusion`.
 - Anchor mode includes backend/options for constraint-based pose optimization.
@@ -334,7 +324,7 @@ python3 offline_fuse_lidar_gps.py \
   --output-dir /path/to/output
 ```
 
-If your manifest contains Pi absolute paths (for example `/home/urp-pi5/...`) and you are running offline on another machine, remap paths with:
+If your manifest contains Pi absolute paths (for example `/home/<pi-user>/...`) and you are running offline on another machine, remap paths with:
 
 ```bash
 python3 offline_fuse_lidar_gps.py \
