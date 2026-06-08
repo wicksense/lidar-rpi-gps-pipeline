@@ -8,15 +8,66 @@ This project is designed for a practical field workflow:
 
 ## Hardware Setup
 
-Validated setup:
-- Raspberry Pi (capture host)
-- Ouster LiDAR sensor (Ethernet to Pi)
-- SparkFun u-blox ZED-F9P RTK GPS (USB to Pi)
-- GPS also connected to Ouster for timing/reference
-  - Interface: PPS + NMEA over UART
+This repo now supports two capture architectures:
 
-GPS-to-Ouster wiring reference:
-- https://data.ouster.io/downloads/hardware-user-manual/hardware-user-manual-revd-os0.pdf
+- Original path:
+  GPS position/time is logged on the Pi, and `pi_capture_raw.py` handles capture.
+- PTP path:
+  GPS + PPS feed the Raspberry Pi, the Pi clock is disciplined by `chrony`, the Pi serves PTP on Ethernet, and the Ouster locks to the Pi. `pi_capture_ptp.py` then waits for GPS fix, Pi clock sync, and Ouster PTP lock before capture.
+
+Validated hardware family:
+- Raspberry Pi (capture host)
+- Ouster LiDAR sensor on Pi Ethernet
+- u-blox ZED-F9P class GNSS receiver
+
+### Why the PTP path exists
+
+The PTP path is useful when you want the Pi to be the central timing authority instead of wiring GPS timing directly into the Ouster. In that setup:
+
+- the GPS provides location plus precise time/PPS to the Pi
+- the Pi disciplines its system clock
+- the Pi advertises PTP on Ethernet
+- the Ouster timestamps LiDAR data from the Pi-synchronized PTP clock
+
+That gives the offline pipeline a clean shared time basis, and for these sessions the preferred offline time column is:
+
+- `--gps-time-column pi_time_ns`
+
+### Wiring the GPS to the Pi for the PTP path
+
+At a high level, the GNSS receiver needs:
+
+- I2C data path to the Pi
+- PPS pulse to one Pi GPIO input
+- common ground with the Pi
+- power appropriate for the GNSS board you are using
+
+Recommended Pi-side connections for the scripts in this repo:
+
+- I2C SDA: `GPIO2`, physical pin `3`
+- I2C SCL: `GPIO3`, physical pin `5`
+- PPS input: `GPIO18`, physical pin `12`
+- Ground: any Pi ground pin, for example physical pin `6`
+
+Important safety notes:
+
+- Pi GPIO is `3.3V` only, not `5V` tolerant.
+- Make sure the GNSS PPS output is safe for `3.3V` GPIO input.
+- Power the GNSS board according to its own documentation. Some carrier boards accept multiple supply options; do not assume every board should be powered from the Pi the same way.
+- Keep a common ground between Pi and GNSS.
+
+Practical interpretation:
+
+- I2C carries GNSS messages into the Pi.
+- PPS gives the Pi a precise second boundary.
+- `chrony` combines the coarse UTC time with PPS precision.
+- `ptp4l` and `phc2sys` then let the Pi distribute that time to the Ouster over Ethernet.
+
+### Ouster connection in the PTP path
+
+- Connect the Ouster to the Pi over Ethernet.
+- Configure the Ouster timestamp mode for PTP when using `pi_capture_ptp.py`.
+- The new capture script can verify Ouster timing state through the HTTP API before recording starts.
 
 ## Mounting and Orientation
 
@@ -39,7 +90,7 @@ What matters vs what does not:
 
 ## Workflow Overview
 
-1. Run `pi_capture_raw.py` on the Pi
+1. Run `pi_capture_raw.py` on the Pi for the original serial/PPS capture path, or `pi_capture_ptp.py` for the Pi-clock/PTP timing path
 2. Collect:
    - raw LiDAR chunks (`.pcap` by default)
    - one GPS CSV log
@@ -50,7 +101,11 @@ What matters vs what does not:
 
 ## Repository Layout
 
-- `pi_capture_raw.py`: Raspberry Pi capture script
+- `pi_capture_raw.py`: Raspberry Pi capture script for the original capture path
+- `pi_capture_ptp.py`: Raspberry Pi capture script for GPS/PPS -> Pi clock -> PTP -> Ouster
+- `setup_pi_gps_ptp_stack.sh`: helper to configure `chrony`, `ptp4l`, `phc2sys`, PPS overlay, and the bridge service on the Pi
+- `pi_gps_ptp_diagnostic.sh`: helper to verify I2C, PPS, chrony, PTP, and optional Ouster HTTP timing state
+- `ublox_i2c_chrony_bridge.py`: helper service that feeds UTC time from I2C GNSS into `chrony`'s SOCK refclock
 - `offline_fuse_lidar_gps.py`: offline processing (GPS fusion + SLAM map)
 - `offline_gui.py`: desktop GUI launcher (MVP scaffold)
 - `src/lidar_rpi_gps_pipeline/`: package scaffold for modularization
@@ -72,6 +127,17 @@ python -m pip install pandas numpy pyproj pynmea2 pyserial
 
 Runtime dependency:
 - `ouster-cli` available in `PATH` (used by `pi_capture_raw.py` during capture)
+
+For `pi_capture_ptp.py`, the Pi must also have:
+- `chrony` available in `PATH` (`chronyc` is used for readiness checks)
+- working PTP services outside Python (`ptp4l` / `phc2sys`)
+- Ouster HTTP API reachable from the Pi
+
+For the I2C/PPS GNSS stack used by the setup helper:
+- `python3-smbus` or `python3-smbus2`
+- `pps-tools`
+- `i2c-tools`
+- `linuxptp`
 
 ## Offline fusion environment
 
@@ -191,6 +257,8 @@ PYTHONPATH=src python -m pytest -q
 
 ## Capture on Raspberry Pi
 
+### Original capture path
+
 Basic run:
 
 ```bash
@@ -231,6 +299,128 @@ Notes:
   `1024x20` for walking / strongest pose robustness,
   `2048x10` as the balanced option,
   `4096x5` for maximum spatial crispness with smoother motion.
+
+### PTP-synced capture path
+
+Use this when the timing path is:
+
+- GPS + PPS -> Raspberry Pi
+- Pi clock disciplined outside Python (for example `chrony`)
+- Pi -> Ouster over Ethernet PTP
+
+Basic run:
+
+```bash
+python3 pi_capture_ptp.py
+```
+
+Useful overrides:
+
+```bash
+python3 pi_capture_ptp.py --lidar-mode 1024x20
+python3 pi_capture_ptp.py --gps-input-mode gpsd
+python3 pi_capture_ptp.py --no-wait-for-ouster-ptp-lock
+```
+
+What `pi_capture_ptp.py` adds on top of the original script:
+- optional Ouster timestamp/PTP configuration before capture
+- GPS fix readiness gating
+- Pi clock readiness gating via `chronyc waitsync`
+- Ouster PTP lock readiness gating via HTTP API
+- manifest sync metadata for field-session debugging
+
+Recommended offline guidance for this architecture:
+- prefer `--gps-time-column pi_time_ns`
+- keep `gps_epoch_ns` for QA and UTC traceability
+
+### Pi bring-up for the PTP path
+
+The PTP path has two parts:
+
+1. System setup on the Pi
+2. Capture using `pi_capture_ptp.py`
+
+The helper scripts in this repo are for the system-setup side.
+
+#### 1) Configure the Pi timing stack
+
+Run on the Pi:
+
+```bash
+sudo ./setup_pi_gps_ptp_stack.sh
+```
+
+What this script does:
+
+- enables Pi I2C in boot config
+- enables a PPS GPIO overlay
+- installs/configures a `chrony` SOCK + PPS refclock setup
+- installs the `ublox_i2c_chrony_bridge.py` service
+- writes `ptp4l` and `phc2sys` service units
+- enables and starts those services unless `--no-start` is used
+
+Common overrides:
+
+```bash
+sudo ./setup_pi_gps_ptp_stack.sh --pps-gpio 18
+sudo ./setup_pi_gps_ptp_stack.sh --iface eth0
+sudo ./setup_pi_gps_ptp_stack.sh --skip-apt
+```
+
+If the script changes boot overlays, reboot the Pi before expecting `/dev/pps0` to appear.
+
+#### 2) Verify the timing stack
+
+Run on the Pi:
+
+```bash
+sudo ./pi_gps_ptp_diagnostic.sh
+sudo ./pi_gps_ptp_diagnostic.sh --ouster-host <ouster-ip>
+```
+
+What the diagnostic checks:
+
+- I2C visibility of the GNSS receiver
+- PPS device presence and pulse activity
+- `chrony` tracking and selected source state
+- `ptp4l` / `phc2sys` process state
+- optional Ouster `/api/v1/time` and `/api/v1/time/ptp` responses
+
+This script is meant for bring-up and troubleshooting before you trust a field session.
+
+#### 3) Start capture
+
+Once the system stack is healthy:
+
+```bash
+python3 pi_capture_ptp.py --lidar-mode 1024x20
+```
+
+The script will:
+
+- start GPS logging
+- wait for a valid fix if enabled
+- wait for Pi clock sync from `chrony` if enabled
+- wait for Ouster PTP lock if enabled
+- then begin chunked raw LiDAR capture
+
+#### 4) Move files offline and process
+
+For PTP-based sessions, start with:
+
+```bash
+python3 offline_fuse_lidar_gps.py \
+  --manifest-json /path/to/capture_manifest.json \
+  --processing-mode slam_gps_anchor \
+  --gps-time-column pi_time_ns \
+  --output-dir /path/to/output
+```
+
+Why `pi_time_ns` is preferred here:
+
+- the GPS rows are timestamped by the Pi clock
+- the Ouster is supposed to lock to that same Pi-driven clock via PTP
+- so `pi_time_ns` is the cleanest shared time basis for offline alignment
 
 ### Choosing chunk duration
 
@@ -423,6 +613,10 @@ Guidance:
 - `--gps-time-column pi_time_ns`
 
 These options apply to `--processing-mode gps_fusion` and `--processing-mode slam_gps_anchor`.
+
+Guidance:
+- for the original GPS logging path, `auto` is usually the right choice
+- for `pi_capture_ptp.py` sessions, prefer `--gps-time-column pi_time_ns`
 
 ## SLAM Options
 
