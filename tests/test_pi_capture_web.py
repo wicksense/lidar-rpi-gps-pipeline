@@ -135,3 +135,55 @@ def test_capture_manager_start_and_stop_do_not_deadlock():
         assert stop_snapshot["stop_requested"] is True
         assert stop_snapshot["phase"] == "stopping"
         assert fake_proc._sent_signal == web_capture.signal.SIGINT
+
+
+def test_capture_manager_restart_increments_run_token_and_resets_log_ids():
+    manager = web_capture.CaptureManager()
+
+    class _FakeProc:
+        next_pid = 5000
+
+        def __init__(self):
+            type(self).next_pid += 1
+            self.pid = type(self).next_pid
+            self.stdout = io.StringIO("")
+            self.returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self):
+            self.returncode = 0
+            return self.returncode
+
+        def send_signal(self, _sig):
+            self.returncode = 0
+
+    class _FakeThread:
+        def __init__(self, target=None, args=(), daemon=None):
+            self.target = target
+            self.args = args
+            self.daemon = daemon
+
+        def start(self):
+            return None
+
+    with (
+        mock.patch.object(web_capture.subprocess, "Popen", side_effect=[_FakeProc(), _FakeProc()]),
+        mock.patch.object(web_capture.threading, "Thread", _FakeThread),
+    ):
+        first = manager.start({"capture_mode": "original", "wait_for_gps_fix": False})
+        assert first["run_token"] == 1
+        first_logs = manager.logs_after(0)
+        assert first_logs["run_token"] == 1
+        assert first_logs["newest_id"] >= 1
+
+        manager._proc = None
+        manager._state["running"] = False
+        manager._state["phase"] = "complete"
+
+        second = manager.start({"capture_mode": "original", "wait_for_gps_fix": False})
+        assert second["run_token"] == 2
+        second_logs = manager.logs_after(0)
+        assert second_logs["run_token"] == 2
+        assert second_logs["entries"][0]["id"] == 1

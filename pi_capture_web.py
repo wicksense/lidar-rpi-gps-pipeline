@@ -318,6 +318,7 @@ class CaptureManager:
         self._proc: Optional[subprocess.Popen[str]] = None
         self._reader_thread: Optional[threading.Thread] = None
         self._next_log_id = 1
+        self._run_token = 0
         self._logs: collections.deque[dict[str, Any]] = collections.deque(maxlen=LOG_HISTORY_LIMIT)
         self._state: dict[str, Any] = self._fresh_state()
 
@@ -336,6 +337,7 @@ class CaptureManager:
             "running": False,
             "capture_mode": None,
             "pid": None,
+            "run_token": 0,
             "command": None,
             "config": None,
             "started_at": None,
@@ -365,6 +367,7 @@ class CaptureManager:
 
             self._logs.clear()
             self._next_log_id = 1
+            self._run_token += 1
             self._state = self._fresh_state()
             self._state.update(
                 {
@@ -372,6 +375,7 @@ class CaptureManager:
                     "capture_mode": capture_mode,
                     "command": command,
                     "config": payload,
+                    "run_token": self._run_token,
                     "started_at": dt.datetime.now(dt.timezone.utc).isoformat(),
                     "phase": "starting",
                 }
@@ -449,7 +453,7 @@ class CaptureManager:
         with self._lock:
             logs = [entry for entry in self._logs if entry["id"] > after_id]
             newest_id = self._logs[-1]["id"] if self._logs else after_id
-            return {"entries": logs, "newest_id": newest_id}
+            return {"entries": logs, "newest_id": newest_id, "run_token": self._state.get("run_token", 0)}
 
 
 CAPTURE_MANAGER = CaptureManager()
@@ -843,6 +847,12 @@ HTML_TEMPLATE = """<!doctype html>
   <script>
     const DEFAULTS = __DEFAULT_CONFIG__;
     let lastLogId = 0;
+    let currentRunToken = 0;
+
+    function resetLogView() {
+      lastLogId = 0;
+      document.getElementById("logtext").textContent = "";
+    }
 
     function setUiMessage(text) {
       document.getElementById("ui_message_box").textContent = text || "-";
@@ -912,6 +922,8 @@ HTML_TEMPLATE = """<!doctype html>
           setUiMessage(data.error || "Failed to start capture");
           return;
         }
+        resetLogView();
+        currentRunToken = data.run_token || 0;
         setUiMessage("Capture start request accepted.");
         await refreshStatus();
         await refreshLogs();
@@ -941,6 +953,10 @@ HTML_TEMPLATE = """<!doctype html>
       try {
         const response = await fetch("/api/status");
         const data = await response.json();
+        if ((data.run_token || 0) !== currentRunToken) {
+          currentRunToken = data.run_token || 0;
+          resetLogView();
+        }
         document.getElementById("capture_status").textContent = data.running ? "Running" : "Idle";
         document.getElementById("capture_phase").textContent = data.phase || "-";
         document.getElementById("capture_chunk").textContent = data.current_chunk_index ?? "-";
@@ -964,12 +980,18 @@ HTML_TEMPLATE = """<!doctype html>
       try {
         const response = await fetch(`/api/logs?after=${lastLogId}`);
         const data = await response.json();
+        if ((data.run_token || 0) !== currentRunToken) {
+          currentRunToken = data.run_token || 0;
+          resetLogView();
+        }
         const logtext = document.getElementById("logtext");
         for (const entry of data.entries) {
           logtext.textContent += `${entry.text}\n`;
         }
-        if (data.entries.length > 0) {
+        if (data.entries.length > 0 || data.newest_id !== undefined) {
           lastLogId = data.newest_id;
+        }
+        if (data.entries.length > 0) {
           const box = document.getElementById("logbox");
           box.scrollTop = box.scrollHeight;
         }
