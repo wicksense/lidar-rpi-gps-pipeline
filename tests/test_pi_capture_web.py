@@ -1,5 +1,7 @@
 import importlib.util
+import io
 from pathlib import Path
+from unittest import mock
 
 
 def _load_module(filename: str, module_name: str):
@@ -86,3 +88,50 @@ def test_apply_log_line_updates_tracks_readiness_and_paths():
     assert state["current_chunk_index"] == 3
     assert state["gps_csv_path"] == "/tmp/raw_gps.csv"
     assert state["manifest_path"] == "/tmp/capture_manifest.json"
+
+
+def test_capture_manager_start_and_stop_do_not_deadlock():
+    manager = web_capture.CaptureManager()
+
+    class _FakeProc:
+        def __init__(self):
+            self.pid = 4321
+            self.stdout = io.StringIO("")
+            self.returncode = None
+            self._sent_signal = None
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self):
+            self.returncode = 0
+            return self.returncode
+
+        def send_signal(self, sig):
+            self._sent_signal = sig
+            self.returncode = 0
+
+    fake_proc = _FakeProc()
+
+    class _FakeThread:
+        def __init__(self, target=None, args=(), daemon=None):
+            self.target = target
+            self.args = args
+            self.daemon = daemon
+
+        def start(self):
+            return None
+
+    with (
+        mock.patch.object(web_capture.subprocess, "Popen", return_value=fake_proc),
+        mock.patch.object(web_capture.threading, "Thread", _FakeThread),
+    ):
+        snapshot = manager.start({"capture_mode": "original", "wait_for_gps_fix": False})
+        assert snapshot["running"] is True
+        assert snapshot["phase"] == "starting"
+        assert snapshot["pid"] == 4321
+
+        stop_snapshot = manager.stop()
+        assert stop_snapshot["stop_requested"] is True
+        assert stop_snapshot["phase"] == "stopping"
+        assert fake_proc._sent_signal == web_capture.signal.SIGINT

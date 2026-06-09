@@ -352,6 +352,9 @@ class CaptureManager:
             "manifest_path": None,
         }
 
+    def _snapshot_unlocked(self) -> dict[str, Any]:
+        return json.loads(json.dumps(self._state))
+
     def start(self, payload: dict[str, Any]) -> dict[str, Any]:
         command = build_capture_command(payload)
         capture_mode = optional_text(payload.get("capture_mode")) or "ptp"
@@ -396,8 +399,9 @@ class CaptureManager:
             reader = threading.Thread(target=self._read_logs, args=(proc,), daemon=True)
             self._reader_thread = reader
             reader.start()
+            snapshot = self._snapshot_unlocked()
 
-            return self.snapshot()
+        return snapshot
 
     def _read_logs(self, proc: subprocess.Popen[str]) -> None:
         assert proc.stdout is not None
@@ -428,16 +432,18 @@ class CaptureManager:
             proc = self._proc
             if not proc or proc.poll() is not None:
                 self._append_internal_log("[web] Stop requested but no capture process is running.")
-                return self.snapshot()
+                snapshot = self._snapshot_unlocked()
+                return snapshot
             self._state["stop_requested"] = True
             self._state["phase"] = "stopping"
             self._append_internal_log("[web] Sending SIGINT to capture process.")
             proc.send_signal(signal.SIGINT)
-            return self.snapshot()
+            snapshot = self._snapshot_unlocked()
+            return snapshot
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
-            return json.loads(json.dumps(self._state))
+            return self._snapshot_unlocked()
 
     def logs_after(self, after_id: int) -> dict[str, Any]:
         with self._lock:
