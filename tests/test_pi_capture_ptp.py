@@ -33,6 +33,19 @@ def test_gpsd_time_to_epoch_ns_parses_utc_z_suffix():
     assert epoch_ns == 1778593649123456000
 
 
+def test_resolve_range_defaults_uses_script_defaults():
+    assert ptp_capture.resolve_range_defaults(None, None) == (1.0, 150.0)
+
+
+def test_resolve_range_defaults_rejects_inverted_values():
+    try:
+        ptp_capture.resolve_range_defaults(50.0, 10.0)
+    except ValueError as exc:
+        assert "Maximum range must be greater than minimum range" in str(exc)
+    else:
+        raise AssertionError("Expected ValueError for inverted range values")
+
+
 def test_ouster_ptp_locked_accepts_slave_with_master():
     status = {
         "timestamp_mode": "TIME_FROM_PTP_1588",

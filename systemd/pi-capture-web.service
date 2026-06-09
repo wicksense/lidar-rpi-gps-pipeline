@@ -1,0 +1,16 @@
+[Unit]
+Description=Pi Capture Web UI
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Update User, WorkingDirectory, and ExecStart to match your Pi account and repo path.
+User=<pi-user>
+WorkingDirectory=/home/<pi-user>/lidar-rpi-gps-pipeline
+ExecStart=/home/<pi-user>/lidar-rpi-gps-pipeline/.venv/bin/python /home/<pi-user>/lidar-rpi-gps-pipeline/pi_capture_web.py --host 0.0.0.0 --port 8080
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

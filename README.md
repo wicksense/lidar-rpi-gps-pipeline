@@ -103,9 +103,11 @@ What matters vs what does not:
 
 - `pi_capture_raw.py`: Raspberry Pi capture script for the original capture path
 - `pi_capture_ptp.py`: Raspberry Pi capture script for GPS/PPS -> Pi clock -> PTP -> Ouster
+- `pi_capture_web.py`: phone-friendly local web UI for starting/stopping Pi capture and watching logs
 - `setup_pi_gps_ptp_stack.sh`: helper to configure `chrony`, `ptp4l`, `phc2sys`, PPS overlay, and the bridge service on the Pi
 - `pi_gps_ptp_diagnostic.sh`: helper to verify I2C, PPS, chrony, PTP, and optional Ouster HTTP timing state
 - `ublox_i2c_chrony_bridge.py`: helper service that feeds UTC time from I2C GNSS into `chrony`'s SOCK refclock
+- `systemd/pi-capture-web.service`: example `systemd` unit for starting the web UI automatically on boot
 - `offline_fuse_lidar_gps.py`: offline processing (GPS fusion + SLAM map)
 - `offline_gui.py`: desktop GUI launcher (MVP scaffold)
 - `src/lidar_rpi_gps_pipeline/`: package scaffold for modularization
@@ -285,6 +287,7 @@ python3 pi_capture_raw.py --lidar-mode 4096x5
 - `OUSTER_HOST`: sensor IP on Pi Ethernet link
 - `LIDAR_OUTPUT_MODE`: `pcap_raw` (default) or `csv`
 - `LIDAR_MODE`: sensor mode applied before capture, for example `1024x20`, `2048x10`, or `4096x5`
+- `SLAM_MIN_RANGE_M`, `SLAM_MAX_RANGE_M`: suggested downstream range defaults saved into the manifest
 - `CAPTURE_DURATION_SEC`: seconds per chunk (default `30`)
 - `CONTINUOUS_CHUNKS`: keep chunking until `Ctrl+C`
 - `WAIT_FOR_GPS_FIX_BEFORE_CAPTURE`: wait for first fix before LiDAR start
@@ -294,6 +297,7 @@ python3 pi_capture_raw.py --lidar-mode 4096x5
 
 Notes:
 - The Pi script uses `ouster-cli source <sensor> config lidar_mode <mode>` before capture starts.
+- `--min-range-m` / `--max-range-m` are saved in the manifest as downstream SLAM/filter defaults. They do not trim the raw `.pcap` capture itself.
 - Set `LIDAR_MODE = None` (or pass an empty override by editing the file) to leave the current sensor mode unchanged.
 - Useful defaults:
   `1024x20` for walking / strongest pose robustness,
@@ -318,6 +322,7 @@ Useful overrides:
 
 ```bash
 python3 pi_capture_ptp.py --lidar-mode 1024x20
+python3 pi_capture_ptp.py --min-range-m 2.0 --max-range-m 80.0
 python3 pi_capture_ptp.py --gps-input-mode gpsd
 python3 pi_capture_ptp.py --no-wait-for-ouster-ptp-lock
 ```
@@ -332,6 +337,81 @@ What `pi_capture_ptp.py` adds on top of the original script:
 Recommended offline guidance for this architecture:
 - prefer `--gps-time-column pi_time_ns`
 - keep `gps_epoch_ns` for QA and UTC traceability
+
+### Web UI for road use
+
+If you normally connect a phone to the Pi hotspot and use VNC just to open a terminal, the web UI is usually easier.
+
+Start it on the Pi:
+
+```bash
+python3 pi_capture_web.py --host 0.0.0.0 --port 8080
+```
+
+Then connect your phone to the Pi hotspot or local Pi network and open:
+
+```text
+http://<pi-ip>:8080
+```
+
+What the web UI gives you:
+
+- start/stop controls for both capture paths
+- lidar mode selection (`1024x20`, `2048x10`, `4096x5`, or leave unchanged)
+- min/max range fields for downstream processing defaults
+- readiness toggles for GPS fix, Pi clock sync, and Ouster PTP lock
+- live log streaming in the browser
+- quick preflight visibility for `chrony` and optional Ouster timing state
+
+Why this is easier than VNC on a phone:
+
+- large tap targets instead of terminal typing
+- live capture logs without a full remote desktop
+- much lighter bandwidth and less fiddly screen interaction
+
+Important note:
+
+- `pi_capture_web.py` is a local control panel with no built-in authentication.
+- Use it only on trusted local networks such as the Pi hotspot you control.
+
+#### Start the web UI automatically on boot
+
+If your Pi capture environment lives in a virtualenv, the easiest boot setup is a `systemd` service that points directly at the venv Python.
+
+This repo includes an example unit:
+
+- `systemd/pi-capture-web.service`
+
+Before installing it:
+
+1. Edit the file and set:
+   - `User`
+   - `WorkingDirectory`
+   - `ExecStart`
+2. Make sure `ExecStart` points to your venv Python, for example:
+   - `/home/<pi-user>/lidar-rpi-gps-pipeline/.venv/bin/python`
+
+Install it on the Pi:
+
+```bash
+sudo cp systemd/pi-capture-web.service /etc/systemd/system/pi-capture-web.service
+sudo systemctl daemon-reload
+sudo systemctl enable pi-capture-web.service
+sudo systemctl start pi-capture-web.service
+```
+
+Check status:
+
+```bash
+sudo systemctl status pi-capture-web.service
+sudo journalctl -u pi-capture-web.service -f
+```
+
+After that, the web UI should come up automatically on boot and be available from your phone at:
+
+```text
+http://<pi-ip>:8080
+```
 
 ### Pi bring-up for the PTP path
 
@@ -403,6 +483,12 @@ The script will:
 - wait for Pi clock sync from `chrony` if enabled
 - wait for Ouster PTP lock if enabled
 - then begin chunked raw LiDAR capture
+
+If you prefer the phone-first workflow, start the web UI instead and launch capture from the browser:
+
+```bash
+python3 pi_capture_web.py --host 0.0.0.0 --port 8080
+```
 
 #### 4) Move files offline and process
 
