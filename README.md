@@ -128,7 +128,7 @@ python -m pip install pandas numpy pyproj pynmea2 pyserial
 ```
 
 Runtime dependency:
-- `ouster-cli` available in `PATH` (used by `pi_capture_raw.py` during capture)
+- `ouster-cli` installed either in `PATH` or in the same virtualenv as the capture script (the Pi scripts auto-resolve the sibling CLI next to the active Python interpreter)
 
 For `pi_capture_ptp.py`, the Pi must also have:
 - `chrony` available in `PATH` (`chronyc` is used for readiness checks)

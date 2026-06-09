@@ -44,6 +44,8 @@ import urllib.error
 import urllib.request
 from typing import Any, Optional
 
+from ouster_cli_utils import resolve_ouster_cli_executable
+
 try:
     import pynmea2
 except ImportError:  # pragma: no cover - exercised only in minimal environments
@@ -773,6 +775,11 @@ def run_command_capture(cmd: list[str]) -> dict[str, Any]:
     }
 
 
+def ouster_cli_command(*args: str) -> list[str]:
+    """Build an `ouster-cli` command using the best-resolved executable."""
+    return [resolve_ouster_cli_executable(), *args]
+
+
 def collect_chrony_snapshot() -> dict[str, Any]:
     """Capture chrony status details for manifests and debug logs."""
     return {
@@ -935,12 +942,13 @@ def configure_ouster_lidar_mode(host: str, lidar_mode: Optional[str]) -> bool:
         return False
 
     cmd = [
-        "ouster-cli",
-        "source",
-        host,
-        "config",
-        "lidar_mode",
-        lidar_mode,
+        *ouster_cli_command(
+            "source",
+            host,
+            "config",
+            "lidar_mode",
+            lidar_mode,
+        ),
     ]
     log("Applying Ouster sensor config:")
     log("  " + " ".join(cmd))
@@ -1027,21 +1035,23 @@ def run_ouster_capture(
     """Start one ouster-cli capture and return the process exit code."""
     if output_mode == "csv":
         cmd = [
-            "ouster-cli",
-            "source",
-            host,
-            "slice",
-            f"0s:{seconds}s",
-            "save",
-            requested_output_path,
+            *ouster_cli_command(
+                "source",
+                host,
+                "slice",
+                f"0s:{seconds}s",
+                "save",
+                requested_output_path,
+            ),
         ]
     elif output_mode == "pcap_raw":
         cmd = [
-            "ouster-cli",
-            "source",
-            host,
-            "save_raw",
-            requested_output_path,
+            *ouster_cli_command(
+                "source",
+                host,
+                "save_raw",
+                requested_output_path,
+            ),
         ]
     else:
         raise ValueError(f"Unsupported LIDAR_OUTPUT_MODE: {output_mode}")

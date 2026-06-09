@@ -32,6 +32,8 @@ import pynmea2
 import serial
 from pyproj import Transformer
 
+from ouster_cli_utils import resolve_ouster_cli_executable
+
 # =======================
 # Field Capture Settings
 # =======================
@@ -369,7 +371,7 @@ def configure_ouster_sensor(host: str, lidar_mode: Optional[str]) -> None:
         return
 
     cmd = [
-        "ouster-cli",
+        resolve_ouster_cli_executable(),
         "source",
         host,
         "config",
@@ -409,7 +411,7 @@ def run_ouster_capture(
     if output_mode == "csv":
         # CSV mode: ouster-cli can be bounded by a time slice directly.
         cmd = [
-            "ouster-cli",
+            resolve_ouster_cli_executable(),
             "source",
             host,
             "slice",
@@ -420,7 +422,7 @@ def run_ouster_capture(
     elif output_mode == "pcap_raw":
         # Raw mode: save_raw runs until interrupted; we stop it after `seconds`.
         cmd = [
-            "ouster-cli",
+            resolve_ouster_cli_executable(),
             "source",
             host,
             "save_raw",
