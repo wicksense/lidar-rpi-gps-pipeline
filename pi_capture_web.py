@@ -130,6 +130,8 @@ LOG_HISTORY_LIMIT = 500
 DEFAULT_UI_CONFIG = {
     "capture_mode": "ptp",
     "lidar_mode": "",
+    "lidar_resolution": "",
+    "lidar_hz": "",
     "min_range_m": ptp_capture.SLAM_MIN_RANGE_M,
     "max_range_m": ptp_capture.SLAM_MAX_RANGE_M,
     "wait_for_gps_fix": True,
@@ -139,6 +141,12 @@ DEFAULT_UI_CONFIG = {
     "timestamp_mode": ptp_capture.OUSTER_TIMESTAMP_MODE or "",
     "ptp_profile": ptp_capture.OUSTER_PTP_PROFILE or "",
     "ouster_host": ptp_capture.OUSTER_HOST,
+}
+
+SUPPORTED_LIDAR_MODE_PAIRS = {
+    ("1024", "20"): "1024x20",
+    ("2048", "10"): "2048x10",
+    ("4096", "5"): "4096x5",
 }
 
 
@@ -171,12 +179,41 @@ def optional_float(value: Any) -> Optional[float]:
     return float(value)
 
 
+def split_lidar_mode(mode: Optional[str]) -> tuple[str, str]:
+    text = optional_text(mode)
+    if not text or "x" not in text:
+        return "", ""
+    left, right = text.lower().split("x", 1)
+    return left.strip(), right.strip()
+
+
+def resolve_lidar_mode_from_payload(payload: dict[str, Any]) -> Optional[str]:
+    lidar_mode = optional_text(payload.get("lidar_mode"))
+    if lidar_mode:
+        return lidar_mode
+
+    resolution = optional_text(payload.get("lidar_resolution"))
+    hz = optional_text(payload.get("lidar_hz"))
+    if not resolution and not hz:
+        return None
+    if not resolution or not hz:
+        raise ValueError("Select both lidar resolution and sample rate, or leave both unchanged.")
+
+    mode = SUPPORTED_LIDAR_MODE_PAIRS.get((resolution, hz))
+    if mode is None:
+        raise ValueError(
+            f"Unsupported lidar mode combination: {resolution} columns at {hz} Hz. "
+            "Choose one of 1024x20, 2048x10, or 4096x5."
+        )
+    return mode
+
+
 def build_capture_command(payload: dict[str, Any]) -> list[str]:
     capture_mode = optional_text(payload.get("capture_mode")) or "ptp"
     if capture_mode not in {"ptp", "original"}:
         raise ValueError("capture_mode must be 'ptp' or 'original'.")
 
-    lidar_mode = optional_text(payload.get("lidar_mode"))
+    lidar_mode = resolve_lidar_mode_from_payload(payload)
     min_range_m = optional_float(payload.get("min_range_m"))
     max_range_m = optional_float(payload.get("max_range_m"))
     ptp_capture.resolve_range_defaults(min_range_m, max_range_m)
@@ -727,14 +764,25 @@ HTML_TEMPLATE = """<!doctype html>
           </div>
 
           <div class="field">
-            <label for="lidar_mode">Lidar Mode</label>
-            <select id="lidar_mode">
+            <label for="lidar_resolution">Lidar Resolution</label>
+            <select id="lidar_resolution">
               <option value="">Leave sensor mode unchanged</option>
-              <option value="1024x20">1024x20 (1024 columns, 20 Hz)</option>
-              <option value="2048x10">2048x10 (2048 columns, 10 Hz)</option>
-              <option value="4096x5">4096x5 (4096 columns, 5 Hz)</option>
+              <option value="1024">1024 columns</option>
+              <option value="2048">2048 columns</option>
+              <option value="4096">4096 columns</option>
             </select>
-            <div class="hint">This is the sensor resolution x sample-rate mode. Leave it unchanged if the sensor is already configured the way you want.</div>
+            <div class="hint">Horizontal resolution. Pick together with sample rate.</div>
+          </div>
+
+          <div class="field">
+            <label for="lidar_hz">Sample Rate</label>
+            <select id="lidar_hz">
+              <option value="">Leave sensor mode unchanged</option>
+              <option value="20">20 Hz</option>
+              <option value="10">10 Hz</option>
+              <option value="5">5 Hz</option>
+            </select>
+            <div class="hint">We validate against supported mode pairs. Currently: 1024x20, 2048x10, 4096x5.</div>
           </div>
 
           <div class="field">
@@ -846,6 +894,16 @@ HTML_TEMPLATE = """<!doctype html>
 
   <script>
     const DEFAULTS = __DEFAULT_CONFIG__;
+    const SUPPORTED_LIDAR_PAIRS = {
+      "1024": "20",
+      "2048": "10",
+      "4096": "5"
+    };
+    const HZ_TO_RESOLUTION = {
+      "20": "1024",
+      "10": "2048",
+      "5": "4096"
+    };
     let lastLogId = 0;
     let currentRunToken = 0;
 
@@ -860,7 +918,8 @@ HTML_TEMPLATE = """<!doctype html>
 
     function setDefaults() {
       document.getElementById("capture_mode").value = DEFAULTS.capture_mode;
-      document.getElementById("lidar_mode").value = DEFAULTS.lidar_mode;
+      document.getElementById("lidar_resolution").value = DEFAULTS.lidar_resolution;
+      document.getElementById("lidar_hz").value = DEFAULTS.lidar_hz;
       document.getElementById("min_range_m").value = DEFAULTS.min_range_m;
       document.getElementById("max_range_m").value = DEFAULTS.max_range_m;
       document.getElementById("wait_for_gps_fix").checked = DEFAULTS.wait_for_gps_fix;
@@ -871,6 +930,7 @@ HTML_TEMPLATE = """<!doctype html>
       document.getElementById("ptp_profile").value = DEFAULTS.ptp_profile;
       document.getElementById("ouster_host").value = DEFAULTS.ouster_host;
       applyModeVisibility();
+      syncLidarFields("resolution");
     }
 
     function applyModeVisibility() {
@@ -880,10 +940,42 @@ HTML_TEMPLATE = """<!doctype html>
       });
     }
 
+    function syncLidarFields(source) {
+      const resolutionEl = document.getElementById("lidar_resolution");
+      const hzEl = document.getElementById("lidar_hz");
+      const resolution = resolutionEl.value;
+      const hz = hzEl.value;
+
+      if (!resolution && !hz) return;
+      if (source === "resolution") {
+        if (!resolution) {
+          hzEl.value = "";
+          return;
+        }
+        const expectedHz = SUPPORTED_LIDAR_PAIRS[resolution];
+        if (!expectedHz) return;
+        if (!hz || hz !== expectedHz) {
+          hzEl.value = expectedHz;
+        }
+        return;
+      }
+
+      if (!hz) {
+        resolutionEl.value = "";
+        return;
+      }
+      const expectedResolution = HZ_TO_RESOLUTION[hz];
+      if (!expectedResolution) return;
+      if (!resolution || resolution !== expectedResolution) {
+        resolutionEl.value = expectedResolution;
+      }
+    }
+
     function formData() {
       return {
         capture_mode: document.getElementById("capture_mode").value,
-        lidar_mode: document.getElementById("lidar_mode").value,
+        lidar_resolution: document.getElementById("lidar_resolution").value,
+        lidar_hz: document.getElementById("lidar_hz").value,
         min_range_m: document.getElementById("min_range_m").value,
         max_range_m: document.getElementById("max_range_m").value,
         wait_for_gps_fix: document.getElementById("wait_for_gps_fix").checked,
@@ -1014,6 +1106,8 @@ HTML_TEMPLATE = """<!doctype html>
     }
 
     document.getElementById("capture_mode").addEventListener("change", applyModeVisibility);
+    document.getElementById("lidar_resolution").addEventListener("change", () => syncLidarFields("resolution"));
+    document.getElementById("lidar_hz").addEventListener("change", () => syncLidarFields("hz"));
     document.getElementById("start_btn").addEventListener("click", startCapture);
     document.getElementById("stop_btn").addEventListener("click", stopCapture);
     document.getElementById("refresh_btn").addEventListener("click", async () => {

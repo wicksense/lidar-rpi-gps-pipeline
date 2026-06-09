@@ -374,7 +374,8 @@ http://<pi-ip>:8080
 What the web UI gives you:
 
 - start/stop controls for both capture paths
-- lidar mode selection (`1024x20`, `2048x10`, `4096x5`, or leave unchanged)
+- separate lidar resolution and sample-rate fields in the web UI
+- validation against supported Ouster mode pairs (`1024x20`, `2048x10`, `4096x5`, or leave unchanged)
 - min/max range fields for downstream processing defaults
 - readiness toggles for GPS fix, Pi clock sync, and Ouster PTP lock
 - `bridge` GPS mode for the I2C/PPS/PTP setup

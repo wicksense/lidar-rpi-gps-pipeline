@@ -21,7 +21,8 @@ def test_build_capture_command_for_ptp_mode():
     cmd = web_capture.build_capture_command(
         {
             "capture_mode": "ptp",
-            "lidar_mode": "1024x20",
+            "lidar_resolution": "1024",
+            "lidar_hz": "20",
             "min_range_m": "2.5",
             "max_range_m": "80",
             "wait_for_gps_fix": True,
@@ -49,7 +50,8 @@ def test_build_capture_command_for_original_mode():
     cmd = web_capture.build_capture_command(
         {
             "capture_mode": "original",
-            "lidar_mode": "",
+            "lidar_resolution": "",
+            "lidar_hz": "",
             "min_range_m": 1.0,
             "max_range_m": 150.0,
             "wait_for_gps_fix": False,
@@ -60,6 +62,22 @@ def test_build_capture_command_for_original_mode():
     assert "--no-wait-for-gps-fix" in joined
     assert "--min-range-m 1.0" in joined
     assert "--max-range-m 150.0" in joined
+
+
+def test_build_capture_command_rejects_unsupported_lidar_pair():
+    try:
+        web_capture.build_capture_command(
+            {
+                "capture_mode": "ptp",
+                "lidar_resolution": "1024",
+                "lidar_hz": "10",
+                "wait_for_gps_fix": False,
+            }
+        )
+    except ValueError as exc:
+        assert "Unsupported lidar mode combination" in str(exc)
+    else:
+        raise AssertionError("Expected ValueError for unsupported lidar mode pair")
 
 
 def test_apply_log_line_updates_tracks_readiness_and_paths():
