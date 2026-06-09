@@ -228,6 +228,7 @@ def build_preflight_snapshot(ouster_host: Optional[str]) -> dict[str, Any]:
                 "waitsync",
                 str(ptp_capture.CHRONY_WAITSYNC_TRIES),
                 str(ptp_capture.CHRONY_MAX_CORRECTION_SEC),
+                "0",
                 str(ptp_capture.CHRONY_WAITSYNC_INTERVAL_SEC),
             ]
         )
@@ -320,6 +321,15 @@ class CaptureManager:
         self._logs: collections.deque[dict[str, Any]] = collections.deque(maxlen=LOG_HISTORY_LIMIT)
         self._state: dict[str, Any] = self._fresh_state()
 
+    def _append_internal_log(self, text: str) -> None:
+        entry = {
+            "id": self._next_log_id,
+            "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "text": text,
+        }
+        self._next_log_id += 1
+        self._logs.append(entry)
+
     @staticmethod
     def _fresh_state() -> dict[str, Any]:
         return {
@@ -363,14 +373,23 @@ class CaptureManager:
                     "phase": "starting",
                 }
             )
+            self._append_internal_log(f"[web] Starting capture: {' '.join(command)}")
 
-            proc = subprocess.Popen(
-                command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-            )
+            try:
+                proc = subprocess.Popen(
+                    command,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                )
+            except Exception as exc:
+                self._state["running"] = False
+                self._state["phase"] = "failed"
+                self._state["exit_code"] = -1
+                self._append_internal_log(f"[web] Failed to start capture: {exc}")
+                raise RuntimeError(f"Failed to start capture: {exc}") from exc
+
             self._proc = proc
             self._state["pid"] = proc.pid
 
@@ -408,9 +427,11 @@ class CaptureManager:
         with self._lock:
             proc = self._proc
             if not proc or proc.poll() is not None:
+                self._append_internal_log("[web] Stop requested but no capture process is running.")
                 return self.snapshot()
             self._state["stop_requested"] = True
             self._state["phase"] = "stopping"
+            self._append_internal_log("[web] Sending SIGINT to capture process.")
             proc.send_signal(signal.SIGINT)
             return self.snapshot()
 
@@ -795,10 +816,14 @@ HTML_TEMPLATE = """<!doctype html>
           <pre id="latest_gps_log">-</pre>
         </div>
 
-        <div class="field full">
-          <label>Preflight Snapshot</label>
-          <pre id="preflight_box">Loading…</pre>
-        </div>
+          <div class="field full">
+            <label>Preflight Snapshot</label>
+            <pre id="preflight_box">Loading…</pre>
+          </div>
+          <div class="field full">
+            <label>UI Messages</label>
+            <pre id="ui_message_box">-</pre>
+          </div>
       </section>
     </div>
 
@@ -811,6 +836,10 @@ HTML_TEMPLATE = """<!doctype html>
   <script>
     const DEFAULTS = __DEFAULT_CONFIG__;
     let lastLogId = 0;
+
+    function setUiMessage(text) {
+      document.getElementById("ui_message_box").textContent = text || "-";
+    }
 
     function setDefaults() {
       document.getElementById("capture_mode").value = DEFAULTS.capture_mode;
@@ -864,64 +893,95 @@ HTML_TEMPLATE = """<!doctype html>
     }
 
     async function startCapture() {
-      const response = await fetch("/api/start", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(formData())
-      });
-      const data = await response.json();
-      if (!response.ok) {
-        alert(data.error || "Failed to start capture");
+      setUiMessage("Starting capture...");
+      try {
+        const response = await fetch("/api/start", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(formData())
+        });
+        const data = await response.json();
+        if (!response.ok) {
+          setUiMessage(data.error || "Failed to start capture");
+          return;
+        }
+        setUiMessage("Capture start request accepted.");
+        await refreshStatus();
+        await refreshLogs();
+      } catch (error) {
+        setUiMessage(`Start request failed: ${error}`);
       }
-      await refreshStatus();
     }
 
     async function stopCapture() {
-      const response = await fetch("/api/stop", { method: "POST" });
-      const data = await response.json();
-      if (!response.ok) {
-        alert(data.error || "Failed to stop capture");
+      setUiMessage("Stopping capture...");
+      try {
+        const response = await fetch("/api/stop", { method: "POST" });
+        const data = await response.json();
+        if (!response.ok) {
+          setUiMessage(data.error || "Failed to stop capture");
+          return;
+        }
+        setUiMessage("Stop request sent.");
+        await refreshStatus();
+        await refreshLogs();
+      } catch (error) {
+        setUiMessage(`Stop request failed: ${error}`);
       }
-      await refreshStatus();
     }
 
     async function refreshStatus() {
-      const response = await fetch("/api/status");
-      const data = await response.json();
-      document.getElementById("capture_status").textContent = data.running ? "Running" : "Idle";
-      document.getElementById("capture_phase").textContent = data.phase || "-";
-      document.getElementById("capture_chunk").textContent = data.current_chunk_index ?? "-";
-      document.getElementById("manifest_path").textContent = data.manifest_path || "-";
-      document.getElementById("latest_gps_log").textContent = data.latest_gps_log || "-";
+      try {
+        const response = await fetch("/api/status");
+        const data = await response.json();
+        document.getElementById("capture_status").textContent = data.running ? "Running" : "Idle";
+        document.getElementById("capture_phase").textContent = data.phase || "-";
+        document.getElementById("capture_chunk").textContent = data.current_chunk_index ?? "-";
+        document.getElementById("manifest_path").textContent = data.manifest_path || "-";
+        document.getElementById("latest_gps_log").textContent = data.latest_gps_log || "-";
 
-      setBadge("badge_gps", data.gps_fix_ready, "GPS fix");
-      const ptpMode = document.getElementById("capture_mode").value === "ptp";
-      setBadge("badge_clock", ptpMode ? data.pi_clock_sync_ready : null, ptpMode ? "Pi clock sync" : "Pi clock sync n/a");
-      setBadge("badge_ptp", ptpMode ? data.ouster_ptp_lock_ready : null, ptpMode ? "Ouster PTP" : "Ouster PTP n/a");
-      setBadge("badge_proc", data.running ? true : null, data.running ? "Process running" : "Process idle");
+        setBadge("badge_gps", data.gps_fix_ready, "GPS fix");
+        const ptpMode = document.getElementById("capture_mode").value === "ptp";
+        setBadge("badge_clock", ptpMode ? data.pi_clock_sync_ready : null, ptpMode ? "Pi clock sync" : "Pi clock sync n/a");
+        setBadge("badge_ptp", ptpMode ? data.ouster_ptp_lock_ready : null, ptpMode ? "Ouster PTP" : "Ouster PTP n/a");
+        setBadge("badge_proc", data.running ? true : null, data.running ? "Process running" : "Process idle");
+        if (data.phase === "failed" && data.exit_code !== null && data.exit_code !== undefined) {
+          setUiMessage(`Capture process exited with code ${data.exit_code}. Check the live log below.`);
+        }
+      } catch (error) {
+        setUiMessage(`Status refresh failed: ${error}`);
+      }
     }
 
     async function refreshLogs() {
-      const response = await fetch(`/api/logs?after=${lastLogId}`);
-      const data = await response.json();
-      const logtext = document.getElementById("logtext");
-      for (const entry of data.entries) {
-        logtext.textContent += `${entry.text}\n`;
-      }
-      if (data.entries.length > 0) {
-        lastLogId = data.newest_id;
-        const box = document.getElementById("logbox");
-        box.scrollTop = box.scrollHeight;
+      try {
+        const response = await fetch(`/api/logs?after=${lastLogId}`);
+        const data = await response.json();
+        const logtext = document.getElementById("logtext");
+        for (const entry of data.entries) {
+          logtext.textContent += `${entry.text}\n`;
+        }
+        if (data.entries.length > 0) {
+          lastLogId = data.newest_id;
+          const box = document.getElementById("logbox");
+          box.scrollTop = box.scrollHeight;
+        }
+      } catch (error) {
+        setUiMessage(`Log refresh failed: ${error}`);
       }
     }
 
     async function refreshPreflight() {
-      const params = new URLSearchParams();
-      const host = document.getElementById("ouster_host").value;
-      if (host) params.set("ouster_host", host);
-      const response = await fetch(`/api/preflight?${params.toString()}`);
-      const data = await response.json();
-      document.getElementById("preflight_box").textContent = JSON.stringify(data, null, 2);
+      try {
+        const params = new URLSearchParams();
+        const host = document.getElementById("ouster_host").value;
+        if (host) params.set("ouster_host", host);
+        const response = await fetch(`/api/preflight?${params.toString()}`);
+        const data = await response.json();
+        document.getElementById("preflight_box").textContent = JSON.stringify(data, null, 2);
+      } catch (error) {
+        document.getElementById("preflight_box").textContent = `Preflight refresh failed: ${error}`;
+      }
     }
 
     document.getElementById("capture_mode").addEventListener("change", applyModeVisibility);
