@@ -487,6 +487,40 @@ What the diagnostic checks:
 
 This script is meant for bring-up and troubleshooting before you trust a field session.
 
+#### Optional: Reduce packet-drop risk on the Pi
+
+When capturing Ouster UDP traffic on the Pi, you may see warnings like:
+
+- `Failed to set desired SO_RCVBUF size to 1048576`
+
+That means Linux allowed a smaller receive buffer than `ouster-cli` requested. Capture can still work, but packet drops are more likely during short CPU or scheduler hiccups.
+
+A practical mitigation is to raise the kernel UDP receive buffer limits:
+
+```bash
+sudo sysctl -w net.core.rmem_max=8388608
+sudo sysctl -w net.core.rmem_default=8388608
+```
+
+To make that persistent across reboots:
+
+```bash
+sudo tee /etc/sysctl.d/90-ouster-capture.conf >/dev/null <<'EOF'
+net.core.rmem_max=8388608
+net.core.rmem_default=8388608
+EOF
+sudo sysctl --system
+```
+
+Tradeoffs:
+
+- usually low risk on a dedicated capture Pi
+- uses a bit more RAM per socket
+- helps absorb short packet bursts
+- does not fix deeper issues like bad links, wrong `udp_dest`, CPU overload, or slow storage
+
+For most field-capture setups in this repo, `8 MB` is a reasonable starting point.
+
 #### 3) Start capture
 
 Once the system stack is healthy:
