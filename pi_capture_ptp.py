@@ -11,7 +11,7 @@ Run this on the Raspberry Pi during data collection when the timing path is:
 This script keeps the same field-capture responsibilities as `pi_capture_raw.py`
 while adding readiness gates for the new timing architecture:
 
-1. Read GPS fixes from serial or gpsd.
+1. Read GPS fixes from the shared I2C bridge, serial, or gpsd.
 2. Save those GPS fixes to a CSV log file.
 3. Optionally configure the Ouster lidar mode and timestamp/PTP settings.
 4. Wait for:
@@ -72,11 +72,12 @@ CONTINUOUS_CHUNKS = True
 WAIT_FOR_GPS_FIX_BEFORE_CAPTURE = True
 WAIT_FOR_PI_CLOCK_SYNC_BEFORE_CAPTURE = True
 WAIT_FOR_OUSTER_PTP_LOCK_BEFORE_CAPTURE = True
-GPS_INPUT_MODE = "serial"
+GPS_INPUT_MODE = "bridge"
 GPS_PORT = "/dev/gps_ublox"
 GPS_BAUD = 9600
 GPSD_HOST = "127.0.0.1"
 GPSD_PORT = 2947
+BRIDGE_FIX_JSON_PATH = "/run/ublox_i2c_chrony_bridge/latest_fix.json"
 OUTPUT_DIR = "/home/urp-pi5/capture_output"
 UTM_EPSG = 32614
 SLAM_MIN_RANGE_M = 1.0
@@ -168,7 +169,7 @@ def parse_cli_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--gps-input-mode",
-        choices=["serial", "gpsd"],
+        choices=["serial", "gpsd", "bridge"],
         default=None,
         help="GPS ingestion mode for this run.",
     )
@@ -176,6 +177,11 @@ def parse_cli_args() -> argparse.Namespace:
     parser.add_argument("--gps-baud", type=int, default=None, help="Serial GPS baud rate override.")
     parser.add_argument("--gpsd-host", default=None, help="gpsd host override.")
     parser.add_argument("--gpsd-port", type=int, default=None, help="gpsd port override.")
+    parser.add_argument(
+        "--bridge-fix-path",
+        default=None,
+        help="Path to the latest GPS fix JSON published by the I2C chrony bridge.",
+    )
     parser.add_argument("--ouster-host", default=None, help="Ouster host/IP override.")
     parser.add_argument(
         "--readiness-timeout-sec",
@@ -575,6 +581,137 @@ class GpsdGpsLogger(BaseGpsLogger):
         log(f"GPS logger stopped. Rows written: {self.rows_written}")
 
 
+class BridgeGpsLogger(BaseGpsLogger):
+    """Background GPS logger that consumes fixes published by the I2C bridge."""
+
+    def __init__(
+        self,
+        fix_json_path: str,
+        out_csv_path: str,
+        stop_event: threading.Event,
+        epsg_out: int = 32614,
+        status_log_every_sec: float = 1.0,
+        poll_sec: float = 0.2,
+    ):
+        super().__init__(
+            out_csv_path=out_csv_path,
+            stop_event=stop_event,
+            epsg_out=epsg_out,
+            status_log_every_sec=status_log_every_sec,
+        )
+        self.fix_json_path = fix_json_path
+        self.poll_sec = poll_sec
+
+    @staticmethod
+    def _safe_float(value: Any, default: float = float("nan")) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    def run(self) -> None:
+        header = [
+            "pi_time_ns",
+            "pi_time_iso",
+            "gps_epoch_ns",
+            "gps_utc_time",
+            "gps_quality",
+            "num_sats",
+            "hdop",
+            "latitude",
+            "longitude",
+            "altitude_m",
+            "easting",
+            "northing",
+        ]
+
+        last_sequence: Optional[int] = None
+        last_signature: Optional[tuple[Any, ...]] = None
+
+        with open(self.out_csv_path, "w", newline="", encoding="utf-8") as f_out:
+            writer = csv.writer(f_out)
+            writer.writerow(header)
+            log(f"Watching GPS bridge fix file: {self.fix_json_path}")
+            missing_logged = False
+
+            while not self.stop_event.is_set():
+                if not os.path.exists(self.fix_json_path):
+                    if not missing_logged:
+                        log(f"Waiting for GPS bridge fix file to appear: {self.fix_json_path}")
+                        missing_logged = True
+                    time.sleep(self.poll_sec)
+                    continue
+                if missing_logged:
+                    log("GPS bridge fix file detected.")
+                    missing_logged = False
+
+                try:
+                    with open(self.fix_json_path, "r", encoding="utf-8") as f_in:
+                        fix = json.load(f_in)
+                except (OSError, json.JSONDecodeError):
+                    time.sleep(self.poll_sec)
+                    continue
+
+                sequence = fix.get("sequence")
+                signature = (
+                    fix.get("gps_epoch_ns"),
+                    fix.get("gps_utc_time"),
+                    fix.get("latitude"),
+                    fix.get("longitude"),
+                    fix.get("gps_quality"),
+                    fix.get("num_sats"),
+                    fix.get("hdop"),
+                    fix.get("altitude_m"),
+                )
+                if sequence is not None:
+                    if sequence == last_sequence:
+                        time.sleep(self.poll_sec)
+                        continue
+                elif signature == last_signature:
+                    time.sleep(self.poll_sec)
+                    continue
+
+                latitude = fix.get("latitude")
+                longitude = fix.get("longitude")
+                if not isinstance(latitude, (int, float)) or not isinstance(longitude, (int, float)):
+                    time.sleep(self.poll_sec)
+                    continue
+                if math.isnan(latitude) or math.isnan(longitude):
+                    time.sleep(self.poll_sec)
+                    continue
+
+                pi_time_ns = int(fix.get("pi_time_ns") or time.time_ns())
+                pi_time_iso = str(fix.get("pi_time_iso") or dt.datetime.now(dt.timezone.utc).isoformat())
+                gps_epoch_ns = fix.get("gps_epoch_ns")
+                try:
+                    gps_epoch_ns = int(gps_epoch_ns) if gps_epoch_ns not in (None, "") else None
+                except (TypeError, ValueError):
+                    gps_epoch_ns = None
+
+                self._write_fix(
+                    writer,
+                    pi_time_ns=pi_time_ns,
+                    pi_time_iso=pi_time_iso,
+                    gps_epoch_ns=gps_epoch_ns,
+                    gps_utc_time=str(fix.get("gps_utc_time") or ""),
+                    gps_quality=fix.get("gps_quality", ""),
+                    num_sats=fix.get("num_sats", ""),
+                    hdop=fix.get("hdop", ""),
+                    latitude=float(latitude),
+                    longitude=float(longitude),
+                    altitude_m=self._safe_float(fix.get("altitude_m")),
+                    source_summary=f"bridge q={fix.get('gps_quality', '')}",
+                )
+                f_out.flush()
+
+                last_sequence = sequence if isinstance(sequence, int) else last_sequence
+                last_signature = signature
+
+                time.sleep(self.poll_sec)
+
+        log(f"GPS logger stopped. Rows written: {self.rows_written}")
+
+
 def build_gps_logger(
     *,
     gps_input_mode: str,
@@ -584,6 +721,7 @@ def build_gps_logger(
     gps_baud: int,
     gpsd_host: str,
     gpsd_port: int,
+    bridge_fix_path: str,
 ) -> BaseGpsLogger:
     """Construct the requested GPS logger implementation."""
     if gps_input_mode == "serial":
@@ -600,6 +738,13 @@ def build_gps_logger(
         return GpsdGpsLogger(
             host=gpsd_host,
             port=gpsd_port,
+            out_csv_path=gps_csv_path,
+            stop_event=stop_event,
+            epsg_out=UTM_EPSG,
+        )
+    if gps_input_mode == "bridge":
+        return BridgeGpsLogger(
+            fix_json_path=bridge_fix_path,
             out_csv_path=gps_csv_path,
             stop_event=stop_event,
             epsg_out=UTM_EPSG,
@@ -654,6 +799,7 @@ def wait_for_pi_clock_sync(
                 "waitsync",
                 str(CHRONY_WAITSYNC_TRIES),
                 str(max_correction_sec),
+                "0",
                 str(CHRONY_WAITSYNC_INTERVAL_SEC),
             ]
         )
@@ -960,6 +1106,7 @@ def build_abort_manifest(
     gps_baud: int,
     gpsd_host: str,
     gpsd_port: int,
+    bridge_fix_path: str,
     gps_csv_path: str,
     gps_logger: BaseGpsLogger,
     min_range_m: float,
@@ -995,6 +1142,7 @@ def build_abort_manifest(
         "gps_baud": gps_baud,
         "gpsd_host": gpsd_host,
         "gpsd_port": gpsd_port,
+        "bridge_fix_path": bridge_fix_path,
         "utm_epsg": UTM_EPSG,
         "gps_csv_path": gps_csv_path,
         "gps_rows_written": gps_logger.rows_written,
@@ -1029,6 +1177,7 @@ def main() -> None:
     gps_baud = cli.gps_baud or GPS_BAUD
     gpsd_host = cli.gpsd_host or GPSD_HOST
     gpsd_port = cli.gpsd_port or GPSD_PORT
+    bridge_fix_path = cli.bridge_fix_path or BRIDGE_FIX_JSON_PATH
     ouster_host = cli.ouster_host or OUSTER_HOST
 
     ensure_dir(OUTPUT_DIR)
@@ -1071,6 +1220,7 @@ def main() -> None:
         gps_baud=gps_baud,
         gpsd_host=gpsd_host,
         gpsd_port=gpsd_port,
+        bridge_fix_path=bridge_fix_path,
     )
     gps_logger.start()
 
@@ -1100,6 +1250,7 @@ def main() -> None:
                 gps_baud=gps_baud,
                 gpsd_host=gpsd_host,
                 gpsd_port=gpsd_port,
+                bridge_fix_path=bridge_fix_path,
                 gps_csv_path=gps_csv_path,
                 gps_logger=gps_logger,
                 min_range_m=min_range_m,
@@ -1144,6 +1295,7 @@ def main() -> None:
                 gps_baud=gps_baud,
                 gpsd_host=gpsd_host,
                 gpsd_port=gpsd_port,
+                bridge_fix_path=bridge_fix_path,
                 gps_csv_path=gps_csv_path,
                 gps_logger=gps_logger,
                 min_range_m=min_range_m,
@@ -1188,6 +1340,7 @@ def main() -> None:
                 gps_baud=gps_baud,
                 gpsd_host=gpsd_host,
                 gpsd_port=gpsd_port,
+                bridge_fix_path=bridge_fix_path,
                 gps_csv_path=gps_csv_path,
                 gps_logger=gps_logger,
                 min_range_m=min_range_m,
@@ -1307,6 +1460,7 @@ def main() -> None:
         "gps_baud": gps_baud,
         "gpsd_host": gpsd_host,
         "gpsd_port": gpsd_port,
+        "bridge_fix_path": bridge_fix_path,
         "utm_epsg": UTM_EPSG,
         "gps_csv_path": gps_csv_path,
         "gps_rows_written": gps_logger.rows_written,

@@ -14,26 +14,27 @@ import argparse
 import ctypes
 import datetime as dt
 import errno
+import json
+import math
 import os
 import socket
 import time
-from typing import Optional
+from typing import Any, Optional
 
 try:
     from smbus2 import SMBus  # type: ignore
 except ImportError:  # pragma: no cover - fallback for Pi images with python3-smbus only
     try:
         from smbus import SMBus  # type: ignore
-    except ImportError as exc:  # pragma: no cover
-        raise SystemExit(
-            "Neither smbus2 nor smbus is available. Install python3-smbus or python3-smbus2."
-        ) from exc
+    except ImportError:  # pragma: no cover
+        SMBus = None  # type: ignore[assignment]
 
 
 UBLOX_I2C_STREAM_COUNT_MSB = 0xFD
 UBLOX_I2C_STREAM_COUNT_LSB = 0xFE
 UBLOX_I2C_STREAM_DATA = 0xFF
 CHRONY_SOCK_MAGIC = 0x534F434B
+DEFAULT_FIX_JSON_PATH = "/run/ublox_i2c_chrony_bridge/latest_fix.json"
 
 
 class ChronySockSample(ctypes.Structure):
@@ -91,6 +92,14 @@ def parse_args() -> argparse.Namespace:
         "--debug-nmea",
         action="store_true",
         help="Print accepted RMC sentences for debugging",
+    )
+    parser.add_argument(
+        "--fix-json-path",
+        default=DEFAULT_FIX_JSON_PATH,
+        help=(
+            "Path where the latest decoded GPS fix should be published as JSON "
+            f"(default: {DEFAULT_FIX_JSON_PATH})"
+        ),
     )
     return parser.parse_args()
 
@@ -172,8 +181,175 @@ def parse_rmc_utc_epoch(sentence: str) -> Optional[float]:
     return gps_dt.timestamp()
 
 
+def parse_nmea_utc_time(value: str) -> Optional[dt.time]:
+    if not value:
+        return None
+    try:
+        if "." in value:
+            hhmmss, frac = value.split(".", 1)
+        else:
+            hhmmss, frac = value, ""
+        if len(hhmmss) < 6:
+            return None
+        hour = int(hhmmss[0:2])
+        minute = int(hhmmss[2:4])
+        second = int(hhmmss[4:6])
+        microsecond = int((frac + "000000")[:6]) if frac else 0
+        return dt.time(hour, minute, second, microsecond)
+    except ValueError:
+        return None
+
+
+def parse_nmea_date(value: str) -> Optional[dt.date]:
+    if not value or len(value) < 6:
+        return None
+    try:
+        day = int(value[0:2])
+        month = int(value[2:4])
+        year_2 = int(value[4:6])
+        year = 2000 + year_2 if year_2 < 80 else 1900 + year_2
+        return dt.date(year, month, day)
+    except ValueError:
+        return None
+
+
+def combine_utc_date_time(gps_date: Optional[dt.date], gps_time: Optional[dt.time]) -> Optional[dt.datetime]:
+    if gps_date is None or gps_time is None:
+        return None
+    return dt.datetime.combine(gps_date, gps_time).replace(tzinfo=dt.timezone.utc)
+
+
+def parse_nmea_coordinate(value: str, hemisphere: str, *, is_latitude: bool) -> Optional[float]:
+    if not value or not hemisphere:
+        return None
+    degrees_len = 2 if is_latitude else 3
+    if len(value) <= degrees_len:
+        return None
+    try:
+        degrees = int(value[:degrees_len])
+        minutes = float(value[degrees_len:])
+    except ValueError:
+        return None
+    decimal = degrees + (minutes / 60.0)
+    hemi = hemisphere.upper()
+    if hemi in {"S", "W"}:
+        decimal = -decimal
+    elif hemi not in {"N", "E"}:
+        return None
+    return decimal
+
+
+def parse_gga_fix(sentence: str, current_date: Optional[dt.date]) -> Optional[dict[str, Any]]:
+    if not checksum_ok(sentence):
+        return None
+
+    body = sentence[1:].split("*", 1)[0]
+    fields = body.split(",")
+    if not fields or not fields[0].endswith("GGA") or len(fields) < 10:
+        return None
+
+    gps_time = parse_nmea_utc_time(fields[1])
+    latitude = parse_nmea_coordinate(fields[2], fields[3], is_latitude=True)
+    longitude = parse_nmea_coordinate(fields[4], fields[5], is_latitude=False)
+    if latitude is None or longitude is None:
+        return None
+
+    try:
+        gps_quality = int(fields[6] or 0)
+    except ValueError:
+        gps_quality = 0
+    if gps_quality <= 0:
+        return None
+
+    try:
+        num_sats: Any = int(fields[7]) if fields[7] else ""
+    except ValueError:
+        num_sats = fields[7]
+
+    try:
+        hdop: Any = float(fields[8]) if fields[8] else ""
+    except ValueError:
+        hdop = fields[8]
+
+    try:
+        altitude_m = float(fields[9]) if fields[9] else float("nan")
+    except ValueError:
+        altitude_m = float("nan")
+
+    gps_dt = combine_utc_date_time(current_date, gps_time)
+    gps_epoch_ns = int(gps_dt.timestamp() * 1e9) if gps_dt is not None else None
+    gps_utc_time = gps_time.isoformat() if gps_time is not None else ""
+
+    return {
+        "gps_epoch_ns": gps_epoch_ns,
+        "gps_utc_time": gps_utc_time,
+        "gps_quality": gps_quality,
+        "num_sats": num_sats,
+        "hdop": hdop,
+        "latitude": latitude,
+        "longitude": longitude,
+        "altitude_m": altitude_m,
+    }
+
+
+def write_json_atomic(path: str, payload: dict[str, Any]) -> None:
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f_out:
+        json.dump(payload, f_out, indent=2)
+        f_out.flush()
+        os.fsync(f_out.fileno())
+    os.replace(tmp_path, path)
+
+
+class FixPublisher:
+    def __init__(self, json_path: str):
+        self.json_path = json_path
+        self.last_rmc_date: Optional[dt.date] = None
+        self.fix_count = 0
+
+    def update_from_nmea(self, sentence: str) -> None:
+        if not checksum_ok(sentence):
+            return
+
+        body = sentence[1:].split("*", 1)[0]
+        fields = body.split(",")
+        if not fields:
+            return
+
+        talker = fields[0]
+        if talker.endswith("RMC") and len(fields) >= 10:
+            parsed_date = parse_nmea_date(fields[9])
+            if parsed_date is not None:
+                self.last_rmc_date = parsed_date
+            return
+
+        if not talker.endswith("GGA"):
+            return
+
+        fix = parse_gga_fix(sentence, self.last_rmc_date)
+        if fix is None:
+            return
+
+        now_utc = dt.datetime.now(dt.timezone.utc)
+        self.fix_count += 1
+        payload = {
+            "sequence": self.fix_count,
+            "source": "ublox_i2c_bridge",
+            "pi_time_ns": time.time_ns(),
+            "pi_time_iso": now_utc.isoformat(),
+            **fix,
+        }
+        write_json_atomic(self.json_path, payload)
+
+
 class UbloxI2CReader:
     def __init__(self, bus_num: int, address: int, read_chunk_size: int):
+        if SMBus is None:
+            raise RuntimeError("Neither smbus2 nor smbus is available. Install python3-smbus or python3-smbus2.")
         self.bus_num = bus_num
         self.address = address
         self.read_chunk_size = max(1, min(read_chunk_size, 32))
@@ -267,10 +443,12 @@ def main() -> int:
         read_chunk_size=args.read_chunk_size,
     )
     writer = ChronySockWriter(args.sock_path)
+    fix_publisher = FixPublisher(args.fix_json_path)
 
     log(
         f"Starting u-blox I2C -> chrony bridge on bus {args.i2c_bus}, "
-        f"addr 0x{args.i2c_addr:02X}, socket {args.sock_path}"
+        f"addr 0x{args.i2c_addr:02X}, socket {args.sock_path}, "
+        f"fix JSON {args.fix_json_path}"
     )
 
     buffer = bytearray()
@@ -301,6 +479,11 @@ def main() -> int:
             if line is None:
                 break
 
+            try:
+                fix_publisher.update_from_nmea(line)
+            except OSError as exc:
+                log(f"Failed to publish GPS fix JSON: {exc}")
+
             ref_time_unix = parse_rmc_utc_epoch(line)
             if ref_time_unix is None:
                 continue
@@ -322,7 +505,10 @@ def main() -> int:
         now = time.monotonic()
         if now - last_status >= args.status_interval:
             last_status = now
-            log(f"Bridge alive. chrony samples sent: {samples_sent}")
+            log(
+                f"Bridge alive. chrony samples sent: {samples_sent}, "
+                f"GPS fixes published: {fix_publisher.fix_count}"
+            )
 
 
 if __name__ == "__main__":

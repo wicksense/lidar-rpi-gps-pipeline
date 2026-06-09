@@ -106,7 +106,7 @@ What matters vs what does not:
 - `pi_capture_web.py`: phone-friendly local web UI for starting/stopping Pi capture and watching logs
 - `setup_pi_gps_ptp_stack.sh`: helper to configure `chrony`, `ptp4l`, `phc2sys`, PPS overlay, and the bridge service on the Pi
 - `pi_gps_ptp_diagnostic.sh`: helper to verify I2C, PPS, chrony, PTP, and optional Ouster HTTP timing state
-- `ublox_i2c_chrony_bridge.py`: helper service that feeds UTC time from I2C GNSS into `chrony`'s SOCK refclock
+- `ublox_i2c_chrony_bridge.py`: helper service that feeds UTC time from I2C GNSS into `chrony`'s SOCK refclock and publishes the latest decoded GPS fix for `pi_capture_ptp.py`
 - `systemd/pi-capture-web.service`: example `systemd` unit for starting the web UI automatically on boot
 - `offline_fuse_lidar_gps.py`: offline processing (GPS fusion + SLAM map)
 - `offline_gui.py`: desktop GUI launcher (MVP scaffold)
@@ -134,6 +134,7 @@ For `pi_capture_ptp.py`, the Pi must also have:
 - `chrony` available in `PATH` (`chronyc` is used for readiness checks)
 - working PTP services outside Python (`ptp4l` / `phc2sys`)
 - Ouster HTTP API reachable from the Pi
+- the `ublox_i2c_chrony_bridge.py` service running when using the default `bridge` GPS input mode
 
 For the I2C/PPS GNSS stack used by the setup helper:
 - `python3-smbus` or `python3-smbus2`
@@ -323,7 +324,7 @@ Useful overrides:
 ```bash
 python3 pi_capture_ptp.py --lidar-mode 1024x20
 python3 pi_capture_ptp.py --min-range-m 2.0 --max-range-m 80.0
-python3 pi_capture_ptp.py --gps-input-mode gpsd
+python3 pi_capture_ptp.py --gps-input-mode bridge
 python3 pi_capture_ptp.py --no-wait-for-ouster-ptp-lock
 ```
 
@@ -333,6 +334,22 @@ What `pi_capture_ptp.py` adds on top of the original script:
 - Pi clock readiness gating via `chronyc waitsync`
 - Ouster PTP lock readiness gating via HTTP API
 - manifest sync metadata for field-session debugging
+
+For the I2C + PPS + PTP setup in this repo, the recommended GPS input mode is:
+
+- `bridge`
+
+Why:
+
+- `ublox_i2c_chrony_bridge.py` is already the single reader of the u-blox I2C byte stream
+- it now publishes the latest valid GPS fix as local JSON
+- `pi_capture_ptp.py` reads that published fix and writes the normal GPS CSV
+- this avoids two processes competing to read the same I2C GPS stream
+
+Other GPS input modes are still available when they match your hardware:
+
+- `serial`: use only when the GNSS is exposed as a serial device like `/dev/gps_ublox`
+- `gpsd`: use only if you have separately installed and configured `gpsd`
 
 Recommended offline guidance for this architecture:
 - prefer `--gps-time-column pi_time_ns`
@@ -360,6 +377,7 @@ What the web UI gives you:
 - lidar mode selection (`1024x20`, `2048x10`, `4096x5`, or leave unchanged)
 - min/max range fields for downstream processing defaults
 - readiness toggles for GPS fix, Pi clock sync, and Ouster PTP lock
+- `bridge` GPS mode for the I2C/PPS/PTP setup
 - live log streaming in the browser
 - quick preflight visibility for `chrony` and optional Ouster timing state
 
@@ -436,6 +454,7 @@ What this script does:
 - enables a PPS GPIO overlay
 - installs/configures a `chrony` SOCK + PPS refclock setup
 - installs the `ublox_i2c_chrony_bridge.py` service
+- configures that bridge service to publish the latest GPS fix at `/run/ublox_i2c_chrony_bridge/latest_fix.json`
 - writes `ptp4l` and `phc2sys` service units
 - enables and starts those services unless `--no-start` is used
 

@@ -9,6 +9,7 @@ PPS_GPIO="18"
 I2C_BUS="1"
 GPS_ADDR="0x42"
 CHRONY_SOCK_PATH="/run/chrony/zedf9p.sock"
+BRIDGE_FIX_JSON_PATH="/run/ublox_i2c_chrony_bridge/latest_fix.json"
 BRIDGE_INSTALL_PATH="/usr/local/bin/ublox_i2c_chrony_bridge.py"
 BRIDGE_SERVICE_PATH="/etc/systemd/system/ublox-i2c-chrony-bridge.service"
 PTP4L_SERVICE_PATH="/etc/systemd/system/ptp4l.service"
@@ -38,6 +39,7 @@ Options:
   --i2c-bus BUS           I2C bus number (default: 1)
   --gps-addr ADDR         GPS I2C address (default: 0x42)
   --chrony-sock PATH      chrony SOCK refclock path (default: /run/chrony/zedf9p.sock)
+  --bridge-fix-json PATH  JSON path for latest published GPS fix (default: /run/ublox_i2c_chrony_bridge/latest_fix.json)
   --skip-apt              Skip apt package installation
   --no-start              Enable services but do not start/restart them now
   -h, --help              Show this help
@@ -90,6 +92,10 @@ parse_args() {
         ;;
       --chrony-sock)
         CHRONY_SOCK_PATH="$2"
+        shift 2
+        ;;
+      --bridge-fix-json)
+        BRIDGE_FIX_JSON_PATH="$2"
         shift 2
         ;;
       --skip-apt)
@@ -183,7 +189,7 @@ Wants=chrony.service network-online.target
 
 [Service]
 Type=simple
-ExecStart=${BRIDGE_INSTALL_PATH} --i2c-bus ${I2C_BUS} --i2c-addr ${GPS_ADDR} --sock-path ${CHRONY_SOCK_PATH}
+ExecStart=${BRIDGE_INSTALL_PATH} --i2c-bus ${I2C_BUS} --i2c-addr ${GPS_ADDR} --sock-path ${CHRONY_SOCK_PATH} --fix-json-path ${BRIDGE_FIX_JSON_PATH}
 Restart=on-failure
 RestartSec=2
 

@@ -135,7 +135,7 @@ DEFAULT_UI_CONFIG = {
     "wait_for_gps_fix": True,
     "wait_for_pi_clock_sync": True,
     "wait_for_ouster_ptp_lock": True,
-    "gps_input_mode": "serial",
+    "gps_input_mode": "bridge",
     "timestamp_mode": ptp_capture.OUSTER_TIMESTAMP_MODE or "",
     "ptp_profile": ptp_capture.OUSTER_PTP_PROFILE or "",
     "ouster_host": ptp_capture.OUSTER_HOST,
@@ -200,9 +200,9 @@ def build_capture_command(payload: dict[str, Any]) -> list[str]:
         cmd.append("--wait-for-pi-clock-sync" if wait_for_pi_clock_sync else "--no-wait-for-pi-clock-sync")
         cmd.append("--wait-for-ouster-ptp-lock" if wait_for_ouster_ptp_lock else "--no-wait-for-ouster-ptp-lock")
 
-        gps_input_mode = optional_text(payload.get("gps_input_mode")) or "serial"
-        if gps_input_mode not in {"serial", "gpsd"}:
-            raise ValueError("gps_input_mode must be 'serial' or 'gpsd'.")
+        gps_input_mode = optional_text(payload.get("gps_input_mode")) or "bridge"
+        if gps_input_mode not in {"serial", "gpsd", "bridge"}:
+            raise ValueError("gps_input_mode must be 'serial', 'gpsd', or 'bridge'.")
         cmd.extend(["--gps-input-mode", gps_input_mode])
 
         timestamp_mode = optional_text(payload.get("timestamp_mode"))
@@ -757,6 +757,7 @@ HTML_TEMPLATE = """<!doctype html>
           <div class="field ptp-only">
             <label for="gps_input_mode">GPS Input Mode</label>
             <select id="gps_input_mode">
+              <option value="bridge">bridge (I2C bridge service)</option>
               <option value="serial">serial</option>
               <option value="gpsd">gpsd</option>
             </select>

@@ -27,7 +27,7 @@ def test_build_capture_command_for_ptp_mode():
             "wait_for_gps_fix": True,
             "wait_for_pi_clock_sync": False,
             "wait_for_ouster_ptp_lock": True,
-            "gps_input_mode": "gpsd",
+            "gps_input_mode": "bridge",
             "timestamp_mode": "TIME_FROM_PTP_1588",
             "ptp_profile": "default",
             "ouster_host": "169.254.10.20",
@@ -41,7 +41,7 @@ def test_build_capture_command_for_ptp_mode():
     assert "--wait-for-gps-fix" in joined
     assert "--no-wait-for-pi-clock-sync" in joined
     assert "--wait-for-ouster-ptp-lock" in joined
-    assert "--gps-input-mode gpsd" in joined
+    assert "--gps-input-mode bridge" in joined
     assert "--ouster-host 169.254.10.20" in joined
 
 

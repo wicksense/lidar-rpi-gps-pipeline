@@ -1,5 +1,8 @@
 import importlib.util
+import json
 from pathlib import Path
+import threading
+import time
 
 
 def _load_module():
@@ -44,6 +47,62 @@ def test_resolve_range_defaults_rejects_inverted_values():
         assert "Maximum range must be greater than minimum range" in str(exc)
     else:
         raise AssertionError("Expected ValueError for inverted range values")
+
+
+def test_build_gps_logger_supports_bridge_mode(tmp_path):
+    logger = ptp_capture.build_gps_logger(
+        gps_input_mode="bridge",
+        stop_event=threading.Event(),
+        gps_csv_path=str(tmp_path / "raw_gps.csv"),
+        gps_port="/dev/does-not-matter",
+        gps_baud=9600,
+        gpsd_host="127.0.0.1",
+        gpsd_port=2947,
+        bridge_fix_path=str(tmp_path / "latest_fix.json"),
+    )
+    assert isinstance(logger, ptp_capture.BridgeGpsLogger)
+
+
+def test_bridge_gps_logger_writes_fix_from_json(tmp_path):
+    fix_path = tmp_path / "latest_fix.json"
+    fix_path.write_text(
+        json.dumps(
+            {
+                "sequence": 1,
+                "pi_time_ns": 1781034250801505000,
+                "pi_time_iso": "2026-06-09T19:44:10.801505+00:00",
+                "gps_epoch_ns": 1781034250000000000,
+                "gps_utc_time": "19:44:10",
+                "gps_quality": 4,
+                "num_sats": 18,
+                "hdop": 0.6,
+                "latitude": 29.42412,
+                "longitude": -98.49363,
+                "altitude_m": 200.5,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    stop_event = threading.Event()
+    logger = ptp_capture.BridgeGpsLogger(
+        fix_json_path=str(fix_path),
+        out_csv_path=str(tmp_path / "raw_gps.csv"),
+        stop_event=stop_event,
+        poll_sec=0.01,
+    )
+    logger.start()
+    deadline = time.time() + 0.5
+    while logger.rows_written < 1 and time.time() < deadline:
+        time.sleep(0.01)
+    stop_event.set()
+    logger.join(timeout=1)
+
+    csv_text = (tmp_path / "raw_gps.csv").read_text(encoding="utf-8")
+    assert "29.42412" in csv_text
+    assert "-98.49363" in csv_text
+    assert logger.rows_written >= 1
+    assert logger.first_fix_time_ns == 1781034250801505000
 
 
 def test_ouster_ptp_locked_accepts_slave_with_master():
