@@ -33,9 +33,14 @@ def resolve_ouster_cli_executable() -> str:
     if which_path:
         return which_path
 
-    sibling = Path(sys.executable).resolve().with_name("ouster-cli")
-    if sibling.exists():
-        return str(sibling)
+    executable_path = Path(sys.executable)
+    sibling_candidates = [
+        executable_path.with_name("ouster-cli"),
+        executable_path.resolve().with_name("ouster-cli"),
+    ]
+    for sibling in sibling_candidates:
+        if sibling.exists():
+            return str(sibling)
 
     for candidate in ("/usr/local/bin/ouster-cli", "/usr/bin/ouster-cli"):
         if Path(candidate).exists():

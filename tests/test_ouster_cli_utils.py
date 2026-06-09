@@ -35,3 +35,25 @@ def test_resolve_ouster_cli_uses_sibling_of_python_when_path_missing(tmp_path):
         mock.patch.object(ouster_cli_utils.sys, "executable", str(fake_python)),
     ):
         assert ouster_cli_utils.resolve_ouster_cli_executable() == str(sibling_cli)
+
+
+def test_resolve_ouster_cli_prefers_venv_sibling_before_resolved_symlink_target(tmp_path):
+    venv_bin = tmp_path / ".venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    real_bin = tmp_path / "real-bin"
+    real_bin.mkdir()
+
+    real_python = real_bin / "python3.13"
+    real_python.write_text("", encoding="utf-8")
+    venv_python = venv_bin / "python"
+    venv_python.symlink_to(real_python)
+
+    venv_cli = venv_bin / "ouster-cli"
+    venv_cli.write_text("", encoding="utf-8")
+
+    with (
+        mock.patch.dict(ouster_cli_utils.os.environ, {}, clear=True),
+        mock.patch.object(ouster_cli_utils.shutil, "which", return_value=None),
+        mock.patch.object(ouster_cli_utils.sys, "executable", str(venv_python)),
+    ):
+        assert ouster_cli_utils.resolve_ouster_cli_executable() == str(venv_cli)
