@@ -489,6 +489,11 @@ What the diagnostic checks:
 
 This script is meant for bring-up and troubleshooting before you trust a field session.
 
+PTP troubleshooting note:
+
+- If the Ouster stays in `port_state=LISTENING` instead of `SLAVE`, first verify the Pi-side `ptp4l` / `phc2sys` services are healthy.
+- One Ouster community report also found that PTP would not lock while the sensor was using a link-local `169.254.x.x` address, and started working after moving the sensor to a static non-link-local IPv4 address on the same subnet as the master.
+
 #### Optional: Reduce packet-drop risk on the Pi
 
 When capturing Ouster UDP traffic on the Pi, you may see warnings like:
