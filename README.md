@@ -449,7 +449,8 @@ What this script does:
 
 - enables Pi I2C in boot config
 - enables a PPS GPIO overlay
-- creates or updates a NetworkManager Wi-Fi hotspot profile named `URP-RPI-Net`
+- creates a persistent NetworkManager ethernet profile named `URP-Ouster-Link` on `eth0` with IPv4 `169.254.100.8/16` if it does not already exist
+- creates a NetworkManager Wi-Fi hotspot profile named `URP-RPI-Net` if it does not already exist
 - sets hotspot SSID `URP-RPI-Net` with default password `test@123`
 - installs/configures a `chrony` SOCK + PPS refclock setup
 - installs the `ublox_i2c_chrony_bridge.py` service
@@ -462,6 +463,7 @@ Common overrides:
 ```bash
 sudo ./setup_pi_gps_ptp_stack.sh --pps-gpio 18
 sudo ./setup_pi_gps_ptp_stack.sh --iface eth0
+sudo ./setup_pi_gps_ptp_stack.sh --eth-ipv4 169.254.100.8/16
 sudo ./setup_pi_gps_ptp_stack.sh --hotspot-password 'your-strong-password'
 sudo ./setup_pi_gps_ptp_stack.sh --skip-apt
 ```

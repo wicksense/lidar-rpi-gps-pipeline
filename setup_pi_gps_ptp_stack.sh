@@ -5,6 +5,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 IFACE="eth0"
+ETH_CONNECTION_NAME="URP-Ouster-Link"
+ETH_IPV4_ADDRESS="169.254.100.8/16"
 WIFI_IFACE="wlan0"
 HOTSPOT_NAME="URP-RPI-Net"
 HOTSPOT_SSID="URP-RPI-Net"
@@ -39,6 +41,8 @@ Usage:
 
 Options:
   --iface IFACE           Ethernet interface for PTP grandmaster (default: eth0)
+  --eth-connection NAME   NetworkManager connection name for Ouster ethernet link (default: URP-Ouster-Link)
+  --eth-ipv4 CIDR         Static IPv4/CIDR for Ouster ethernet link (default: 169.254.100.8/16)
   --wifi-iface IFACE      Wi-Fi interface for hotspot/AP mode (default: wlan0)
   --hotspot-name NAME     NetworkManager connection name for hotspot (default: URP-RPI-Net)
   --hotspot-ssid SSID     Wi-Fi SSID for hotspot/AP mode (default: URP-RPI-Net)
@@ -84,6 +88,14 @@ parse_args() {
     case "$1" in
       --iface)
         IFACE="$2"
+        shift 2
+        ;;
+      --eth-connection)
+        ETH_CONNECTION_NAME="$2"
+        shift 2
+        ;;
+      --eth-ipv4)
+        ETH_IPV4_ADDRESS="$2"
         shift 2
         ;;
       --wifi-iface)
@@ -203,24 +215,50 @@ install_bridge_script() {
   install -m 0755 "${SCRIPT_DIR}/ublox_i2c_chrony_bridge.py" "${BRIDGE_INSTALL_PATH}"
 }
 
+configure_ethernet_link() {
+  if ! command -v nmcli >/dev/null 2>&1; then
+    warn "nmcli not found. Skipping persistent ethernet setup for ${IFACE}."
+    return
+  fi
+
+  if nmcli connection show "${ETH_CONNECTION_NAME}" >/dev/null 2>&1; then
+    log "Ethernet profile '${ETH_CONNECTION_NAME}' already exists; leaving it unchanged"
+    return
+  fi
+
+  log "Creating persistent ethernet profile '${ETH_CONNECTION_NAME}' on ${IFACE}"
+  nmcli connection add \
+    type ethernet \
+    ifname "${IFACE}" \
+    con-name "${ETH_CONNECTION_NAME}" \
+    autoconnect yes \
+    ipv4.method manual \
+    ipv4.addresses "${ETH_IPV4_ADDRESS}" \
+    ipv6.method ignore
+
+  nmcli connection modify "${ETH_CONNECTION_NAME}" \
+    connection.autoconnect yes \
+    connection.autoconnect-priority 90
+}
+
 configure_hotspot() {
   if ! command -v nmcli >/dev/null 2>&1; then
     warn "nmcli not found. Skipping hotspot/AP setup for ${WIFI_IFACE}."
     return
   fi
 
-  log "Configuring Wi-Fi hotspot '${HOTSPOT_NAME}' on ${WIFI_IFACE}"
-
   if nmcli connection show "${HOTSPOT_NAME}" >/dev/null 2>&1; then
-    log "Hotspot profile already exists; updating it in place"
-  else
-    nmcli connection add \
-      type wifi \
-      ifname "${WIFI_IFACE}" \
-      con-name "${HOTSPOT_NAME}" \
-      autoconnect yes \
-      ssid "${HOTSPOT_SSID}"
+    log "Hotspot profile '${HOTSPOT_NAME}' already exists; leaving it unchanged"
+    return
   fi
+
+  log "Creating Wi-Fi hotspot '${HOTSPOT_NAME}' on ${WIFI_IFACE}"
+  nmcli connection add \
+    type wifi \
+    ifname "${WIFI_IFACE}" \
+    con-name "${HOTSPOT_NAME}" \
+    autoconnect yes \
+    ssid "${HOTSPOT_SSID}"
 
   nmcli connection modify "${HOTSPOT_NAME}" \
     connection.interface-name "${WIFI_IFACE}" \
@@ -365,6 +403,7 @@ print_next_steps() {
   log "Setup complete."
   log "Installed/updated:"
   log "  - PPS overlay on GPIO ${PPS_GPIO} (physical pin 12 if GPIO18)"
+  log "  - Ouster ethernet profile '${ETH_CONNECTION_NAME}' on ${IFACE} (${ETH_IPV4_ADDRESS})"
   log "  - Wi-Fi hotspot '${HOTSPOT_SSID}' on ${WIFI_IFACE}"
   log "  - chrony SOCK + PPS refclocks"
   log "  - u-blox I2C chrony bridge service"
@@ -387,6 +426,7 @@ print_next_steps() {
   log "  chronyc tracking"
   log "  chronyc sources -v"
   log "  ppstest /dev/pps0"
+  log "  nmcli connection show \"${ETH_CONNECTION_NAME}\""
   log "  nmcli connection show \"${HOTSPOT_NAME}\""
 }
 
@@ -396,6 +436,7 @@ main() {
   install_packages
   configure_boot
   install_bridge_script
+  configure_ethernet_link
   configure_hotspot
   write_bridge_service
   configure_chrony
