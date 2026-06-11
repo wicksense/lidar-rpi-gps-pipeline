@@ -82,8 +82,6 @@ GPSD_PORT = 2947
 BRIDGE_FIX_JSON_PATH = "/run/ublox_i2c_chrony_bridge/latest_fix.json"
 OUTPUT_DIR = "/home/urp-pi5/capture_output"
 UTM_EPSG = 32614
-SLAM_MIN_RANGE_M = 1.0
-SLAM_MAX_RANGE_M = 150.0
 READINESS_TIMEOUT_SEC = 180
 READINESS_POLL_SEC = 2
 CHRONY_MAX_CORRECTION_SEC = 0.01
@@ -191,24 +189,6 @@ def parse_cli_args() -> argparse.Namespace:
         default=None,
         help="Timeout for each readiness gate.",
     )
-    parser.add_argument(
-        "--min-range-m",
-        type=float,
-        default=None,
-        help=(
-            "Suggested downstream minimum range in meters. "
-            "Stored in the manifest for later SLAM/filter defaults; does not change raw capture."
-        ),
-    )
-    parser.add_argument(
-        "--max-range-m",
-        type=float,
-        default=None,
-        help=(
-            "Suggested downstream maximum range in meters. "
-            "Stored in the manifest for later SLAM/filter defaults; does not change raw capture."
-        ),
-    )
     parser.set_defaults(
         wait_for_gps_fix=None,
         wait_for_pi_clock_sync=None,
@@ -238,19 +218,6 @@ def normalize_optional_string(value: Optional[str]) -> Optional[str]:
         return None
     normalized = value.strip()
     return normalized or None
-
-
-def resolve_range_defaults(min_range_m: Optional[float], max_range_m: Optional[float]) -> tuple[float, float]:
-    """Resolve downstream range defaults and validate them."""
-    resolved_min = SLAM_MIN_RANGE_M if min_range_m is None else float(min_range_m)
-    resolved_max = SLAM_MAX_RANGE_M if max_range_m is None else float(max_range_m)
-    if resolved_min < 0:
-        raise ValueError("Minimum range must be >= 0.")
-    if resolved_max <= 0:
-        raise ValueError("Maximum range must be > 0.")
-    if resolved_max <= resolved_min:
-        raise ValueError("Maximum range must be greater than minimum range.")
-    return resolved_min, resolved_max
 
 
 def gpsd_time_to_epoch_ns(time_text: Optional[str]) -> Optional[int]:
@@ -1119,8 +1086,6 @@ def build_abort_manifest(
     bridge_fix_path: str,
     gps_csv_path: str,
     gps_logger: BaseGpsLogger,
-    min_range_m: float,
-    max_range_m: float,
     readiness: dict[str, Any],
     chunks: list[dict[str, Any]],
 ) -> dict[str, Any]:
@@ -1138,8 +1103,6 @@ def build_abort_manifest(
         "ouster_host": ouster_host,
         "lidar_output_mode": LIDAR_OUTPUT_MODE,
         "lidar_mode": lidar_mode,
-        "slam_min_range_m": min_range_m,
-        "slam_max_range_m": max_range_m,
         "ouster_timestamp_mode": timestamp_mode,
         "ouster_ptp_profile": ptp_profile,
         "chunk_duration_sec": CAPTURE_DURATION_SEC,
@@ -1181,7 +1144,6 @@ def main() -> None:
     lidar_mode = normalize_lidar_mode(cli.lidar_mode if cli.lidar_mode is not None else LIDAR_MODE)
     timestamp_mode = normalize_optional_string(cli.timestamp_mode if cli.timestamp_mode is not None else OUSTER_TIMESTAMP_MODE)
     ptp_profile = normalize_optional_string(cli.ptp_profile if cli.ptp_profile is not None else OUSTER_PTP_PROFILE)
-    min_range_m, max_range_m = resolve_range_defaults(cli.min_range_m, cli.max_range_m)
     gps_input_mode = cli.gps_input_mode or GPS_INPUT_MODE
     gps_port = cli.gps_port or GPS_PORT
     gps_baud = cli.gps_baud or GPS_BAUD
@@ -1215,11 +1177,6 @@ def main() -> None:
         lidar_mode=lidar_mode,
         timestamp_mode=timestamp_mode,
         ptp_profile=ptp_profile,
-    )
-    log(
-        "Session downstream range defaults: "
-        f"min={min_range_m:.2f} m, max={max_range_m:.2f} m "
-        "(saved in manifest; raw capture itself is unchanged)."
     )
 
     gps_logger = build_gps_logger(
@@ -1263,8 +1220,6 @@ def main() -> None:
                 bridge_fix_path=bridge_fix_path,
                 gps_csv_path=gps_csv_path,
                 gps_logger=gps_logger,
-                min_range_m=min_range_m,
-                max_range_m=max_range_m,
                 readiness=readiness,
                 chunks=chunks,
             )
@@ -1308,8 +1263,6 @@ def main() -> None:
                 bridge_fix_path=bridge_fix_path,
                 gps_csv_path=gps_csv_path,
                 gps_logger=gps_logger,
-                min_range_m=min_range_m,
-                max_range_m=max_range_m,
                 readiness=readiness,
                 chunks=chunks,
             )
@@ -1353,8 +1306,6 @@ def main() -> None:
                 bridge_fix_path=bridge_fix_path,
                 gps_csv_path=gps_csv_path,
                 gps_logger=gps_logger,
-                min_range_m=min_range_m,
-                max_range_m=max_range_m,
                 readiness=readiness,
                 chunks=chunks,
             )
@@ -1407,8 +1358,6 @@ def main() -> None:
             "ouster_exit_code": rc,
             "lidar_output_mode": LIDAR_OUTPUT_MODE,
             "lidar_mode": lidar_mode,
-            "slam_min_range_m": min_range_m,
-            "slam_max_range_m": max_range_m,
             "ouster_timestamp_mode": timestamp_mode,
             "ouster_ptp_profile": ptp_profile,
             "requested_output_path": requested_output_path,
@@ -1456,8 +1405,6 @@ def main() -> None:
         "ouster_host": ouster_host,
         "lidar_output_mode": LIDAR_OUTPUT_MODE,
         "lidar_mode": lidar_mode,
-        "slam_min_range_m": min_range_m,
-        "slam_max_range_m": max_range_m,
         "ouster_timestamp_mode": timestamp_mode,
         "ouster_ptp_profile": ptp_profile,
         "chunk_duration_sec": CAPTURE_DURATION_SEC,

@@ -75,8 +75,6 @@ OUTPUT_DIR = "/home/urp-pi5/capture_output"
 # Projected CRS EPSG code used to convert lat/lon to easting/northing meters.
 # Example: 32614 = WGS84 / UTM Zone 14N.
 UTM_EPSG = 32614
-SLAM_MIN_RANGE_M = 1.0
-SLAM_MAX_RANGE_M = 150.0
 
 
 def log(message: str) -> None:
@@ -116,24 +114,6 @@ def parse_cli_args() -> argparse.Namespace:
         help=(
             "Optional Ouster lidar mode override, for example 1024x20, 2048x10, or 4096x5. "
             "If omitted, uses the hardcoded LIDAR_MODE setting."
-        ),
-    )
-    parser.add_argument(
-        "--min-range-m",
-        type=float,
-        default=None,
-        help=(
-            "Suggested downstream minimum range in meters. "
-            "Stored in the manifest for later SLAM/filter defaults; does not change raw capture."
-        ),
-    )
-    parser.add_argument(
-        "--max-range-m",
-        type=float,
-        default=None,
-        help=(
-            "Suggested downstream maximum range in meters. "
-            "Stored in the manifest for later SLAM/filter defaults; does not change raw capture."
         ),
     )
     parser.set_defaults(wait_for_gps_fix=None)
@@ -346,19 +326,6 @@ def normalize_lidar_mode(mode: Optional[str]) -> Optional[str]:
     return f"{int(left)}x{int(right)}"
 
 
-def resolve_range_defaults(min_range_m: Optional[float], max_range_m: Optional[float]) -> tuple[float, float]:
-    """Resolve downstream range defaults and validate them."""
-    resolved_min = SLAM_MIN_RANGE_M if min_range_m is None else float(min_range_m)
-    resolved_max = SLAM_MAX_RANGE_M if max_range_m is None else float(max_range_m)
-    if resolved_min < 0:
-        raise ValueError("Minimum range must be >= 0.")
-    if resolved_max <= 0:
-        raise ValueError("Maximum range must be > 0.")
-    if resolved_max <= resolved_min:
-        raise ValueError("Maximum range must be greater than minimum range.")
-    return resolved_min, resolved_max
-
-
 def configure_ouster_sensor(host: str, lidar_mode: Optional[str]) -> None:
     """
     Apply lightweight sensor config before capture starts.
@@ -487,8 +454,6 @@ def main() -> None:
         else cli.wait_for_gps_fix
     )
     lidar_mode = normalize_lidar_mode(cli.lidar_mode if cli.lidar_mode is not None else LIDAR_MODE)
-    min_range_m, max_range_m = resolve_range_defaults(cli.min_range_m, cli.max_range_m)
-
     ensure_dir(OUTPUT_DIR)
 
     # Use one session ID so related files are easy to match later.
@@ -505,12 +470,6 @@ def main() -> None:
     signal.signal(signal.SIGTERM, handle_signal)
 
     configure_ouster_sensor(host=OUSTER_HOST, lidar_mode=lidar_mode)
-    log(
-        "Session downstream range defaults: "
-        f"min={min_range_m:.2f} m, max={max_range_m:.2f} m "
-        "(saved in manifest; raw capture itself is unchanged)."
-    )
-
     # Start GPS logging before LiDAR capture so time ranges overlap.
     gps_logger = GpsLogger(
         serial_port=GPS_PORT,
@@ -544,8 +503,6 @@ def main() -> None:
                 "ouster_host": OUSTER_HOST,
                 "lidar_output_mode": LIDAR_OUTPUT_MODE,
                 "lidar_mode": lidar_mode,
-                "slam_min_range_m": min_range_m,
-                "slam_max_range_m": max_range_m,
                 "chunk_duration_sec": CAPTURE_DURATION_SEC,
                 "continuous_chunks": CONTINUOUS_CHUNKS,
                 "wait_for_gps_fix_before_capture": wait_for_gps_fix,
@@ -658,8 +615,6 @@ def main() -> None:
         "ouster_host": OUSTER_HOST,
         "lidar_output_mode": LIDAR_OUTPUT_MODE,
         "lidar_mode": lidar_mode,
-        "slam_min_range_m": min_range_m,
-        "slam_max_range_m": max_range_m,
         "chunk_duration_sec": CAPTURE_DURATION_SEC,
         "continuous_chunks": CONTINUOUS_CHUNKS,
         "wait_for_gps_fix_before_capture": wait_for_gps_fix,

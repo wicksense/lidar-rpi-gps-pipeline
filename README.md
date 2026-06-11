@@ -288,7 +288,6 @@ python3 pi_capture_raw.py --lidar-mode 4096x5
 - `OUSTER_HOST`: sensor IP on Pi Ethernet link
 - `LIDAR_OUTPUT_MODE`: `pcap_raw` (default) or `csv`
 - `LIDAR_MODE`: sensor mode applied before capture, for example `1024x20`, `2048x10`, or `4096x5`
-- `SLAM_MIN_RANGE_M`, `SLAM_MAX_RANGE_M`: suggested downstream range defaults saved into the manifest
 - `CAPTURE_DURATION_SEC`: seconds per chunk (default `30`)
 - `CONTINUOUS_CHUNKS`: keep chunking until `Ctrl+C`
 - `WAIT_FOR_GPS_FIX_BEFORE_CAPTURE`: wait for first fix before LiDAR start
@@ -298,7 +297,6 @@ python3 pi_capture_raw.py --lidar-mode 4096x5
 
 Notes:
 - The Pi script uses `ouster-cli source <sensor> config lidar_mode <mode>` before capture starts.
-- `--min-range-m` / `--max-range-m` are saved in the manifest as downstream SLAM/filter defaults. They do not trim the raw `.pcap` capture itself.
 - Set `LIDAR_MODE = None` (or pass an empty override by editing the file) to leave the current sensor mode unchanged.
 - Useful defaults:
   `1024x20` for walking / strongest pose robustness,
@@ -323,7 +321,6 @@ Useful overrides:
 
 ```bash
 python3 pi_capture_ptp.py --lidar-mode 1024x20
-python3 pi_capture_ptp.py --min-range-m 2.0 --max-range-m 80.0
 python3 pi_capture_ptp.py --gps-input-mode bridge
 python3 pi_capture_ptp.py --no-wait-for-ouster-ptp-lock
 ```

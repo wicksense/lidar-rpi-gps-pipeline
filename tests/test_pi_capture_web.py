@@ -23,8 +23,6 @@ def test_build_capture_command_for_ptp_mode():
             "capture_mode": "ptp",
             "lidar_resolution": "1024",
             "lidar_hz": "20",
-            "min_range_m": "2.5",
-            "max_range_m": "80",
             "wait_for_gps_fix": True,
             "wait_for_pi_clock_sync": False,
             "wait_for_ouster_ptp_lock": True,
@@ -37,8 +35,6 @@ def test_build_capture_command_for_ptp_mode():
     joined = " ".join(cmd)
     assert cmd[1].endswith("pi_capture_ptp.py")
     assert "--lidar-mode 1024x20" in joined
-    assert "--min-range-m 2.5" in joined
-    assert "--max-range-m 80.0" in joined
     assert "--wait-for-gps-fix" in joined
     assert "--no-wait-for-pi-clock-sync" in joined
     assert "--wait-for-ouster-ptp-lock" in joined
@@ -52,16 +48,12 @@ def test_build_capture_command_for_original_mode():
             "capture_mode": "original",
             "lidar_resolution": "",
             "lidar_hz": "",
-            "min_range_m": 1.0,
-            "max_range_m": 150.0,
             "wait_for_gps_fix": False,
         }
     )
     joined = " ".join(cmd)
     assert cmd[1].endswith("pi_capture_raw.py")
     assert "--no-wait-for-gps-fix" in joined
-    assert "--min-range-m 1.0" in joined
-    assert "--max-range-m 150.0" in joined
 
 
 def test_build_capture_command_rejects_unsupported_lidar_pair():

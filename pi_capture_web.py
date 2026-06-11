@@ -39,24 +39,10 @@ except ModuleNotFoundError as exc:
         OUSTER_HOST = "169.254.237.207"
         OUSTER_TIMESTAMP_MODE = "TIME_FROM_PTP_1588"
         OUSTER_PTP_PROFILE = "default"
-        SLAM_MIN_RANGE_M = 1.0
-        SLAM_MAX_RANGE_M = 150.0
         CHRONY_MAX_CORRECTION_SEC = 0.01
         CHRONY_WAITSYNC_TRIES = 1
         CHRONY_WAITSYNC_INTERVAL_SEC = 1
         OUSTER_API_TIMEOUT_SEC = 5
-
-        @staticmethod
-        def resolve_range_defaults(min_range_m: Optional[float], max_range_m: Optional[float]) -> tuple[float, float]:
-            resolved_min = _FallbackPtpCapture.SLAM_MIN_RANGE_M if min_range_m is None else float(min_range_m)
-            resolved_max = _FallbackPtpCapture.SLAM_MAX_RANGE_M if max_range_m is None else float(max_range_m)
-            if resolved_min < 0:
-                raise ValueError("Minimum range must be >= 0.")
-            if resolved_max <= 0:
-                raise ValueError("Maximum range must be > 0.")
-            if resolved_max <= resolved_min:
-                raise ValueError("Maximum range must be greater than minimum range.")
-            return resolved_min, resolved_max
 
         @staticmethod
         def run_command_capture(cmd: list[str]) -> dict[str, Any]:
@@ -132,8 +118,6 @@ DEFAULT_UI_CONFIG = {
     "lidar_mode": "",
     "lidar_resolution": "",
     "lidar_hz": "",
-    "min_range_m": ptp_capture.SLAM_MIN_RANGE_M,
-    "max_range_m": ptp_capture.SLAM_MAX_RANGE_M,
     "wait_for_gps_fix": True,
     "wait_for_pi_clock_sync": True,
     "wait_for_ouster_ptp_lock": True,
@@ -214,10 +198,6 @@ def build_capture_command(payload: dict[str, Any]) -> list[str]:
         raise ValueError("capture_mode must be 'ptp' or 'original'.")
 
     lidar_mode = resolve_lidar_mode_from_payload(payload)
-    min_range_m = optional_float(payload.get("min_range_m"))
-    max_range_m = optional_float(payload.get("max_range_m"))
-    ptp_capture.resolve_range_defaults(min_range_m, max_range_m)
-
     script_name = "pi_capture_ptp.py" if capture_mode == "ptp" else "pi_capture_raw.py"
     cmd = [sys.executable, os.path.join(SCRIPT_DIR, script_name)]
 
@@ -226,10 +206,6 @@ def build_capture_command(payload: dict[str, Any]) -> list[str]:
 
     if lidar_mode:
         cmd.extend(["--lidar-mode", lidar_mode])
-    if min_range_m is not None:
-        cmd.extend(["--min-range-m", str(min_range_m)])
-    if max_range_m is not None:
-        cmd.extend(["--max-range-m", str(max_range_m)])
 
     if capture_mode == "ptp":
         wait_for_pi_clock_sync = bool_field(payload, "wait_for_pi_clock_sync", True)
@@ -808,18 +784,6 @@ HTML_TEMPLATE = """<!doctype html>
             <div class="hint">We validate against supported mode pairs. Currently: 1024x20, 2048x10, 4096x5.</div>
           </div>
 
-          <div class="field">
-            <label for="min_range_m">Min Range (m)</label>
-            <input id="min_range_m" type="number" step="0.1" min="0">
-            <div class="hint">Saved into the manifest as a downstream SLAM/filter default. It does not change raw packet capture.</div>
-          </div>
-
-          <div class="field">
-            <label for="max_range_m">Max Range (m)</label>
-            <input id="max_range_m" type="number" step="0.1" min="0.1">
-            <div class="hint">Also stored in the manifest for later processing defaults.</div>
-          </div>
-
           <div class="field full">
             <label>Readiness Gates</label>
             <div class="checkbox-row">
@@ -852,10 +816,6 @@ HTML_TEMPLATE = """<!doctype html>
             <label for="ptp_profile">PTP Profile</label>
             <input id="ptp_profile" type="text" placeholder="default">
           </div>
-        </div>
-
-        <div class="subtle">
-          The range fields are here so you can choose your capture-session processing defaults from the phone. Raw `.pcap` capture still records the full sensor data.
         </div>
 
         <div class="actions">
@@ -982,8 +942,6 @@ HTML_TEMPLATE = """<!doctype html>
       document.getElementById("capture_mode").value = DEFAULTS.capture_mode;
       document.getElementById("lidar_resolution").value = DEFAULTS.lidar_resolution;
       document.getElementById("lidar_hz").value = DEFAULTS.lidar_hz;
-      document.getElementById("min_range_m").value = DEFAULTS.min_range_m;
-      document.getElementById("max_range_m").value = DEFAULTS.max_range_m;
       document.getElementById("wait_for_gps_fix").checked = DEFAULTS.wait_for_gps_fix;
       document.getElementById("wait_for_pi_clock_sync").checked = DEFAULTS.wait_for_pi_clock_sync;
       document.getElementById("wait_for_ouster_ptp_lock").checked = DEFAULTS.wait_for_ouster_ptp_lock;
@@ -1038,8 +996,6 @@ HTML_TEMPLATE = """<!doctype html>
         capture_mode: document.getElementById("capture_mode").value,
         lidar_resolution: document.getElementById("lidar_resolution").value,
         lidar_hz: document.getElementById("lidar_hz").value,
-        min_range_m: document.getElementById("min_range_m").value,
-        max_range_m: document.getElementById("max_range_m").value,
         wait_for_gps_fix: document.getElementById("wait_for_gps_fix").checked,
         wait_for_pi_clock_sync: document.getElementById("wait_for_pi_clock_sync").checked,
         wait_for_ouster_ptp_lock: document.getElementById("wait_for_ouster_ptp_lock").checked,
