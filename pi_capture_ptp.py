@@ -102,6 +102,14 @@ def ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
 
+def remove_file_if_exists(path: str) -> None:
+    """Best-effort cleanup helper for aborted pre-capture artifacts."""
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        return
+
+
 def parse_cli_args() -> argparse.Namespace:
     """Optional runtime overrides."""
     parser = argparse.ArgumentParser(
@@ -1223,31 +1231,9 @@ def main() -> None:
             log("Capture aborted before start: GPS fix was not acquired.")
             stop_event.set()
             gps_logger.join(timeout=3)
-            manifest = build_abort_manifest(
-                session_id=session_id,
-                capture_mode="aborted_no_gps_fix",
-                ouster_host=ouster_host,
-                lidar_mode=lidar_mode,
-                timestamp_mode=timestamp_mode,
-                ptp_profile=ptp_profile,
-                wait_for_gps_fix=require_gps_fix,
-                wait_for_pi_clock_sync=require_pi_clock_sync,
-                wait_for_ouster_ptp_lock=require_ouster_ptp_lock,
-                gps_input_mode=gps_input_mode,
-                gps_port=gps_port,
-                gps_baud=gps_baud,
-                gpsd_host=gpsd_host,
-                gpsd_port=gpsd_port,
-                bridge_fix_path=bridge_fix_path,
-                gps_csv_path=gps_csv_path,
-                gps_logger=gps_logger,
-                readiness=readiness,
-                chunks=chunks,
-            )
-            with open(manifest_path, "w", encoding="utf-8") as f_out:
-                json.dump(manifest, f_out, indent=2)
-            log(f"GPS CSV:     {gps_csv_path}")
-            log(f"Manifest:    {manifest_path}")
+            remove_file_if_exists(gps_csv_path)
+            remove_file_if_exists(manifest_path)
+            log("No GPS fix was acquired; discarded empty GPS/manifest artifacts.")
             return
     else:
         readiness["gps_fix"]["ready"] = True

@@ -88,6 +88,14 @@ def ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
 
+def remove_file_if_exists(path: str) -> None:
+    """Best-effort cleanup helper for aborted pre-capture artifacts."""
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        return
+
+
 def parse_cli_args() -> argparse.Namespace:
     """
     Optional runtime overrides.
@@ -490,36 +498,9 @@ def main() -> None:
             log("Capture aborted before start.")
             stop_event.set()
             gps_logger.join(timeout=3)
-
-            run_end_ns = time.time_ns()
-            run_end_iso = dt.datetime.now(dt.timezone.utc).isoformat()
-            manifest = {
-                "session_id": session_id,
-                "capture_mode": "aborted_no_gps_fix",
-                "run_start_iso_utc": run_end_iso,
-                "run_end_iso_utc": run_end_iso,
-                "run_start_ns": run_end_ns,
-                "run_end_ns": run_end_ns,
-                "ouster_host": OUSTER_HOST,
-                "lidar_output_mode": LIDAR_OUTPUT_MODE,
-                "lidar_mode": lidar_mode,
-                "chunk_duration_sec": CAPTURE_DURATION_SEC,
-                "continuous_chunks": CONTINUOUS_CHUNKS,
-                "wait_for_gps_fix_before_capture": wait_for_gps_fix,
-                "gps_port": GPS_PORT,
-                "gps_baud": GPS_BAUD,
-                "utm_epsg": UTM_EPSG,
-                "gps_csv_path": gps_csv_path,
-                "gps_rows_written": gps_logger.rows_written,
-                "gps_first_fix_time_ns": gps_logger.first_fix_time_ns,
-                "chunks_captured": 0,
-                "chunks": [],
-            }
-            with open(manifest_path, "w", encoding="utf-8") as f:
-                json.dump(manifest, f, indent=2)
-
-            log(f"GPS CSV:     {gps_csv_path}")
-            log(f"Manifest:    {manifest_path}")
+            remove_file_if_exists(gps_csv_path)
+            remove_file_if_exists(manifest_path)
+            log("No GPS fix was acquired; discarded empty GPS/manifest artifacts.")
             return
 
     run_start_iso = dt.datetime.now(dt.timezone.utc).isoformat()

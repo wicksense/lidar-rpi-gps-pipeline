@@ -3,6 +3,8 @@ import json
 from pathlib import Path
 import threading
 import time
+from types import SimpleNamespace
+from unittest import mock
 
 
 def _load_module():
@@ -192,3 +194,47 @@ def test_ouster_ptp_locked_rejects_missing_master_signal():
         },
     }
     assert ptp_capture.ouster_ptp_locked(status) is False
+
+
+def test_main_discards_artifacts_when_waiting_for_gps_and_no_fix(tmp_path):
+    class _FakeLogger:
+        rows_written = 0
+        first_fix_time_ns = None
+        latest_fix = None
+
+        def start(self):
+            return None
+
+        def join(self, timeout=None):
+            return None
+
+    cli = SimpleNamespace(
+        wait_for_gps_fix=True,
+        wait_for_pi_clock_sync=False,
+        wait_for_ouster_ptp_lock=False,
+        readiness_timeout_sec=None,
+        lidar_mode=None,
+        timestamp_mode=None,
+        ptp_profile=None,
+        gps_input_mode="bridge",
+        gps_port=None,
+        gps_baud=None,
+        gpsd_host=None,
+        gpsd_port=None,
+        bridge_fix_path=str(tmp_path / "latest_fix.json"),
+        ouster_host=None,
+    )
+
+    with (
+        mock.patch.object(ptp_capture, "OUTPUT_DIR", str(tmp_path)),
+        mock.patch.object(ptp_capture, "parse_cli_args", return_value=cli),
+        mock.patch.object(ptp_capture, "build_gps_logger", return_value=_FakeLogger()),
+        mock.patch.object(ptp_capture, "wait_for_first_gps_fix", return_value=False),
+        mock.patch.object(ptp_capture, "configure_ouster_sensor", return_value=None),
+        mock.patch.object(ptp_capture.signal, "signal", return_value=None),
+        mock.patch.object(ptp_capture.time, "sleep", return_value=None),
+    ):
+        ptp_capture.main()
+
+    assert list(tmp_path.glob("raw_gps_*.csv")) == []
+    assert list(tmp_path.glob("capture_manifest_*.json")) == []
