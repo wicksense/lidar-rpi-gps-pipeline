@@ -310,6 +310,12 @@ check_chrony() {
     warn "chrony does not yet show a selected source (*)"
   fi
 
+  if printf '%s\n' "${sources}" | grep -qE '^#\* (PPS|GPS)[[:space:]]'; then
+    pass "chrony selected source is local GPS/PPS"
+  else
+    warn "chrony selected source is not local GPS/PPS yet"
+  fi
+
   local wait_out rc
   wait_out="$(chronyc waitsync "${CHRONY_MAX_TRIES}" "${CHRONY_MAX_CORRECTION}" 0 "${CHRONY_INTERVAL_SECONDS}" 2>&1)"
   rc=$?
@@ -321,6 +327,81 @@ check_chrony() {
   else
     warn "chronyc waitsync did not succeed yet. This usually means the Pi clock is not fully disciplined."
   fi
+}
+
+check_phc_alignment() {
+  section "PHC Alignment Check"
+
+  if ! command_exists phc_ctl; then
+    warn "phc_ctl not found. Install linuxptp to compare ${IFACE} PHC against CLOCK_REALTIME."
+    return
+  fi
+
+  local sys_out phc_out
+  sys_out="$(phc_ctl CLOCK_REALTIME get 2>&1 || true)"
+  phc_out="$(phc_ctl "${IFACE}" get 2>&1 || true)"
+  echo "\$ phc_ctl CLOCK_REALTIME get"
+  echo "${sys_out}"
+  echo
+  echo "\$ phc_ctl ${IFACE} get"
+  echo "${phc_out}"
+  echo
+
+  local delta_out
+  delta_out="$(python3 - "$sys_out" "$phc_out" <<'PY'
+import re
+import sys
+
+def parse_seconds(text: str) -> float:
+    match = re.search(r"clock time is ([0-9]+\.[0-9]+)", text)
+    if not match:
+        raise ValueError(text)
+    return float(match.group(1))
+
+try:
+    sys_t = parse_seconds(sys.argv[1])
+    phc_t = parse_seconds(sys.argv[2])
+except Exception:
+    print("PARSE_ERROR")
+    raise SystemExit(0)
+
+delta = phc_t - sys_t
+print(f"{delta:.9f}")
+PY
+)"
+
+  if [[ "${delta_out}" == "PARSE_ERROR" || -z "${delta_out}" ]]; then
+    warn "Could not parse PHC/system clock outputs"
+    return
+  fi
+
+  note "PHC minus CLOCK_REALTIME delta: ${delta_out} s"
+
+  local verdict
+  verdict="$(python3 - "$delta_out" <<'PY'
+import math
+import sys
+d = abs(float(sys.argv[1]))
+if d <= 0.01:
+    print("PASS")
+elif d <= 1.0:
+    print("WARN")
+else:
+    print("FAIL")
+PY
+)"
+
+  case "${verdict}" in
+    PASS)
+      pass "${IFACE} PHC is closely aligned with CLOCK_REALTIME"
+      ;;
+    WARN)
+      warn "${IFACE} PHC is offset from CLOCK_REALTIME by more than 10 ms"
+      ;;
+    *)
+      fail "${IFACE} PHC is badly offset from CLOCK_REALTIME; restart phc2sys after chrony is locked to GPS/PPS"
+      ;;
+  esac
 }
 
 check_ptp_stack() {
@@ -514,6 +595,7 @@ main() {
   check_i2c_bridge
   check_chrony
   check_ptp_stack
+  check_phc_alignment
   check_ouster
   print_summary
   print_next_steps

@@ -24,6 +24,7 @@ CHRONY_CONF_DIR="/etc/chrony/conf.d"
 CHRONY_MAIN_CONF="/etc/chrony/chrony.conf"
 CHRONY_REFCLK_CONF="${CHRONY_CONF_DIR}/zedf9p-gps-pps.conf"
 PTP4L_CONF="/etc/linuxptp/ptp4l-zedf9p-master.conf"
+WAIT_FOR_LOCAL_CHRONY_SYNC='until chronyc waitsync 1 0.01 0 1 >/dev/null 2>&1 && chronyc sources | grep -Eq "^#\\* PPS|^#\\* GPS"; do sleep 2; done'
 APT_PACKAGES=(
   chrony
   curl
@@ -362,11 +363,13 @@ EOF
   cat >"${PHC2SYS_SERVICE_PATH}" <<EOF
 [Unit]
 Description=Synchronize PTP hardware clock from system realtime clock
-After=ptp4l.service chrony.service
-Wants=ptp4l.service chrony.service
+After=ptp4l.service chrony.service ublox-i2c-chrony-bridge.service
+Wants=ptp4l.service chrony.service ublox-i2c-chrony-bridge.service
 
 [Service]
 Type=simple
+TimeoutStartSec=0
+ExecStartPre=/bin/bash -lc '${WAIT_FOR_LOCAL_CHRONY_SYNC}'
 ExecStart=/usr/sbin/phc2sys -w -m -s CLOCK_REALTIME -c ${IFACE} -O 0
 Restart=on-failure
 RestartSec=2
