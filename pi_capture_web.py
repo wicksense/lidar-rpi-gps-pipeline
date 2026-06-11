@@ -297,6 +297,12 @@ def build_preflight_snapshot(ouster_host: Optional[str]) -> dict[str, Any]:
             "reachable": False,
             "locked": False,
             "summary": "not checked",
+            "sensor_facts": {
+                "model": "-",
+                "serial": "-",
+                "firmware": "-",
+                "imu_rate_hint_hz": "-",
+            },
         },
     }
 
@@ -316,6 +322,23 @@ def build_preflight_snapshot(ouster_host: Optional[str]) -> dict[str, Any]:
     preflight["ouster"]["locked"] = ptp_capture.ouster_ptp_locked(status)
     preflight["ouster"]["summary"] = ptp_capture.summarize_ouster_ptp_status(status)
     preflight["ouster"]["status"] = status
+    try:
+        sensor_info = ptp_capture.ouster_api_request("GET", host, "/api/v1/sensor/cmd/get_sensor_info")
+    except Exception as exc:
+        preflight["ouster"]["sensor_info_error"] = str(exc)
+    else:
+        if isinstance(sensor_info, dict):
+            preflight["ouster"]["sensor_info"] = sensor_info
+            firmware = str(sensor_info.get("build_rev") or sensor_info.get("image_rev") or "-")
+            image_rev = str(sensor_info.get("image_rev") or "")
+            firmware_text = " ".join(part for part in (firmware, image_rev) if part and part != "-").strip() or "-"
+            imu_rate_hint_hz = "640" if "v3.2" in firmware_text.lower() else "-"
+            preflight["ouster"]["sensor_facts"] = {
+                "model": str(sensor_info.get("prod_line") or sensor_info.get("product_line") or "-"),
+                "serial": str(sensor_info.get("prod_sn") or sensor_info.get("serial_no") or "-"),
+                "firmware": firmware_text,
+                "imu_rate_hint_hz": imu_rate_hint_hz,
+            }
     return preflight
 
 
@@ -895,6 +918,24 @@ HTML_TEMPLATE = """<!doctype html>
                 <div class="status-value mini" id="preflight_reason">Loading…</div>
               </div>
             </div>
+            <div class="status-grid">
+              <div class="status-card">
+                <strong>Sensor Model</strong>
+                <div class="status-value" id="sensor_model">Loading…</div>
+              </div>
+              <div class="status-card">
+                <strong>Sensor Serial</strong>
+                <div class="status-value mini" id="sensor_serial">Loading…</div>
+              </div>
+              <div class="status-card">
+                <strong>Firmware</strong>
+                <div class="status-value mini" id="sensor_firmware">Loading…</div>
+              </div>
+              <div class="status-card">
+                <strong>IMU Rate Hint</strong>
+                <div class="status-value" id="sensor_imu_rate">Loading…</div>
+              </div>
+            </div>
             <details>
               <summary class="mini">Show detailed preflight JSON</summary>
               <pre id="preflight_box">Loading…</pre>
@@ -1124,17 +1165,28 @@ HTML_TEMPLATE = """<!doctype html>
         const ousterReachable = data?.ouster?.reachable === true;
         const ousterLocked = data?.ouster?.locked === true;
         const ousterSummary = data?.ouster?.summary || data?.ouster?.error || "-";
+        const sensorFacts = data?.ouster?.sensor_facts || {};
 
         document.getElementById("preflight_clock_status").textContent = chronyReady ? "OK" : "Waiting";
         document.getElementById("preflight_ouster_status").textContent = ousterReachable ? "Reachable" : "Not reachable";
         document.getElementById("preflight_ptp_status").textContent = ousterLocked ? "Locked" : "Not locked";
         document.getElementById("preflight_reason").textContent = ousterSummary;
+        document.getElementById("sensor_model").textContent = sensorFacts.model || "-";
+        document.getElementById("sensor_serial").textContent = sensorFacts.serial || "-";
+        document.getElementById("sensor_firmware").textContent = sensorFacts.firmware || "-";
+        document.getElementById("sensor_imu_rate").textContent = sensorFacts.imu_rate_hint_hz && sensorFacts.imu_rate_hint_hz !== "-"
+          ? `${sensorFacts.imu_rate_hint_hz} Hz`
+          : "-";
         document.getElementById("preflight_box").textContent = JSON.stringify(data, null, 2);
       } catch (error) {
         document.getElementById("preflight_clock_status").textContent = "Error";
         document.getElementById("preflight_ouster_status").textContent = "Error";
         document.getElementById("preflight_ptp_status").textContent = "Error";
         document.getElementById("preflight_reason").textContent = String(error);
+        document.getElementById("sensor_model").textContent = "Error";
+        document.getElementById("sensor_serial").textContent = "Error";
+        document.getElementById("sensor_firmware").textContent = "Error";
+        document.getElementById("sensor_imu_rate").textContent = "Error";
         document.getElementById("preflight_box").textContent = `Preflight refresh failed: ${error}`;
       }
     }

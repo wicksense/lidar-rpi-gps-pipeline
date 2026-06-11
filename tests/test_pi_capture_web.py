@@ -213,4 +213,8 @@ def test_html_template_contains_compact_preflight_summary():
     assert "preflight_clock_status" in html
     assert "preflight_ouster_status" in html
     assert "preflight_ptp_status" in html
+    assert "sensor_model" in html
+    assert "sensor_serial" in html
+    assert "sensor_firmware" in html
+    assert "sensor_imu_rate" in html
     assert "Show detailed preflight JSON" in html
