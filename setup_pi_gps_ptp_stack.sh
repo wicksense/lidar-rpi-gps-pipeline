@@ -5,6 +5,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 IFACE="eth0"
+WIFI_IFACE="wlan0"
+HOTSPOT_NAME="URP-RPI-Net"
+HOTSPOT_SSID="URP-RPI-Net"
+HOTSPOT_PASSWORD="test@123"
 PPS_GPIO="18"
 I2C_BUS="1"
 GPS_ADDR="0x42"
@@ -35,6 +39,10 @@ Usage:
 
 Options:
   --iface IFACE           Ethernet interface for PTP grandmaster (default: eth0)
+  --wifi-iface IFACE      Wi-Fi interface for hotspot/AP mode (default: wlan0)
+  --hotspot-name NAME     NetworkManager connection name for hotspot (default: URP-RPI-Net)
+  --hotspot-ssid SSID     Wi-Fi SSID for hotspot/AP mode (default: URP-RPI-Net)
+  --hotspot-password PSK  WPA2 password for hotspot/AP mode (default: test@123)
   --pps-gpio GPIO         BCM GPIO number for PPS input (default: 18; physical pin 12)
   --i2c-bus BUS           I2C bus number (default: 1)
   --gps-addr ADDR         GPS I2C address (default: 0x42)
@@ -76,6 +84,22 @@ parse_args() {
     case "$1" in
       --iface)
         IFACE="$2"
+        shift 2
+        ;;
+      --wifi-iface)
+        WIFI_IFACE="$2"
+        shift 2
+        ;;
+      --hotspot-name)
+        HOTSPOT_NAME="$2"
+        shift 2
+        ;;
+      --hotspot-ssid)
+        HOTSPOT_SSID="$2"
+        shift 2
+        ;;
+      --hotspot-password)
+        HOTSPOT_PASSWORD="$2"
         shift 2
         ;;
       --pps-gpio)
@@ -177,6 +201,40 @@ configure_boot() {
 install_bridge_script() {
   log "Installing I2C->chrony bridge to ${BRIDGE_INSTALL_PATH}"
   install -m 0755 "${SCRIPT_DIR}/ublox_i2c_chrony_bridge.py" "${BRIDGE_INSTALL_PATH}"
+}
+
+configure_hotspot() {
+  if ! command -v nmcli >/dev/null 2>&1; then
+    warn "nmcli not found. Skipping hotspot/AP setup for ${WIFI_IFACE}."
+    return
+  fi
+
+  log "Configuring Wi-Fi hotspot '${HOTSPOT_NAME}' on ${WIFI_IFACE}"
+
+  if nmcli connection show "${HOTSPOT_NAME}" >/dev/null 2>&1; then
+    log "Hotspot profile already exists; updating it in place"
+  else
+    nmcli connection add \
+      type wifi \
+      ifname "${WIFI_IFACE}" \
+      con-name "${HOTSPOT_NAME}" \
+      autoconnect yes \
+      ssid "${HOTSPOT_SSID}"
+  fi
+
+  nmcli connection modify "${HOTSPOT_NAME}" \
+    connection.interface-name "${WIFI_IFACE}" \
+    connection.autoconnect yes \
+    connection.autoconnect-priority 100 \
+    802-11-wireless.ssid "${HOTSPOT_SSID}" \
+    802-11-wireless.mode ap \
+    802-11-wireless.band bg \
+    ipv4.method shared \
+    ipv6.method ignore
+
+  nmcli connection modify "${HOTSPOT_NAME}" \
+    wifi-sec.key-mgmt wpa-psk \
+    wifi-sec.psk "${HOTSPOT_PASSWORD}"
 }
 
 write_bridge_service() {
@@ -307,6 +365,7 @@ print_next_steps() {
   log "Setup complete."
   log "Installed/updated:"
   log "  - PPS overlay on GPIO ${PPS_GPIO} (physical pin 12 if GPIO18)"
+  log "  - Wi-Fi hotspot '${HOTSPOT_SSID}' on ${WIFI_IFACE}"
   log "  - chrony SOCK + PPS refclocks"
   log "  - u-blox I2C chrony bridge service"
   log "  - ptp4l/phc2sys services for interface ${IFACE}"
@@ -328,6 +387,7 @@ print_next_steps() {
   log "  chronyc tracking"
   log "  chronyc sources -v"
   log "  ppstest /dev/pps0"
+  log "  nmcli connection show \"${HOTSPOT_NAME}\""
 }
 
 main() {
@@ -336,6 +396,7 @@ main() {
   install_packages
   configure_boot
   install_bridge_script
+  configure_hotspot
   write_bridge_service
   configure_chrony
   configure_ptp4l
