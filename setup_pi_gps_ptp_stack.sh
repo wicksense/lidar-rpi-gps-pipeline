@@ -367,7 +367,7 @@ Wants=ptp4l.service chrony.service
 
 [Service]
 Type=simple
-ExecStart=/usr/sbin/phc2sys -s CLOCK_REALTIME -c ${IFACE} -w
+ExecStart=/usr/sbin/phc2sys -s CLOCK_REALTIME -c ${IFACE}
 Restart=on-failure
 RestartSec=2
 
