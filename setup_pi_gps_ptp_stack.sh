@@ -17,6 +17,8 @@ GPS_ADDR="0x42"
 CHRONY_SOCK_PATH="/run/chrony/zedf9p.sock"
 BRIDGE_FIX_JSON_PATH="/run/ublox_i2c_chrony_bridge/latest_fix.json"
 BRIDGE_INSTALL_PATH="/usr/local/bin/ublox_i2c_chrony_bridge.py"
+TIMING_HELPER_INSTALL_PATH="/usr/local/bin/pi_timing_helper.py"
+TIMING_HELPER_SUDOERS_PATH="/etc/sudoers.d/pi-capture-web-timing"
 BRIDGE_SERVICE_PATH="/etc/systemd/system/ublox-i2c-chrony-bridge.service"
 PTP4L_SERVICE_PATH="/etc/systemd/system/ptp4l.service"
 PHC2SYS_SERVICE_PATH="/etc/systemd/system/phc2sys.service"
@@ -25,6 +27,7 @@ CHRONY_MAIN_CONF="/etc/chrony/chrony.conf"
 CHRONY_REFCLK_CONF="${CHRONY_CONF_DIR}/zedf9p-gps-pps.conf"
 PTP4L_CONF="/etc/linuxptp/ptp4l-zedf9p-master.conf"
 WAIT_FOR_LOCAL_CHRONY_SYNC='until chronyc waitsync 1 0.01 0 1 >/dev/null 2>&1 && chronyc sources | grep -Eq "^#\\* PPS|^#\\* GPS"; do sleep 2; done'
+WEB_UI_USER="${SUDO_USER:-}"
 APT_PACKAGES=(
   chrony
   curl
@@ -53,6 +56,7 @@ Options:
   --gps-addr ADDR         GPS I2C address (default: 0x42)
   --chrony-sock PATH      chrony SOCK refclock path (default: /run/chrony/zedf9p.sock)
   --bridge-fix-json PATH  JSON path for latest published GPS fix (default: /run/ublox_i2c_chrony_bridge/latest_fix.json)
+  --web-ui-user USER      Install sudo access for this web UI user (default: sudo caller)
   --skip-apt              Skip apt package installation
   --no-start              Enable services but do not start/restart them now
   -h, --help              Show this help
@@ -135,6 +139,10 @@ parse_args() {
         BRIDGE_FIX_JSON_PATH="$2"
         shift 2
         ;;
+      --web-ui-user)
+        WEB_UI_USER="$2"
+        shift 2
+        ;;
       --skip-apt)
         SKIP_APT="1"
         shift
@@ -214,6 +222,26 @@ configure_boot() {
 install_bridge_script() {
   log "Installing I2C->chrony bridge to ${BRIDGE_INSTALL_PATH}"
   install -m 0755 "${SCRIPT_DIR}/ublox_i2c_chrony_bridge.py" "${BRIDGE_INSTALL_PATH}"
+}
+
+install_timing_helper() {
+  log "Installing timing helper to ${TIMING_HELPER_INSTALL_PATH}"
+  install -m 0755 "${SCRIPT_DIR}/pi_timing_helper.py" "${TIMING_HELPER_INSTALL_PATH}"
+}
+
+configure_web_ui_sudoers() {
+  if [[ -z "${WEB_UI_USER}" ]]; then
+    warn "No web UI user was provided or detected, so the timing helper sudoers file was not installed."
+    warn "If your web UI runs as a normal user, rerun setup with: --web-ui-user <your-pi-user>"
+    return
+  fi
+
+  log "Granting ${WEB_UI_USER} passwordless access to the timing helper"
+  cat >"${TIMING_HELPER_SUDOERS_PATH}" <<EOF
+${WEB_UI_USER} ALL=(root) NOPASSWD: ${TIMING_HELPER_INSTALL_PATH}
+EOF
+  chmod 0440 "${TIMING_HELPER_SUDOERS_PATH}"
+  visudo -cf "${TIMING_HELPER_SUDOERS_PATH}" >/dev/null
 }
 
 configure_ethernet_link() {
@@ -388,6 +416,15 @@ enable_services() {
   systemctl enable ublox-i2c-chrony-bridge.service
 }
 
+chrony_local_source_ready() {
+  if ! command -v chronyc >/dev/null 2>&1; then
+    return 1
+  fi
+
+  chronyc waitsync 1 0.01 0 1 >/dev/null 2>&1 || return 1
+  chronyc sources 2>/dev/null | grep -Eq '^#\* PPS|^#\* GPS'
+}
+
 start_services() {
   if [[ "${NO_START}" == "1" ]]; then
     warn "Skipping immediate service start/restart as requested"
@@ -398,7 +435,14 @@ start_services() {
   systemctl restart chrony.service
   systemctl restart ublox-i2c-chrony-bridge.service
   systemctl restart ptp4l.service
-  systemctl restart phc2sys.service
+
+  if chrony_local_source_ready; then
+    log "chrony is already locked to local GPS/PPS. Restarting phc2sys now."
+    systemctl restart phc2sys.service
+  else
+    warn "chrony is not yet locked to local GPS/PPS. Leaving phc2sys stopped for now so setup does not hang indoors."
+    warn "Once you are outside with sky view and chrony selects GPS/PPS, run: sudo systemctl restart phc2sys.service"
+  fi
 }
 
 print_next_steps() {
@@ -431,6 +475,7 @@ print_next_steps() {
   log "  ppstest /dev/pps0"
   log "  nmcli connection show \"${ETH_CONNECTION_NAME}\""
   log "  nmcli connection show \"${HOTSPOT_NAME}\""
+  log "  sudo systemctl restart phc2sys.service   # after chrony selects local GPS/PPS"
 }
 
 main() {
@@ -439,8 +484,10 @@ main() {
   install_packages
   configure_boot
   install_bridge_script
+  install_timing_helper
   configure_ethernet_link
   configure_hotspot
+  configure_web_ui_sudoers
   write_bridge_service
   configure_chrony
   configure_ptp4l

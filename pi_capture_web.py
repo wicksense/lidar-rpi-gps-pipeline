@@ -112,6 +112,9 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8080
 LOG_HISTORY_LIMIT = 500
+TIMING_HELPER_INSTALLED_PATH = "/usr/local/bin/pi_timing_helper.py"
+TIMING_HELPER_PATH = os.environ.get("PI_TIMING_HELPER_PATH", TIMING_HELPER_INSTALLED_PATH)
+TIMING_IFACE = os.environ.get("PI_TIMING_IFACE", "eth0")
 
 DEFAULT_UI_CONFIG = {
     "capture_mode": "ptp",
@@ -332,6 +335,52 @@ def build_preflight_snapshot(ouster_host: Optional[str]) -> dict[str, Any]:
                 "imu_rate_hint_hz": imu_rate_hint_hz,
             }
     return preflight
+
+
+def resolve_timing_helper_path() -> str:
+    if os.path.exists(TIMING_HELPER_PATH):
+        return TIMING_HELPER_PATH
+    local_path = os.path.join(SCRIPT_DIR, "pi_timing_helper.py")
+    if os.path.exists(local_path):
+        return local_path
+    return TIMING_HELPER_PATH
+
+
+def run_timing_helper(*args: str, require_root: bool = True) -> dict[str, Any]:
+    helper_path = resolve_timing_helper_path()
+    cmd = [helper_path, *args]
+    if require_root:
+        cmd = ["sudo", "-n", *cmd]
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    stdout = result.stdout.strip()
+    stderr = result.stderr.strip()
+    if result.returncode != 0:
+        raise RuntimeError(stderr or stdout or f"Timing helper failed with exit code {result.returncode}")
+    try:
+        return json.loads(stdout or "{}")
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Timing helper returned invalid JSON: {stdout or stderr}") from exc
+
+
+def build_timing_status_snapshot() -> dict[str, Any]:
+    try:
+        return run_timing_helper("status", "--iface", TIMING_IFACE)
+    except Exception as exc:
+        return {
+            "ok": False,
+            "summary": "Timing status is unavailable.",
+            "recommended_action": str(exc),
+            "gps_time_ready": False,
+            "pi_time_broadcast_ready": False,
+            "background_services_ready": False,
+            "gps_time_summary": str(exc),
+            "pi_time_broadcast_summary": str(exc),
+            "background_services_summary": str(exc),
+            "services": {},
+            "phc_alignment": {"available": False, "ready": False, "summary": str(exc)},
+            "error": str(exc),
+        }
 
 
 def apply_log_line_updates(state: dict[str, Any], line: str) -> None:
@@ -918,6 +967,35 @@ HTML_TEMPLATE = """<!doctype html>
             </details>
           </div>
           <div class="field full">
+            <label>Timing Health</label>
+            <div class="status-grid">
+              <div class="status-card">
+                <strong>GPS Time</strong>
+                <div class="status-value" id="timing_gps_status">Loading…</div>
+              </div>
+              <div class="status-card">
+                <strong>Pi Time Broadcast</strong>
+                <div class="status-value" id="timing_broadcast_status">Loading…</div>
+              </div>
+              <div class="status-card">
+                <strong>Background Services</strong>
+                <div class="status-value mini" id="timing_services_status">Loading…</div>
+              </div>
+              <div class="status-card">
+                <strong>What To Do</strong>
+                <div class="status-value mini" id="timing_action_text">Loading…</div>
+              </div>
+            </div>
+            <div class="actions">
+              <button class="secondary" id="refresh_timing_btn">Refresh Timing</button>
+              <button class="secondary" id="restart_timing_btn">Fix Time Broadcast</button>
+            </div>
+            <details>
+              <summary class="mini">Show advanced timing details</summary>
+              <pre id="timing_box">Loading…</pre>
+            </details>
+          </div>
+          <div class="field full">
             <label>UI Messages</label>
             <pre id="ui_message_box">-</pre>
           </div>
@@ -1164,23 +1242,83 @@ HTML_TEMPLATE = """<!doctype html>
       }
     }
 
+    function describeTimingReadiness(ready, okText, waitText) {
+      return ready ? okText : waitText;
+    }
+
+    async function refreshTimingStatus() {
+      try {
+        const response = await fetch("/api/timing-status");
+        const data = await response.json();
+        const gpsReady = data?.gps_time_ready === true;
+        const broadcastReady = data?.pi_time_broadcast_ready === true;
+        const servicesReady = data?.background_services_ready === true;
+
+        document.getElementById("timing_gps_status").textContent = describeTimingReadiness(
+          gpsReady,
+          "Ready",
+          "Waiting for outdoor GPS/PPS lock"
+        );
+        document.getElementById("timing_broadcast_status").textContent = describeTimingReadiness(
+          broadcastReady,
+          "Ready",
+          "Needs restart or alignment"
+        );
+        document.getElementById("timing_services_status").textContent = data?.background_services_summary || "-";
+        document.getElementById("timing_action_text").textContent = data?.recommended_action || data?.summary || "-";
+        document.getElementById("timing_box").textContent = JSON.stringify(data, null, 2);
+        document.getElementById("restart_timing_btn").disabled = !gpsReady;
+        if (!servicesReady && !gpsReady && data?.summary) {
+          setUiMessage(data.summary);
+        }
+      } catch (error) {
+        document.getElementById("timing_gps_status").textContent = "Error";
+        document.getElementById("timing_broadcast_status").textContent = "Error";
+        document.getElementById("timing_services_status").textContent = "Error";
+        document.getElementById("timing_action_text").textContent = String(error);
+        document.getElementById("timing_box").textContent = `Timing refresh failed: ${error}`;
+        document.getElementById("restart_timing_btn").disabled = false;
+      }
+    }
+
+    async function restartTimingBroadcast() {
+      setUiMessage("Checking GPS time before restarting Pi time broadcast...");
+      try {
+        const response = await fetch("/api/timing-restart-phc2sys", { method: "POST" });
+        const data = await response.json();
+        if (!response.ok) {
+          setUiMessage(data.error || "Could not restart Pi time broadcast.");
+          return;
+        }
+        setUiMessage(data.summary || "Pi time broadcast action finished.");
+        await refreshTimingStatus();
+      } catch (error) {
+        setUiMessage(`Time broadcast restart failed: ${error}`);
+      }
+    }
+
     document.getElementById("capture_mode").addEventListener("change", applyModeVisibility);
     document.getElementById("lidar_resolution").addEventListener("change", () => syncLidarFields("resolution"));
     document.getElementById("lidar_hz").addEventListener("change", () => syncLidarFields("hz"));
     document.getElementById("start_btn").addEventListener("click", startCapture);
     document.getElementById("stop_btn").addEventListener("click", stopCapture);
+    document.getElementById("refresh_timing_btn").addEventListener("click", refreshTimingStatus);
+    document.getElementById("restart_timing_btn").addEventListener("click", restartTimingBroadcast);
     document.getElementById("refresh_btn").addEventListener("click", async () => {
       await refreshStatus();
       await refreshPreflight();
+      await refreshTimingStatus();
     });
 
     setDefaults();
     refreshStatus();
     refreshLogs();
     refreshPreflight();
+    refreshTimingStatus();
     setInterval(refreshStatus, 2000);
     setInterval(refreshLogs, 1000);
     setInterval(refreshPreflight, 5000);
+    setInterval(refreshTimingStatus, 5000);
   </script>
 </body>
 </html>
@@ -1237,6 +1375,10 @@ class CaptureRequestHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.OK, build_preflight_snapshot(host))
             return
 
+        if parsed.path == "/api/timing-status":
+            self._send_json(HTTPStatus.OK, build_timing_status_snapshot())
+            return
+
         self.send_error(HTTPStatus.NOT_FOUND)
 
     def do_POST(self) -> None:  # noqa: N802
@@ -1257,6 +1399,16 @@ class CaptureRequestHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/stop":
             snapshot = CAPTURE_MANAGER.stop()
             self._send_json(HTTPStatus.OK, snapshot)
+            return
+
+        if parsed.path == "/api/timing-restart-phc2sys":
+            try:
+                payload = run_timing_helper("restart-phc2sys", "--iface", TIMING_IFACE)
+            except Exception as exc:
+                self._send_json(HTTPStatus.BAD_GATEWAY, {"error": str(exc)})
+                return
+            status_code = HTTPStatus.OK if payload.get("ok") else HTTPStatus.CONFLICT
+            self._send_json(status_code, payload)
             return
 
         self.send_error(HTTPStatus.NOT_FOUND)

@@ -202,9 +202,14 @@ def test_capture_manager_restart_increments_run_token_and_resets_log_ids():
 def test_html_template_contains_compact_preflight_summary():
     html = web_capture.HTML_TEMPLATE
     assert "Preflight Summary" in html
+    assert "Timing Health" in html
     assert "preflight_clock_status" in html
     assert "preflight_ouster_status" in html
     assert "preflight_ptp_status" in html
+    assert "timing_gps_status" in html
+    assert "timing_broadcast_status" in html
+    assert "timing_services_status" in html
+    assert "timing_action_text" in html
     assert "sensor_model" in html
     assert "sensor_serial" in html
     assert "sensor_firmware" in html
@@ -237,3 +242,26 @@ def test_build_preflight_snapshot_requires_local_gps_pps_sync_for_chrony_ready()
 
     assert snapshot["chrony"]["ready"] is False
     assert "instead of GPS/PPS" in snapshot["chrony"]["summary"]
+
+
+def test_build_timing_status_snapshot_returns_helper_payload():
+    expected = {
+        "gps_time_ready": True,
+        "pi_time_broadcast_ready": True,
+        "background_services_ready": True,
+        "summary": "Timing stack looks ready for PTP capture.",
+        "recommended_action": "You can start a PTP capture session.",
+    }
+    with mock.patch.object(web_capture, "run_timing_helper", return_value=expected):
+        snapshot = web_capture.build_timing_status_snapshot()
+
+    assert snapshot == expected
+
+
+def test_build_timing_status_snapshot_returns_friendly_error_payload():
+    with mock.patch.object(web_capture, "run_timing_helper", side_effect=RuntimeError("sudo is not configured")):
+        snapshot = web_capture.build_timing_status_snapshot()
+
+    assert snapshot["ok"] is False
+    assert snapshot["summary"] == "Timing status is unavailable."
+    assert "sudo is not configured" in snapshot["recommended_action"]

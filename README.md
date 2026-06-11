@@ -380,6 +380,8 @@ What the web UI gives you:
 - `bridge` GPS mode for the I2C/PPS/PTP setup
 - live log streaming in the browser
 - quick preflight visibility for `chrony` and optional Ouster timing state
+- a plain-English timing health panel for GPS time, Pi time broadcast, and timing-service health
+- a one-button `Fix Time Broadcast` action that safely restarts `phc2sys` only after GPS/PPS time is ready
 
 Why this is easier than VNC on a phone:
 
@@ -457,9 +459,20 @@ What this script does:
 - sets hotspot SSID `URP-RPI-Net` with default password `test@123`
 - installs/configures a `chrony` SOCK + PPS refclock setup
 - installs the `ublox_i2c_chrony_bridge.py` service
+- installs the privileged `pi_timing_helper.py` helper used by the web UI timing panel
+- installs a narrow sudoers rule so the web UI user can run that helper without a password
 - configures that bridge service to publish the latest GPS fix at `/run/ublox_i2c_chrony_bridge/latest_fix.json`
 - writes `ptp4l` and `phc2sys` service units
 - enables and starts those services unless `--no-start` is used
+
+Indoor bring-up note:
+
+- if the Pi is indoors and `chrony` has not yet selected the local `GPS` or `PPS` source, the setup script now starts `chrony`, the bridge, and `ptp4l`, but deliberately leaves `phc2sys` stopped instead of hanging forever
+- once you are outside with sky view and `chronyc sources -v` shows `#* GPS` or `#* PPS`, run:
+
+```bash
+sudo systemctl restart phc2sys.service
+```
 
 Common overrides:
 
@@ -468,6 +481,7 @@ sudo ./setup_pi_gps_ptp_stack.sh --pps-gpio 18
 sudo ./setup_pi_gps_ptp_stack.sh --iface eth0
 sudo ./setup_pi_gps_ptp_stack.sh --eth-ipv4 192.168.50.1/24
 sudo ./setup_pi_gps_ptp_stack.sh --hotspot-password 'your-strong-password'
+sudo ./setup_pi_gps_ptp_stack.sh --web-ui-user <pi-user>
 sudo ./setup_pi_gps_ptp_stack.sh --skip-apt
 ```
 
