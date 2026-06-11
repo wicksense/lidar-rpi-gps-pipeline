@@ -561,6 +561,7 @@ class BridgeGpsLogger(BaseGpsLogger):
         epsg_out: int = 32614,
         status_log_every_sec: float = 1.0,
         poll_sec: float = 0.2,
+        min_fresh_pi_time_ns: Optional[int] = None,
     ):
         super().__init__(
             out_csv_path=out_csv_path,
@@ -570,6 +571,7 @@ class BridgeGpsLogger(BaseGpsLogger):
         )
         self.fix_json_path = fix_json_path
         self.poll_sec = poll_sec
+        self.min_fresh_pi_time_ns = time.time_ns() if min_fresh_pi_time_ns is None else int(min_fresh_pi_time_ns)
 
     @staticmethod
     def _safe_float(value: Any, default: float = float("nan")) -> float:
@@ -596,6 +598,8 @@ class BridgeGpsLogger(BaseGpsLogger):
 
         last_sequence: Optional[int] = None
         last_signature: Optional[tuple[Any, ...]] = None
+        last_observed_token: Optional[tuple[Any, ...]] = None
+        stale_logged = False
 
         with open(self.out_csv_path, "w", newline="", encoding="utf-8") as f_out:
             writer = csv.writer(f_out)
@@ -632,6 +636,11 @@ class BridgeGpsLogger(BaseGpsLogger):
                     fix.get("hdop"),
                     fix.get("altitude_m"),
                 )
+                observed_token = (
+                    sequence,
+                    fix.get("pi_time_ns"),
+                    *signature,
+                )
                 if sequence is not None:
                     if sequence == last_sequence:
                         time.sleep(self.poll_sec)
@@ -650,6 +659,17 @@ class BridgeGpsLogger(BaseGpsLogger):
                     continue
 
                 pi_time_ns = int(fix.get("pi_time_ns") or time.time_ns())
+                if pi_time_ns < self.min_fresh_pi_time_ns:
+                    if observed_token != last_observed_token and not stale_logged:
+                        log(
+                            "Ignoring stale GPS bridge fix from before this capture session. "
+                            "Waiting for a new fix update."
+                        )
+                        stale_logged = True
+                    last_observed_token = observed_token
+                    time.sleep(self.poll_sec)
+                    continue
+                stale_logged = False
                 pi_time_iso = str(fix.get("pi_time_iso") or dt.datetime.now(dt.timezone.utc).isoformat())
                 gps_epoch_ns = fix.get("gps_epoch_ns")
                 try:
@@ -675,6 +695,7 @@ class BridgeGpsLogger(BaseGpsLogger):
 
                 last_sequence = sequence if isinstance(sequence, int) else last_sequence
                 last_signature = signature
+                last_observed_token = observed_token
 
                 time.sleep(self.poll_sec)
 
