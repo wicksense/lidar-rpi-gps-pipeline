@@ -22,10 +22,11 @@ from lidar_rpi_gps_pipeline.jobs.offline_fusion import (
     choose_time_mode,
     filter_gps_outliers_by_speed,
     load_gps_for_interpolation,
+    preferred_gps_time_column_from_manifest,
 )
 
 
-def test_choose_time_mode_relative_start_offsets_both_series_from_lidar_start() -> None:
+def test_choose_time_mode_relative_start_offsets_each_series_from_its_own_start() -> None:
     lidar_ts = np.asarray([1_000, 1_050, 1_100], dtype=np.int64)
     gps_ts = np.asarray([1_020, 1_070, 1_120], dtype=np.int64)
 
@@ -33,7 +34,7 @@ def test_choose_time_mode_relative_start_offsets_both_series_from_lidar_start() 
 
     assert mode == "relative_start"
     assert np.array_equal(lidar_adj, np.asarray([0, 50, 100], dtype=np.int64))
-    assert np.array_equal(gps_adj, np.asarray([20, 70, 120], dtype=np.int64))
+    assert np.array_equal(gps_adj, np.asarray([0, 50, 100], dtype=np.int64))
 
 
 def test_choose_time_mode_auto_prefers_unix_ns_for_overlapping_epoch_series() -> None:
@@ -102,6 +103,37 @@ def test_load_gps_for_interpolation_drops_non_finite_rows_and_duplicate_timestam
     assert gps_time_col == "gps_epoch_ns"
     assert gps_df[gps_time_col].tolist() == [250, 300]
     assert gps_df["altitude_m"].tolist() == [122.5, 120.0]
+
+
+def test_load_gps_for_interpolation_respects_preferred_auto_columns(tmp_path: Path) -> None:
+    gps_csv = tmp_path / "gps.csv"
+    pd.DataFrame(
+        [
+            {
+                "gps_epoch_ns": 300,
+                "pi_time_ns": 30,
+                "easting": 630_000.0,
+                "northing": 3_900_000.0,
+                "altitude_m": 120.0,
+            },
+            {
+                "gps_epoch_ns": 400,
+                "pi_time_ns": 40,
+                "easting": 630_010.0,
+                "northing": 3_900_010.0,
+                "altitude_m": 120.5,
+            },
+        ]
+    ).to_csv(gps_csv, index=False)
+
+    gps_df, gps_time_col = load_gps_for_interpolation(
+        str(gps_csv),
+        "auto",
+        preferred_auto_columns=["pi_time_ns", "gps_epoch_ns"],
+    )
+
+    assert gps_time_col == "pi_time_ns"
+    assert gps_df[gps_time_col].tolist() == [30, 40]
 
 
 def test_load_gps_for_interpolation_requires_two_finite_rows(tmp_path: Path) -> None:
@@ -181,6 +213,13 @@ def test_filter_raw_paths_by_session_raises_when_no_match() -> None:
     raw_paths = ["/data/raw_lidar_20260317_093703_chunk0000.pcap"]
     with pytest.raises(ValueError, match="No raw LiDAR files matched session filter"):
         _filter_raw_paths_by_session(raw_paths, "20260317_094022")
+
+
+def test_preferred_gps_time_column_from_manifest_prefers_pi_time_for_ptp_architecture() -> None:
+    manifest = {
+        "timing_architecture": "gps_pps_to_pi__chrony_to_pi_clock__ptp_to_ouster",
+    }
+    assert preferred_gps_time_column_from_manifest(manifest) == "pi_time_ns"
 
 
 def test_lookup_pose_columns_marks_large_drift_as_outlier_instead_of_raising() -> None:

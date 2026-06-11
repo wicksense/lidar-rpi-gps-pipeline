@@ -67,16 +67,17 @@ def choose_time_mode(
 
     Modes:
     - unix_ns: direct nanosecond epoch matching
-    - relative_start: normalize both series to LiDAR start timestamp
+    - relative_start: normalize each series to its own start timestamp
     - auto: choose unix_ns if overlap looks valid, else relative_start
     """
     lidar_start = int(lidar_ts_ns[0])
+    gps_start = int(gps_ts_ns[0])
 
     if requested_mode == "unix_ns":
         return lidar_ts_ns, gps_ts_ns, "unix_ns"
 
     if requested_mode == "relative_start":
-        return lidar_ts_ns - lidar_start, gps_ts_ns - lidar_start, "relative_start"
+        return lidar_ts_ns - lidar_start, gps_ts_ns - gps_start, "relative_start"
 
     overlap = (lidar_ts_ns.min() <= gps_ts_ns.max()) and (gps_ts_ns.min() <= lidar_ts_ns.max())
 
@@ -88,10 +89,31 @@ def choose_time_mode(
     if overlap and lidar_looks_like_epoch and gps_looks_like_epoch:
         return lidar_ts_ns, gps_ts_ns, "unix_ns"
 
-    return lidar_ts_ns - lidar_start, gps_ts_ns - lidar_start, "relative_start"
+    return lidar_ts_ns - lidar_start, gps_ts_ns - gps_start, "relative_start"
 
 
-def pick_gps_time_column(df: pd.DataFrame, requested: str) -> str:
+def preferred_gps_time_column_from_manifest(manifest: Optional[Dict[str, Any]]) -> Optional[str]:
+    """
+    Prefer `pi_time_ns` for Pi-clock/PTP capture manifests.
+
+    In the PTP pipeline, the LiDAR timestamps should align to the Pi's clock
+    domain, so `pi_time_ns` is the safest automatic default when the manifest
+    explicitly identifies that architecture.
+    """
+    if not isinstance(manifest, dict):
+        return None
+    timing_architecture = str(manifest.get("timing_architecture") or "")
+    if timing_architecture == "gps_pps_to_pi__chrony_to_pi_clock__ptp_to_ouster":
+        return "pi_time_ns"
+    return None
+
+
+def pick_gps_time_column(
+    df: pd.DataFrame,
+    requested: str,
+    *,
+    preferred_auto: Optional[List[str]] = None,
+) -> str:
     if requested == "gps_epoch_ns":
         if "gps_epoch_ns" not in df.columns:
             raise ValueError("Requested --gps-time-column gps_epoch_ns, but column is missing.")
@@ -101,10 +123,10 @@ def pick_gps_time_column(df: pd.DataFrame, requested: str) -> str:
             raise ValueError("Requested --gps-time-column pi_time_ns, but column is missing.")
         return "pi_time_ns"
 
-    if "gps_epoch_ns" in df.columns and df["gps_epoch_ns"].notna().sum() >= 2:
-        return "gps_epoch_ns"
-    if "pi_time_ns" in df.columns and df["pi_time_ns"].notna().sum() >= 2:
-        return "pi_time_ns"
+    preferred = preferred_auto or ["gps_epoch_ns", "pi_time_ns"]
+    for column in preferred:
+        if column in df.columns and df[column].notna().sum() >= 2:
+            return column
     raise ValueError("No usable GPS time column found (need gps_epoch_ns or pi_time_ns with >=2 rows).")
 
 
@@ -112,6 +134,7 @@ def load_gps_for_interpolation(
     gps_csv: str,
     requested_time_col: str,
     *,
+    preferred_auto_columns: Optional[List[str]] = None,
     apply_outlier_filter: bool = False,
     gps_outlier_max_speed_mps: float = 30.0,
 ) -> Tuple[pd.DataFrame, str]:
@@ -123,7 +146,11 @@ def load_gps_for_interpolation(
     if missing_gps:
         raise ValueError(f"Missing required GPS columns: {missing_gps}")
 
-    gps_time_col = pick_gps_time_column(gps_df, requested_time_col)
+    gps_time_col = pick_gps_time_column(
+        gps_df,
+        requested_time_col,
+        preferred_auto=preferred_auto_columns,
+    )
     log(f"GPS time column: {gps_time_col}")
 
     gps_cols = [gps_time_col, "easting", "northing", "altitude_m"]
@@ -1254,6 +1281,7 @@ def fuse_raw_to_single_las(
     chosen_mode: Optional[str] = None
     gps_t_mode: Optional[np.ndarray] = None
     lidar_start_ns: Optional[int] = None
+    gps_start_ns: Optional[int] = None
     total_points = 0
     total_scans = 0
     debug_csv_count = 0
@@ -1317,7 +1345,8 @@ def fuse_raw_to_single_las(
 
                         if chosen_mode == "relative_start":
                             lidar_start_ns = int(timestamp_ns[0])
-                            gps_t_mode = gps_t_raw - lidar_start_ns
+                            gps_start_ns = int(gps_t_raw[0])
+                            gps_t_mode = gps_t_raw - gps_start_ns
                         else:
                             gps_t_mode = gps_t_raw
 
@@ -2688,14 +2717,35 @@ def run_from_args(
     should_cancel: CancelChecker = None,
 ) -> Dict[str, Any]:
     _check_cancel(should_cancel)
+    manifest: Optional[Dict[str, Any]] = None
 
     if args.manifest_json and (args.lidar_csv or args.lidar_raw):
         raise ValueError("Use either --manifest-json or direct LiDAR inputs, not both.")
 
     if args.manifest_json:
+        with open(args.manifest_json, "r", encoding="utf-8") as f:
+            manifest = json.load(f)
         raw_paths, lidar_paths, gps_csv = _resolve_inputs_from_manifest(args)
     else:
         raw_paths, lidar_paths, gps_csv = _resolve_inputs_direct(args)
+
+    preferred_gps_time_columns: Optional[List[str]] = None
+    if args.gps_time_column == "auto":
+        preferred = preferred_gps_time_column_from_manifest(manifest)
+        if preferred:
+            preferred_gps_time_columns = [preferred, "gps_epoch_ns", "pi_time_ns"]
+            log(
+                f"GPS time column preference (manifest): auto -> prefer {preferred} "
+                f"for timing architecture {manifest.get('timing_architecture')}"
+            )
+            _emit(
+                emit_event,
+                "status",
+                message=(
+                    "GPS time column preference from manifest: "
+                    f"{preferred} first for PTP/Pi-clock capture"
+                ),
+            )
 
     if raw_paths:
         requested_filter = (getattr(args, "lidar_session_filter", "") or "").strip()
@@ -2769,6 +2819,7 @@ def run_from_args(
         gps_df, gps_time_col = load_gps_for_interpolation(
             gps_csv,
             args.gps_time_column,
+            preferred_auto_columns=preferred_gps_time_columns,
             apply_outlier_filter=(args.gps_outlier_filter == "on"),
             gps_outlier_max_speed_mps=args.gps_outlier_max_speed_mps,
         )
@@ -2853,6 +2904,7 @@ def run_from_args(
     gps_df, gps_time_col = load_gps_for_interpolation(
         gps_csv,
         args.gps_time_column,
+        preferred_auto_columns=preferred_gps_time_columns,
         apply_outlier_filter=(args.gps_outlier_filter == "on"),
         gps_outlier_max_speed_mps=args.gps_outlier_max_speed_mps,
     )
