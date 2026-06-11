@@ -205,3 +205,12 @@ def test_capture_manager_restart_increments_run_token_and_resets_log_ids():
         second_logs = manager.logs_after(0)
         assert second_logs["run_token"] == 2
         assert second_logs["entries"][0]["id"] == 1
+
+
+def test_html_template_contains_compact_preflight_summary():
+    html = web_capture.HTML_TEMPLATE
+    assert "Preflight Summary" in html
+    assert "preflight_clock_status" in html
+    assert "preflight_ouster_status" in html
+    assert "preflight_ptp_status" in html
+    assert "Show detailed preflight JSON" in html

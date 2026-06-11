@@ -876,8 +876,29 @@ HTML_TEMPLATE = """<!doctype html>
         </div>
 
           <div class="field full">
-            <label>Preflight Snapshot</label>
-            <pre id="preflight_box">Loading…</pre>
+            <label>Preflight Summary</label>
+            <div class="status-grid">
+              <div class="status-card">
+                <strong>Pi Clock</strong>
+                <div class="status-value" id="preflight_clock_status">Loading…</div>
+              </div>
+              <div class="status-card">
+                <strong>Ouster Reachability</strong>
+                <div class="status-value" id="preflight_ouster_status">Loading…</div>
+              </div>
+              <div class="status-card">
+                <strong>Ouster PTP Lock</strong>
+                <div class="status-value" id="preflight_ptp_status">Loading…</div>
+              </div>
+              <div class="status-card">
+                <strong>Reason</strong>
+                <div class="status-value mini" id="preflight_reason">Loading…</div>
+              </div>
+            </div>
+            <details>
+              <summary class="mini">Show detailed preflight JSON</summary>
+              <pre id="preflight_box">Loading…</pre>
+            </details>
           </div>
           <div class="field full">
             <label>UI Messages</label>
@@ -1099,8 +1120,21 @@ HTML_TEMPLATE = """<!doctype html>
         if (host) params.set("ouster_host", host);
         const response = await fetch(`/api/preflight?${params.toString()}`);
         const data = await response.json();
+        const chronyReady = data?.chrony?.ready === true;
+        const ousterReachable = data?.ouster?.reachable === true;
+        const ousterLocked = data?.ouster?.locked === true;
+        const ousterSummary = data?.ouster?.summary || data?.ouster?.error || "-";
+
+        document.getElementById("preflight_clock_status").textContent = chronyReady ? "OK" : "Waiting";
+        document.getElementById("preflight_ouster_status").textContent = ousterReachable ? "Reachable" : "Not reachable";
+        document.getElementById("preflight_ptp_status").textContent = ousterLocked ? "Locked" : "Not locked";
+        document.getElementById("preflight_reason").textContent = ousterSummary;
         document.getElementById("preflight_box").textContent = JSON.stringify(data, null, 2);
       } catch (error) {
+        document.getElementById("preflight_clock_status").textContent = "Error";
+        document.getElementById("preflight_ouster_status").textContent = "Error";
+        document.getElementById("preflight_ptp_status").textContent = "Error";
+        document.getElementById("preflight_reason").textContent = String(error);
         document.getElementById("preflight_box").textContent = `Preflight refresh failed: ${error}`;
       }
     }
