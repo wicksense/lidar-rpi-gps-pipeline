@@ -89,6 +89,7 @@ CHRONY_WAITSYNC_TRIES = 1
 CHRONY_WAITSYNC_INTERVAL_SEC = 1
 OUSTER_API_TIMEOUT_SEC = 5
 TIMING_ARCHITECTURE = "gps_pps_to_pi__chrony_to_pi_clock__ptp_to_ouster"
+LOCAL_CHRONY_SOURCE_NAMES = frozenset({"GPS", "PPS"})
 
 
 def log(message: str) -> None:
@@ -784,6 +785,74 @@ def collect_chrony_snapshot() -> dict[str, Any]:
     }
 
 
+def parse_chrony_sources_output(text: str) -> list[dict[str, str]]:
+    """Parse `chronyc sources -v` output into source entries."""
+    entries: list[dict[str, str]] = []
+    for raw_line in text.splitlines():
+        if len(raw_line) < 3:
+            continue
+        mode = raw_line[0]
+        state = raw_line[1]
+        if mode not in {"#", "^", "="}:
+            continue
+        if state not in {"*", "+", "-", "?", "x", "~"}:
+            continue
+        remainder = raw_line[2:].strip()
+        if not remainder:
+            continue
+        name = remainder.split()[0]
+        entries.append(
+            {
+                "mode": mode,
+                "state": state,
+                "name": name,
+                "raw": raw_line.rstrip(),
+            }
+        )
+    return entries
+
+
+def evaluate_chrony_local_gps_pps_sync(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """
+    Determine whether chrony is synchronized specifically to local GPS/PPS.
+
+    We intentionally require more than `chronyc waitsync == 0` here: the
+    selected (`*`) chrony source must be one of the local refclocks so we do
+    not accidentally proceed on ordinary network NTP.
+    """
+    waitsync = snapshot.get("waitsync") if isinstance(snapshot.get("waitsync"), dict) else {}
+    waitsync_ok = waitsync.get("returncode") == 0
+    sources_result = snapshot.get("sources") if isinstance(snapshot.get("sources"), dict) else {}
+    sources = parse_chrony_sources_output(str(sources_result.get("stdout") or ""))
+    selected = next((entry for entry in sources if entry["state"] == "*"), None)
+    local_sources = [entry for entry in sources if entry["name"] in LOCAL_CHRONY_SOURCE_NAMES]
+    local_states = {entry["name"]: entry["state"] for entry in local_sources}
+    selected_name = selected["name"] if selected else None
+    selected_is_local = selected_name in LOCAL_CHRONY_SOURCE_NAMES if selected_name else False
+    ready = bool(waitsync_ok and selected_is_local)
+
+    if not waitsync_ok:
+        summary = waitsync.get("stdout") or waitsync.get("stderr") or "chronyc waitsync not yet satisfied"
+    elif not local_sources:
+        summary = "chrony waitsync passed, but GPS/PPS refclocks were not present in `chronyc sources -v`."
+    elif selected is None:
+        summary = "chrony waitsync passed, but no selected source was reported."
+    elif not selected_is_local:
+        summary = f"chrony is synchronized to {selected_name} instead of GPS/PPS."
+    else:
+        summary = f"chrony synchronized to local source {selected_name}."
+
+    return {
+        "ready": ready,
+        "summary": summary,
+        "waitsync_ok": waitsync_ok,
+        "selected_source": selected,
+        "selected_source_name": selected_name,
+        "local_source_states": local_states,
+        "parsed_sources": sources,
+    }
+
+
 def wait_for_pi_clock_sync(
     *,
     stop_event: threading.Event,
@@ -791,7 +860,7 @@ def wait_for_pi_clock_sync(
     poll_sec: int,
     max_correction_sec: float,
 ) -> tuple[bool, dict[str, Any]]:
-    """Wait until chrony reports the Pi system clock is synchronized."""
+    """Wait until chrony reports the Pi system clock is synchronized to local GPS/PPS."""
     deadline = time.time() + timeout_sec
     last_snapshot = collect_chrony_snapshot()
 
@@ -806,16 +875,21 @@ def wait_for_pi_clock_sync(
                 str(CHRONY_WAITSYNC_INTERVAL_SEC),
             ]
         )
-        last_snapshot = {
+        snapshot = {
             "waitsync": waitsync,
             **collect_chrony_snapshot(),
         }
-        if waitsync["returncode"] == 0:
-            log("Pi clock synchronized according to chrony.")
+        evaluation = evaluate_chrony_local_gps_pps_sync(snapshot)
+        last_snapshot = {
+            **snapshot,
+            "evaluation": evaluation,
+        }
+        if evaluation["ready"]:
+            selected_name = evaluation.get("selected_source_name") or "GPS/PPS"
+            log(f"Pi clock synchronized to local {selected_name} according to chrony.")
             return True, last_snapshot
 
-        summary = waitsync["stdout"] or waitsync["stderr"] or "chronyc waitsync not yet satisfied"
-        log(f"Waiting for Pi clock sync: {summary}")
+        log(f"Waiting for Pi clock sync: {evaluation['summary']}")
 
         if time.time() >= deadline:
             break

@@ -246,6 +246,7 @@ def build_preflight_snapshot(ouster_host: Optional[str]) -> dict[str, Any]:
             ]
         )
         chrony_tracking = ptp_capture.run_command_capture(["chronyc", "tracking"])
+        chrony_sources = ptp_capture.run_command_capture(["chronyc", "sources", "-v"])
     except FileNotFoundError as exc:
         chrony_waitsync = {
             "cmd": ["chronyc", "waitsync"],
@@ -259,14 +260,29 @@ def build_preflight_snapshot(ouster_host: Optional[str]) -> dict[str, Any]:
             "stdout": "",
             "stderr": str(exc),
         }
+        chrony_sources = {
+            "cmd": ["chronyc", "sources", "-v"],
+            "returncode": 127,
+            "stdout": "",
+            "stderr": str(exc),
+        }
 
-    chrony_ready = chrony_waitsync["returncode"] == 0
+    chrony_snapshot = {
+        "waitsync": chrony_waitsync,
+        "tracking": chrony_tracking,
+        "sources": chrony_sources,
+    }
+    chrony_evaluation = ptp_capture.evaluate_chrony_local_gps_pps_sync(chrony_snapshot)
+    chrony_ready = chrony_evaluation["ready"]
     preflight = {
         "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
         "chrony": {
             "ready": chrony_ready,
+            "summary": chrony_evaluation["summary"],
+            "evaluation": chrony_evaluation,
             "waitsync": chrony_waitsync,
             "tracking": chrony_tracking,
+            "sources": chrony_sources,
         },
         "ouster": {
             "requested_host": ouster_host,
@@ -321,7 +337,7 @@ def build_preflight_snapshot(ouster_host: Optional[str]) -> dict[str, Any]:
 def apply_log_line_updates(state: dict[str, Any], line: str) -> None:
     if "GPS fix acquired" in line:
         state["gps_fix_ready"] = True
-    if "Pi clock synchronized according to chrony." in line:
+    if "Pi clock synchronized to local" in line or "Pi clock synchronized according to chrony." in line:
         state["pi_clock_sync_ready"] = True
     if "Ouster PTP lock acquired." in line:
         state["ouster_ptp_lock_ready"] = True
@@ -1118,6 +1134,7 @@ HTML_TEMPLATE = """<!doctype html>
         const response = await fetch(`/api/preflight?${params.toString()}`);
         const data = await response.json();
         const chronyReady = data?.chrony?.ready === true;
+        const chronySummary = data?.chrony?.summary || data?.chrony?.evaluation?.summary || "-";
         const ousterReachable = data?.ouster?.reachable === true;
         const ousterLocked = data?.ouster?.locked === true;
         const ousterSummary = data?.ouster?.summary || data?.ouster?.error || "-";
@@ -1126,7 +1143,7 @@ HTML_TEMPLATE = """<!doctype html>
         document.getElementById("preflight_clock_status").textContent = chronyReady ? "OK" : "Waiting";
         document.getElementById("preflight_ouster_status").textContent = ousterReachable ? "Reachable" : "Not reachable";
         document.getElementById("preflight_ptp_status").textContent = ousterLocked ? "Locked" : "Not locked";
-        document.getElementById("preflight_reason").textContent = ousterSummary;
+        document.getElementById("preflight_reason").textContent = chronyReady ? ousterSummary : chronySummary;
         document.getElementById("sensor_model").textContent = sensorFacts.model || "-";
         document.getElementById("sensor_serial").textContent = sensorFacts.serial || "-";
         document.getElementById("sensor_firmware").textContent = sensorFacts.firmware || "-";

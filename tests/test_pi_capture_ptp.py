@@ -196,6 +196,44 @@ def test_ouster_ptp_locked_rejects_missing_master_signal():
     assert ptp_capture.ouster_ptp_locked(status) is False
 
 
+def test_evaluate_chrony_local_gps_pps_sync_accepts_local_selected_source():
+    snapshot = {
+        "waitsync": {"returncode": 0, "stdout": "ok", "stderr": ""},
+        "sources": {
+            "stdout": "\n".join(
+                [
+                    "#+ GPS                           0   2   377    10   +0ns[   +0ns] +/-    0ns",
+                    "#* PPS                           0   2   377    10   +0ns[   +0ns] +/-    0ns",
+                    "^- 23.150.41.123                2   6   377    10   +1ms[  +1ms] +/-   22ms",
+                ]
+            )
+        },
+    }
+    evaluation = ptp_capture.evaluate_chrony_local_gps_pps_sync(snapshot)
+    assert evaluation["ready"] is True
+    assert evaluation["selected_source_name"] == "PPS"
+    assert evaluation["local_source_states"] == {"GPS": "+", "PPS": "*"}
+
+
+def test_evaluate_chrony_local_gps_pps_sync_rejects_network_selected_source():
+    snapshot = {
+        "waitsync": {"returncode": 0, "stdout": "ok", "stderr": ""},
+        "sources": {
+            "stdout": "\n".join(
+                [
+                    "#? GPS                           0   2     0     -   +0ns[   +0ns] +/-    0ns",
+                    "#? PPS                           0   2     0     -   +0ns[   +0ns] +/-    0ns",
+                    "^* 23.150.41.123                2   6   377    10   +1ms[  +1ms] +/-   22ms",
+                ]
+            )
+        },
+    }
+    evaluation = ptp_capture.evaluate_chrony_local_gps_pps_sync(snapshot)
+    assert evaluation["ready"] is False
+    assert evaluation["selected_source_name"] == "23.150.41.123"
+    assert "instead of GPS/PPS" in evaluation["summary"]
+
+
 def test_main_discards_artifacts_when_waiting_for_gps_and_no_fix(tmp_path):
     class _FakeLogger:
         rows_written = 0

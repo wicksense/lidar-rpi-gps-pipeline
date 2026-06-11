@@ -84,7 +84,7 @@ def test_apply_log_line_updates_tracks_readiness_and_paths():
         "current_chunk_index": None,
     }
     web_capture.apply_log_line_updates(state, "[2026-06-08 12:00:00] GPS fix acquired. Continuing readiness checks.")
-    web_capture.apply_log_line_updates(state, "[2026-06-08 12:00:01] Pi clock synchronized according to chrony.")
+    web_capture.apply_log_line_updates(state, "[2026-06-08 12:00:01] Pi clock synchronized to local PPS according to chrony.")
     web_capture.apply_log_line_updates(state, "[2026-06-08 12:00:02] Ouster PTP lock acquired.")
     web_capture.apply_log_line_updates(state, "[2026-06-08 12:00:03] GPS fix logged: q=4, lat=29.0")
     web_capture.apply_log_line_updates(state, "[2026-06-08 12:00:04] Starting chunk 3: /tmp/raw_lidar_chunk0003.pcap")
@@ -210,3 +210,30 @@ def test_html_template_contains_compact_preflight_summary():
     assert "sensor_firmware" in html
     assert "sensor_imu_rate" in html
     assert "Show detailed preflight JSON" in html
+
+
+def test_build_preflight_snapshot_requires_local_gps_pps_sync_for_chrony_ready():
+    with mock.patch.object(
+        web_capture.ptp_capture,
+        "run_command_capture",
+        side_effect=[
+            {"cmd": ["chronyc", "waitsync"], "returncode": 0, "stdout": "ok", "stderr": ""},
+            {"cmd": ["chronyc", "tracking"], "returncode": 0, "stdout": "tracking", "stderr": ""},
+            {
+                "cmd": ["chronyc", "sources", "-v"],
+                "returncode": 0,
+                "stdout": "\n".join(
+                    [
+                        "#? GPS                           0   2     0     -   +0ns[   +0ns] +/-    0ns",
+                        "#? PPS                           0   2     0     -   +0ns[   +0ns] +/-    0ns",
+                        "^* 23.150.41.123                2   6   377    10   +1ms[  +1ms] +/-   22ms",
+                    ]
+                ),
+                "stderr": "",
+            },
+        ],
+    ):
+        snapshot = web_capture.build_preflight_snapshot(None)
+
+    assert snapshot["chrony"]["ready"] is False
+    assert "instead of GPS/PPS" in snapshot["chrony"]["summary"]
