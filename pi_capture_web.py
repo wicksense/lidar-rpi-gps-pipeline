@@ -36,7 +36,7 @@ except ModuleNotFoundError as exc:
         raise
 
     class _FallbackPtpCapture:
-        OUSTER_HOST = "169.254.237.207"
+        OUSTER_HOST = "192.168.50.2"
         OUSTER_TIMESTAMP_MODE = "TIME_FROM_PTP_1588"
         OUSTER_PTP_PROFILE = "default"
         CHRONY_MAX_CORRECTION_SEC = 0.01

@@ -60,7 +60,7 @@ from pyproj import Transformer
 # =======================
 # Field Capture Settings
 # =======================
-OUSTER_HOST = "169.254.237.207"
+OUSTER_HOST = "192.168.50.2"
 LIDAR_OUTPUT_MODE = "pcap_raw"
 # Leave the current lidar mode unchanged by default. Override with
 # `--lidar-mode 1024x20`, `--lidar-mode 2048x10`, or `--lidar-mode 4096x5`.

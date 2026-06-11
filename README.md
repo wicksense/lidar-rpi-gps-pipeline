@@ -66,6 +66,9 @@ Practical interpretation:
 ### Ouster connection in the PTP path
 
 - Connect the Ouster to the Pi over Ethernet.
+- Prefer a static non-link-local subnet for the PTP link, for example:
+  - Pi `eth0`: `192.168.50.1/24`
+  - Ouster: `192.168.50.2/24`
 - Configure the Ouster timestamp mode for PTP when using `pi_capture_ptp.py`.
 - The new capture script can verify Ouster timing state through the HTTP API before recording starts.
 
@@ -449,7 +452,7 @@ What this script does:
 
 - enables Pi I2C in boot config
 - enables a PPS GPIO overlay
-- creates a persistent NetworkManager ethernet profile named `URP-Ouster-Link` on `eth0` with IPv4 `169.254.100.8/16` if it does not already exist
+- creates a persistent NetworkManager ethernet profile named `URP-Ouster-Link` on `eth0` with IPv4 `192.168.50.1/24` if it does not already exist
 - creates a NetworkManager Wi-Fi hotspot profile named `URP-RPI-Net` if it does not already exist
 - sets hotspot SSID `URP-RPI-Net` with default password `test@123`
 - installs/configures a `chrony` SOCK + PPS refclock setup
@@ -463,7 +466,7 @@ Common overrides:
 ```bash
 sudo ./setup_pi_gps_ptp_stack.sh --pps-gpio 18
 sudo ./setup_pi_gps_ptp_stack.sh --iface eth0
-sudo ./setup_pi_gps_ptp_stack.sh --eth-ipv4 169.254.100.8/16
+sudo ./setup_pi_gps_ptp_stack.sh --eth-ipv4 192.168.50.1/24
 sudo ./setup_pi_gps_ptp_stack.sh --hotspot-password 'your-strong-password'
 sudo ./setup_pi_gps_ptp_stack.sh --skip-apt
 ```
@@ -493,6 +496,7 @@ PTP troubleshooting note:
 
 - If the Ouster stays in `port_state=LISTENING` instead of `SLAVE`, first verify the Pi-side `ptp4l` / `phc2sys` services are healthy.
 - One Ouster community report also found that PTP would not lock while the sensor was using a link-local `169.254.x.x` address, and started working after moving the sensor to a static non-link-local IPv4 address on the same subnet as the master.
+- If you manually run `phc2sys` in the foreground for debugging, stop `phc2sys.service` first. Otherwise two `phc2sys` processes can fight over the same clock and produce `clockcheck: clock frequency changed unexpectedly!` warnings.
 
 #### Optional: Reduce packet-drop risk on the Pi
 

@@ -6,7 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 IFACE="eth0"
 ETH_CONNECTION_NAME="URP-Ouster-Link"
-ETH_IPV4_ADDRESS="169.254.100.8/16"
+ETH_IPV4_ADDRESS="192.168.50.1/24"
 WIFI_IFACE="wlan0"
 HOTSPOT_NAME="URP-RPI-Net"
 HOTSPOT_SSID="URP-RPI-Net"
@@ -42,7 +42,7 @@ Usage:
 Options:
   --iface IFACE           Ethernet interface for PTP grandmaster (default: eth0)
   --eth-connection NAME   NetworkManager connection name for Ouster ethernet link (default: URP-Ouster-Link)
-  --eth-ipv4 CIDR         Static IPv4/CIDR for Ouster ethernet link (default: 169.254.100.8/16)
+  --eth-ipv4 CIDR         Static IPv4/CIDR for Ouster ethernet link (default: 192.168.50.1/24)
   --wifi-iface IFACE      Wi-Fi interface for hotspot/AP mode (default: wlan0)
   --hotspot-name NAME     NetworkManager connection name for hotspot (default: URP-RPI-Net)
   --hotspot-ssid SSID     Wi-Fi SSID for hotspot/AP mode (default: URP-RPI-Net)

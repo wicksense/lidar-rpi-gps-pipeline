@@ -43,8 +43,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--ouster-host",
-        default="169.254.237.207",
-        help="Ouster hostname/IP to query (default: 169.254.237.207).",
+        default="192.168.50.2",
+        help="Ouster hostname/IP to query (default: 192.168.50.2).",
     )
     parser.add_argument(
         "--samples",

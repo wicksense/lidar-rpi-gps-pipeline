@@ -41,7 +41,7 @@ from ouster_cli_utils import resolve_ouster_cli_executable
 #   python3 pi_capture_raw.py
 # If hardware/network settings ever change, edit this section only.
 # Ouster sensor address on the local Ethernet link.
-OUSTER_HOST = "169.254.237.207"
+OUSTER_HOST = "192.168.50.2"
 # Capture format:
 # - "pcap_raw": raw UDP packets via `save_raw` (recommended for Pi reliability).
 # - "csv": direct point CSV via `save` (heavier; more likely to drop scans on Pi).
