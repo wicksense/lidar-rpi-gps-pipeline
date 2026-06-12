@@ -77,6 +77,7 @@ def test_apply_log_line_updates_tracks_readiness_and_paths():
         "gps_fix_ready": False,
         "pi_clock_sync_ready": False,
         "ouster_ptp_lock_ready": False,
+        "gps_live_log_context": None,
         "latest_gps_log": None,
         "gps_csv_path": None,
         "manifest_path": None,
@@ -98,6 +99,56 @@ def test_apply_log_line_updates_tracks_readiness_and_paths():
     assert state["current_chunk_index"] == 3
     assert state["gps_csv_path"] == "/tmp/raw_gps.csv"
     assert state["manifest_path"] == "/tmp/capture_manifest.json"
+
+
+def test_should_surface_live_log_line_throttles_repeated_gps_fix_lines_per_chunk():
+    state = {"current_chunk_index": None, "gps_live_log_context": None}
+
+    assert web_capture.should_surface_live_log_line(state, "GPS fix logged: q=1, lat=29.0") is True
+    assert web_capture.should_surface_live_log_line(state, "GPS fix logged: q=1, lat=29.1") is False
+
+    web_capture.apply_log_line_updates(state, "Starting chunk 0: /tmp/raw_lidar_chunk0000.pcap")
+    assert web_capture.should_surface_live_log_line(state, "GPS fix logged: q=1, lat=29.2") is True
+    assert web_capture.should_surface_live_log_line(state, "GPS fix logged: q=1, lat=29.3") is False
+
+    web_capture.apply_log_line_updates(state, "Starting chunk 1: /tmp/raw_lidar_chunk0001.pcap")
+    assert web_capture.should_surface_live_log_line(state, "GPS fix logged: q=1, lat=29.4") is True
+
+
+def test_capture_manager_read_logs_updates_latest_gps_log_without_spamming_logbox():
+    manager = web_capture.CaptureManager()
+
+    class _FakeProc:
+        def __init__(self):
+            self.stdout = io.StringIO(
+                "\n".join(
+                    [
+                        "[2026-06-12 10:00:00] GPS fix logged: q=1, lat=29.0",
+                        "[2026-06-12 10:00:01] GPS fix logged: q=1, lat=29.1",
+                        "[2026-06-12 10:00:02] Starting chunk 0: /tmp/raw_lidar_chunk0000.pcap",
+                        "[2026-06-12 10:00:03] GPS fix logged: q=1, lat=29.2",
+                        "[2026-06-12 10:00:04] GPS fix logged: q=1, lat=29.3",
+                        "",
+                    ]
+                )
+            )
+            self.returncode = 0
+
+        def wait(self):
+            return self.returncode
+
+    proc = _FakeProc()
+    manager._state["running"] = True
+    manager._proc = proc
+    manager._read_logs(proc)
+
+    logs = manager.logs_after(0)["entries"]
+    gps_lines = [entry["text"] for entry in logs if "GPS fix logged:" in entry["text"]]
+    assert gps_lines == [
+        "[2026-06-12 10:00:00] GPS fix logged: q=1, lat=29.0",
+        "[2026-06-12 10:00:03] GPS fix logged: q=1, lat=29.2",
+    ]
+    assert manager.snapshot()["latest_gps_log"] == "[2026-06-12 10:00:04] GPS fix logged: q=1, lat=29.3"
 
 
 def test_capture_manager_start_and_stop_do_not_deadlock():

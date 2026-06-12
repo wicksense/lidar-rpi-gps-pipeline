@@ -413,6 +413,27 @@ def apply_log_line_updates(state: dict[str, Any], line: str) -> None:
         state["phase"] = "capturing"
 
 
+def should_surface_live_log_line(state: dict[str, Any], line: str) -> bool:
+    """
+    Keep the live log readable by throttling repetitive GPS fix lines.
+
+    We still update `latest_gps_log` on every fix, but we only surface one GPS
+    fix line per capture context:
+    - once before chunking starts
+    - once after each new chunk begins
+    """
+    if "GPS fix logged:" not in line:
+        return True
+
+    chunk_index = state.get("current_chunk_index")
+    context = f"chunk:{chunk_index}" if chunk_index is not None else "pre_capture"
+    last_context = state.get("gps_live_log_context")
+    if last_context == context:
+        return False
+    state["gps_live_log_context"] = context
+    return True
+
+
 class CaptureManager:
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -450,6 +471,7 @@ class CaptureManager:
             "pi_clock_sync_ready": False,
             "ouster_ptp_lock_ready": False,
             "current_chunk_index": None,
+            "gps_live_log_context": None,
             "latest_gps_log": None,
             "gps_csv_path": None,
             "manifest_path": None,
@@ -513,14 +535,15 @@ class CaptureManager:
         for raw_line in proc.stdout:
             line = raw_line.rstrip("\n")
             with self._lock:
-                entry = {
-                    "id": self._next_log_id,
-                    "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
-                    "text": line,
-                }
-                self._next_log_id += 1
-                self._logs.append(entry)
                 apply_log_line_updates(self._state, line)
+                if should_surface_live_log_line(self._state, line):
+                    entry = {
+                        "id": self._next_log_id,
+                        "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
+                        "text": line,
+                    }
+                    self._next_log_id += 1
+                    self._logs.append(entry)
 
         proc.wait()
         with self._lock:
