@@ -1081,6 +1081,11 @@ HTML_TEMPLATE = """<!doctype html>
     };
     let lastLogId = 0;
     let currentRunToken = 0;
+    let refreshStatusInFlight = false;
+    let refreshLogsInFlight = false;
+    let refreshPreflightInFlight = false;
+    let refreshTimingInFlight = false;
+    let refreshWifiInFlight = false;
 
     function resetLogView() {
       lastLogId = 0;
@@ -1213,8 +1218,10 @@ HTML_TEMPLATE = """<!doctype html>
     }
 
     async function refreshStatus() {
+      if (refreshStatusInFlight) return;
+      refreshStatusInFlight = true;
       try {
-        const response = await fetch("/api/status");
+        const response = await fetch("/api/status", { cache: "no-store" });
         const data = await response.json();
         if ((data.run_token || 0) !== currentRunToken) {
           currentRunToken = data.run_token || 0;
@@ -1236,12 +1243,16 @@ HTML_TEMPLATE = """<!doctype html>
         }
       } catch (error) {
         setUiMessage(`Status refresh failed: ${error}`);
+      } finally {
+        refreshStatusInFlight = false;
       }
     }
 
     async function refreshLogs() {
+      if (refreshLogsInFlight) return;
+      refreshLogsInFlight = true;
       try {
-        const response = await fetch(`/api/logs?after=${lastLogId}`);
+        const response = await fetch(`/api/logs?after=${lastLogId}`, { cache: "no-store" });
         const data = await response.json();
         if ((data.run_token || 0) !== currentRunToken) {
           currentRunToken = data.run_token || 0;
@@ -1260,15 +1271,19 @@ HTML_TEMPLATE = """<!doctype html>
         }
       } catch (error) {
         setUiMessage(`Log refresh failed: ${error}`);
+      } finally {
+        refreshLogsInFlight = false;
       }
     }
 
     async function refreshPreflight() {
+      if (refreshPreflightInFlight) return;
+      refreshPreflightInFlight = true;
       try {
         const params = new URLSearchParams();
         const host = document.getElementById("ouster_host").value;
         if (host) params.set("ouster_host", host);
-        const response = await fetch(`/api/preflight?${params.toString()}`);
+        const response = await fetch(`/api/preflight?${params.toString()}`, { cache: "no-store" });
         const data = await response.json();
         const chronyReady = data?.chrony?.ready === true;
         const chronySummary = data?.chrony?.summary || data?.chrony?.evaluation?.summary || "-";
@@ -1298,6 +1313,8 @@ HTML_TEMPLATE = """<!doctype html>
         document.getElementById("sensor_firmware").textContent = "Error";
         document.getElementById("sensor_imu_rate").textContent = "Error";
         document.getElementById("preflight_box").textContent = `Preflight refresh failed: ${error}`;
+      } finally {
+        refreshPreflightInFlight = false;
       }
     }
 
@@ -1306,8 +1323,10 @@ HTML_TEMPLATE = """<!doctype html>
     }
 
     async function refreshTimingStatus() {
+      if (refreshTimingInFlight) return;
+      refreshTimingInFlight = true;
       try {
-        const response = await fetch("/api/timing-status");
+        const response = await fetch("/api/timing-status", { cache: "no-store" });
         const data = await response.json();
         const gpsReady = data?.gps_time_ready === true;
         const broadcastReady = data?.pi_time_broadcast_ready === true;
@@ -1337,6 +1356,8 @@ HTML_TEMPLATE = """<!doctype html>
         document.getElementById("timing_action_text").textContent = String(error);
         document.getElementById("timing_box").textContent = `Timing refresh failed: ${error}`;
         document.getElementById("restart_timing_btn").disabled = false;
+      } finally {
+        refreshTimingInFlight = false;
       }
     }
 
@@ -1386,8 +1407,10 @@ HTML_TEMPLATE = """<!doctype html>
     }
 
     async function refreshWifiStatus() {
+      if (refreshWifiInFlight) return;
+      refreshWifiInFlight = true;
       try {
-        const response = await fetch("/api/wifi-status");
+        const response = await fetch("/api/wifi-status", { cache: "no-store" });
         const data = await response.json();
         document.getElementById("wifi_active_status").textContent = data?.active_connection || "No active Wi-Fi";
         document.getElementById("wifi_profiles_status").textContent = data?.summary || "-";
@@ -1395,6 +1418,8 @@ HTML_TEMPLATE = """<!doctype html>
       } catch (error) {
         document.getElementById("wifi_active_status").textContent = "Error";
         document.getElementById("wifi_profiles_status").textContent = String(error);
+      } finally {
+        refreshWifiInFlight = false;
       }
     }
 
@@ -1439,6 +1464,16 @@ HTML_TEMPLATE = """<!doctype html>
       await refreshTimingStatus();
       await refreshWifiStatus();
     });
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "visible") {
+        void refreshStatus();
+        void refreshLogs();
+      }
+    });
+    window.addEventListener("focus", () => {
+      void refreshStatus();
+      void refreshLogs();
+    });
 
     setDefaults();
     refreshStatus();
@@ -1464,6 +1499,9 @@ class CaptureRequestHandler(BaseHTTPRequestHandler):
         body = json.dumps(payload).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Expires", "0")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -1472,6 +1510,9 @@ class CaptureRequestHandler(BaseHTTPRequestHandler):
         body = html_text.encode("utf-8")
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Expires", "0")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)

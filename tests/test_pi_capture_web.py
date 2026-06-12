@@ -266,6 +266,9 @@ def test_html_template_contains_compact_preflight_summary():
     assert "sensor_firmware" in html
     assert "sensor_imu_rate" in html
     assert "Show detailed preflight JSON" in html
+    assert 'cache: "no-store"' in html
+    assert "visibilitychange" in html
+    assert "refreshLogsInFlight" in html
 
 
 def test_build_preflight_snapshot_requires_local_gps_pps_sync_for_chrony_ready():
