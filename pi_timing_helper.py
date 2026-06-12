@@ -23,7 +23,7 @@ from typing import Any
 
 DEFAULT_IFACE = "eth0"
 LOCAL_CHRONY_SOURCE_NAMES = {"GPS", "PPS"}
-PHC_READY_DELTA_SEC = 0.01
+PHC_READY_DELTA_SEC = 0.05
 PHC_WARN_DELTA_SEC = 1.0
 SERVICE_UNITS = {
     "chrony": "chrony.service",

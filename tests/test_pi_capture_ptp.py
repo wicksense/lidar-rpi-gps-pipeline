@@ -196,6 +196,51 @@ def test_ouster_ptp_locked_rejects_missing_master_signal():
     assert ptp_capture.ouster_ptp_locked(status) is False
 
 
+def test_evaluate_ouster_sensor_time_alignment_accepts_small_delta():
+    status = {
+        "time": {
+            "sensor": {
+                "timestamp": {
+                    "time": 1781280168.6174073,
+                }
+            }
+        }
+    }
+    evaluation = ptp_capture.evaluate_ouster_sensor_time_alignment(status, pi_now_sec=1781280168.602482)
+    assert evaluation["ready"] is True
+    assert evaluation["delta_seconds"] > 0
+
+
+def test_evaluate_ouster_sensor_time_alignment_rejects_large_delta():
+    status = {
+        "time": {
+            "sensor": {
+                "timestamp": {
+                    "time": 1781032462.8541107,
+                }
+            }
+        }
+    }
+    evaluation = ptp_capture.evaluate_ouster_sensor_time_alignment(status, pi_now_sec=1781278969.1754236)
+    assert evaluation["ready"] is False
+    assert "not aligned" in evaluation["summary"]
+
+
+def test_collect_phc_alignment_reports_ready_when_delta_small():
+    with mock.patch.object(
+        ptp_capture,
+        "run_command_capture",
+        side_effect=[
+            {"returncode": 0, "stdout": "phc_ctl[1]: clock time is 1781280168.602482101 or Fri Jun 12 11:02:48 2026", "stderr": "", "cmd": []},
+            {"returncode": 0, "stdout": "phc_ctl[1]: clock time is 1781280168.617407242 or Fri Jun 12 11:02:48 2026", "stderr": "", "cmd": []},
+        ],
+    ):
+        result = ptp_capture.collect_phc_alignment("eth0")
+
+    assert result["ready"] is True
+    assert abs(result["delta_seconds"]) < ptp_capture.PHC_ALIGNMENT_READY_DELTA_SEC
+
+
 def test_evaluate_chrony_local_gps_pps_sync_accepts_local_selected_source():
     snapshot = {
         "waitsync": {"returncode": 0, "stdout": "ok", "stderr": ""},

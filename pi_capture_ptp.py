@@ -35,6 +35,7 @@ import glob
 import json
 import math
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -88,6 +89,9 @@ CHRONY_MAX_CORRECTION_SEC = 0.01
 CHRONY_WAITSYNC_TRIES = 1
 CHRONY_WAITSYNC_INTERVAL_SEC = 1
 OUSTER_API_TIMEOUT_SEC = 5
+PTP_IFACE = "eth0"
+PHC_ALIGNMENT_READY_DELTA_SEC = 0.05
+OUSTER_SENSOR_TIME_READY_DELTA_SEC = 1.0
 TIMING_ARCHITECTURE = "gps_pps_to_pi__chrony_to_pi_clock__ptp_to_ouster"
 LOCAL_CHRONY_SOURCE_NAMES = frozenset({"GPS", "PPS"})
 
@@ -853,6 +857,83 @@ def evaluate_chrony_local_gps_pps_sync(snapshot: dict[str, Any]) -> dict[str, An
     }
 
 
+def parse_phc_seconds(text: str) -> float:
+    match = re.search(r"clock time is ([0-9]+\.[0-9]+)", text)
+    if not match:
+        raise ValueError(f"Could not parse PHC output: {text}")
+    return float(match.group(1))
+
+
+def collect_phc_alignment(iface: str = PTP_IFACE) -> dict[str, Any]:
+    """Compare the Pi system clock against the NIC PHC used for PTP."""
+    sys_out = run_command_capture(["phc_ctl", "CLOCK_REALTIME", "get"])
+    phc_out = run_command_capture(["phc_ctl", iface, "get"])
+
+    if sys_out["returncode"] != 0 or phc_out["returncode"] != 0:
+        summary = "Could not read the Pi network hardware clock."
+        return {
+            "available": False,
+            "ready": False,
+            "summary": summary,
+            "system_clock": sys_out,
+            "phc_clock": phc_out,
+        }
+
+    try:
+        sys_t = parse_phc_seconds(sys_out["stdout"])
+        phc_t = parse_phc_seconds(phc_out["stdout"])
+    except ValueError as exc:
+        return {
+            "available": True,
+            "ready": False,
+            "summary": str(exc),
+            "system_clock": sys_out,
+            "phc_clock": phc_out,
+        }
+
+    delta = phc_t - sys_t
+    ready = abs(delta) <= PHC_ALIGNMENT_READY_DELTA_SEC
+    summary = (
+        f"{iface} PHC aligned with CLOCK_REALTIME (delta {delta:+.6f}s)."
+        if ready
+        else f"{iface} PHC not aligned with CLOCK_REALTIME yet (delta {delta:+.6f}s)."
+    )
+    return {
+        "available": True,
+        "ready": ready,
+        "delta_seconds": delta,
+        "summary": summary,
+        "system_clock": sys_out,
+        "phc_clock": phc_out,
+    }
+
+
+def wait_for_phc_alignment(
+    *,
+    stop_event: threading.Event,
+    timeout_sec: int,
+    poll_sec: int,
+    iface: str = PTP_IFACE,
+) -> tuple[bool, dict[str, Any]]:
+    """Wait until the Pi NIC PHC is aligned closely enough to CLOCK_REALTIME."""
+    deadline = time.time() + timeout_sec
+    last_alignment = collect_phc_alignment(iface)
+
+    while not stop_event.is_set():
+        last_alignment = collect_phc_alignment(iface)
+        if last_alignment.get("ready"):
+            log(f"Pi hardware PTP clock aligned: {last_alignment['summary']}")
+            return True, last_alignment
+
+        log(f"Waiting for Pi hardware PTP clock alignment: {last_alignment['summary']}")
+
+        if time.time() >= deadline:
+            break
+        time.sleep(poll_sec)
+
+    return False, last_alignment
+
+
 def wait_for_pi_clock_sync(
     *,
     stop_event: threading.Event,
@@ -1003,6 +1084,84 @@ def wait_for_ouster_ptp_lock(
         time.sleep(poll_sec)
 
     return False, last_status
+
+
+def extract_sensor_timestamp_seconds(status: dict[str, Any]) -> Optional[float]:
+    time_block = status.get("time")
+    if not isinstance(time_block, dict):
+        return None
+    sensor = time_block.get("sensor")
+    if not isinstance(sensor, dict):
+        return None
+    timestamp = sensor.get("timestamp")
+    if not isinstance(timestamp, dict):
+        return None
+    value = timestamp.get("time")
+    if isinstance(value, (int, float)):
+        return float(value)
+    return None
+
+
+def evaluate_ouster_sensor_time_alignment(status: dict[str, Any], pi_now_sec: Optional[float] = None) -> dict[str, Any]:
+    """Check whether Ouster sensor time is close enough to the Pi system clock."""
+    if pi_now_sec is None:
+        pi_now_sec = time.time()
+    sensor_ts = extract_sensor_timestamp_seconds(status)
+    if sensor_ts is None:
+        return {
+            "ready": False,
+            "summary": "Could not read Ouster sensor time.",
+            "sensor_time_sec": None,
+            "pi_time_sec": pi_now_sec,
+            "delta_seconds": None,
+        }
+
+    delta = sensor_ts - pi_now_sec
+    ready = abs(delta) <= OUSTER_SENSOR_TIME_READY_DELTA_SEC
+    summary = (
+        f"Ouster sensor time aligned with Pi clock (delta {delta:+.3f}s)."
+        if ready
+        else f"Ouster sensor time not aligned with Pi clock yet (delta {delta:+.3f}s)."
+    )
+    return {
+        "ready": ready,
+        "summary": summary,
+        "sensor_time_sec": sensor_ts,
+        "pi_time_sec": pi_now_sec,
+        "delta_seconds": delta,
+    }
+
+
+def wait_for_ouster_sensor_time_alignment(
+    *,
+    host: str,
+    stop_event: threading.Event,
+    timeout_sec: int,
+    poll_sec: int,
+) -> tuple[bool, dict[str, Any]]:
+    """Wait until the Ouster-reported sensor time is close to the Pi clock."""
+    deadline = time.time() + timeout_sec
+    last_result: dict[str, Any] = {}
+
+    while not stop_event.is_set():
+        try:
+            status = get_ouster_time_status(host)
+        except Exception as exc:
+            last_result = {"ready": False, "summary": str(exc), "error": str(exc)}
+            log(f"Waiting for Ouster sensor time alignment: {exc}")
+        else:
+            alignment = evaluate_ouster_sensor_time_alignment(status)
+            last_result = {"status": status, "alignment": alignment, **alignment}
+            if alignment["ready"]:
+                log(f"Ouster sensor time aligned: {alignment['summary']}")
+                return True, last_result
+            log(f"Waiting for Ouster sensor time alignment: {alignment['summary']}")
+
+        if time.time() >= deadline:
+            break
+        time.sleep(poll_sec)
+
+    return False, last_result
 
 
 def configure_ouster_lidar_mode(host: str, lidar_mode: Optional[str]) -> bool:
@@ -1225,6 +1384,7 @@ def build_abort_manifest(
         "gps_first_fix_time_ns": gps_logger.first_fix_time_ns,
         "gps_latest_fix": gps_logger.latest_fix,
         "readiness": readiness,
+        "readiness_snapshot": readiness,
         "chunks_captured": len(chunks),
         "chunks": chunks,
     }
@@ -1265,7 +1425,9 @@ def main() -> None:
     readiness: dict[str, Any] = {
         "gps_fix": {"required": require_gps_fix, "ready": False},
         "pi_clock_sync": {"required": require_pi_clock_sync, "ready": False},
+        "phc_alignment": {"required": require_pi_clock_sync, "ready": False, "iface": PTP_IFACE},
         "ouster_ptp_lock": {"required": require_ouster_ptp_lock, "ready": False},
+        "ouster_sensor_time_alignment": {"required": require_ouster_ptp_lock, "ready": False},
     }
 
     def handle_signal(_sig: int, _frame: Any) -> None:
@@ -1352,8 +1514,49 @@ def main() -> None:
             log(f"GPS CSV:     {gps_csv_path}")
             log(f"Manifest:    {manifest_path}")
             return
+
+        log("Waiting for Pi hardware PTP clock alignment before LiDAR capture...")
+        phc_ready, phc_alignment = wait_for_phc_alignment(
+            stop_event=stop_event,
+            timeout_sec=readiness_timeout_sec,
+            poll_sec=READINESS_POLL_SEC,
+            iface=PTP_IFACE,
+        )
+        readiness["phc_alignment"]["ready"] = phc_ready
+        readiness["phc_alignment"]["status"] = phc_alignment
+        if not phc_ready:
+            log("Capture aborted before start: Pi hardware PTP clock did not align with system time.")
+            stop_event.set()
+            gps_logger.join(timeout=3)
+            manifest = build_abort_manifest(
+                session_id=session_id,
+                capture_mode="aborted_no_phc_alignment",
+                ouster_host=ouster_host,
+                lidar_mode=lidar_mode,
+                timestamp_mode=timestamp_mode,
+                ptp_profile=ptp_profile,
+                wait_for_gps_fix=require_gps_fix,
+                wait_for_pi_clock_sync=require_pi_clock_sync,
+                wait_for_ouster_ptp_lock=require_ouster_ptp_lock,
+                gps_input_mode=gps_input_mode,
+                gps_port=gps_port,
+                gps_baud=gps_baud,
+                gpsd_host=gpsd_host,
+                gpsd_port=gpsd_port,
+                bridge_fix_path=bridge_fix_path,
+                gps_csv_path=gps_csv_path,
+                gps_logger=gps_logger,
+                readiness=readiness,
+                chunks=chunks,
+            )
+            with open(manifest_path, "w", encoding="utf-8") as f_out:
+                json.dump(manifest, f_out, indent=2)
+            log(f"GPS CSV:     {gps_csv_path}")
+            log(f"Manifest:    {manifest_path}")
+            return
     else:
         readiness["pi_clock_sync"]["ready"] = True
+        readiness["phc_alignment"]["ready"] = True
 
     if require_ouster_ptp_lock:
         log("Waiting for Ouster PTP lock before LiDAR capture...")
@@ -1395,8 +1598,49 @@ def main() -> None:
             log(f"GPS CSV:     {gps_csv_path}")
             log(f"Manifest:    {manifest_path}")
             return
+
+        log("Waiting for Ouster sensor time to match the Pi clock before LiDAR capture...")
+        sensor_time_ready, sensor_time_status = wait_for_ouster_sensor_time_alignment(
+            host=ouster_host,
+            stop_event=stop_event,
+            timeout_sec=readiness_timeout_sec,
+            poll_sec=READINESS_POLL_SEC,
+        )
+        readiness["ouster_sensor_time_alignment"]["ready"] = sensor_time_ready
+        readiness["ouster_sensor_time_alignment"]["status"] = sensor_time_status
+        if not sensor_time_ready:
+            log("Capture aborted before start: Ouster sensor time did not align with the Pi clock.")
+            stop_event.set()
+            gps_logger.join(timeout=3)
+            manifest = build_abort_manifest(
+                session_id=session_id,
+                capture_mode="aborted_no_ouster_sensor_time_alignment",
+                ouster_host=ouster_host,
+                lidar_mode=lidar_mode,
+                timestamp_mode=timestamp_mode,
+                ptp_profile=ptp_profile,
+                wait_for_gps_fix=require_gps_fix,
+                wait_for_pi_clock_sync=require_pi_clock_sync,
+                wait_for_ouster_ptp_lock=require_ouster_ptp_lock,
+                gps_input_mode=gps_input_mode,
+                gps_port=gps_port,
+                gps_baud=gps_baud,
+                gpsd_host=gpsd_host,
+                gpsd_port=gpsd_port,
+                bridge_fix_path=bridge_fix_path,
+                gps_csv_path=gps_csv_path,
+                gps_logger=gps_logger,
+                readiness=readiness,
+                chunks=chunks,
+            )
+            with open(manifest_path, "w", encoding="utf-8") as f_out:
+                json.dump(manifest, f_out, indent=2)
+            log(f"GPS CSV:     {gps_csv_path}")
+            log(f"Manifest:    {manifest_path}")
+            return
     else:
         readiness["ouster_ptp_lock"]["ready"] = True
+        readiness["ouster_sensor_time_alignment"]["ready"] = True
 
     run_start_iso = dt.datetime.now(dt.timezone.utc).isoformat()
     run_start_ns = time.time_ns()
@@ -1505,6 +1749,7 @@ def main() -> None:
         "gps_first_fix_time_ns": gps_logger.first_fix_time_ns,
         "gps_latest_fix": gps_logger.latest_fix,
         "readiness": readiness,
+        "readiness_snapshot": readiness,
         "chunks_captured": len(chunks),
         "chunks": chunks,
     }
