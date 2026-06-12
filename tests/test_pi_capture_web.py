@@ -261,6 +261,8 @@ def test_html_template_contains_compact_preflight_summary():
     assert "timing_broadcast_status" in html
     assert "timing_services_status" in html
     assert "timing_action_text" in html
+    assert "clear_log_btn" in html
+    assert "Clear Log View" in html
     assert "sensor_model" in html
     assert "sensor_serial" in html
     assert "sensor_firmware" in html

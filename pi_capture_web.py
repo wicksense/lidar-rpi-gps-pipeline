@@ -1063,6 +1063,9 @@ HTML_TEMPLATE = """<!doctype html>
 
     <section class="panel" style="margin-top: 16px;">
       <h2>Live Log</h2>
+      <div class="actions" style="margin-top: 0; margin-bottom: 10px;">
+        <button class="secondary" id="clear_log_btn">Clear Log View</button>
+      </div>
       <div class="logbox" id="logbox"><pre id="logtext"></pre></div>
     </section>
   </div>
@@ -1090,6 +1093,11 @@ HTML_TEMPLATE = """<!doctype html>
     function resetLogView() {
       lastLogId = 0;
       document.getElementById("logtext").textContent = "";
+    }
+
+    function clearLogView() {
+      document.getElementById("logtext").textContent = "";
+      setUiMessage("Live log view cleared. New lines will continue below.");
     }
 
     function setUiMessage(text) {
@@ -1454,6 +1462,7 @@ HTML_TEMPLATE = """<!doctype html>
     document.getElementById("lidar_hz").addEventListener("change", () => syncLidarFields("hz"));
     document.getElementById("start_btn").addEventListener("click", startCapture);
     document.getElementById("stop_btn").addEventListener("click", stopCapture);
+    document.getElementById("clear_log_btn").addEventListener("click", clearLogView);
     document.getElementById("refresh_timing_btn").addEventListener("click", refreshTimingStatus);
     document.getElementById("restart_timing_btn").addEventListener("click", restartTimingBroadcast);
     document.getElementById("refresh_wifi_btn").addEventListener("click", refreshWifiStatus);
