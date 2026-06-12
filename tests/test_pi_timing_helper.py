@@ -76,3 +76,38 @@ def test_restart_phc2sys_refuses_when_gps_time_not_ready():
     assert result["ok"] is False
     assert "was not restarted" in result["summary"]
     assert result["recommended_action"] == "Move outside for sky view."
+
+
+def test_list_wifi_connections_parses_active_and_saved_profiles():
+    active_cmd = {
+        "returncode": 0,
+        "stdout": "AirRowdy:wifi:wlan0\nURP-Ouster-Link:ethernet:eth0",
+        "stderr": "",
+    }
+    saved_cmd = {
+        "returncode": 0,
+        "stdout": "URP-RPI-Net:wifi\nAirRowdy:wifi\nURP-Ouster-Link:ethernet",
+        "stderr": "",
+    }
+    with (
+        mock.patch.object(timing_helper, "shutil_which", return_value="/usr/bin/nmcli"),
+        mock.patch.object(timing_helper, "run_command_capture", side_effect=[active_cmd, saved_cmd]),
+    ):
+        status = timing_helper.list_wifi_connections()
+
+    assert status["available"] is True
+    assert status["active_connection"] == "AirRowdy"
+    assert status["saved_connections"] == ["URP-RPI-Net", "AirRowdy"]
+
+
+def test_switch_wifi_rejects_unknown_connection():
+    before = {
+        "available": True,
+        "saved_connections": ["URP-RPI-Net", "AirRowdy"],
+        "summary": "Active Wi-Fi: AirRowdy.",
+    }
+    with mock.patch.object(timing_helper, "list_wifi_connections", return_value=before):
+        result = timing_helper.switch_wifi("MissingNet")
+
+    assert result["ok"] is False
+    assert "was not found" in result["summary"]

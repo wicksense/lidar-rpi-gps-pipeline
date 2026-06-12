@@ -6,7 +6,7 @@ Small privileged helper for the Pi capture web UI.
 
 This script intentionally exposes only a tiny whitelist of timing-related
 operations so the web UI can stay phone-friendly without requiring operators
-to type systemctl commands during field use.
+to type systemctl or nmcli commands during field use.
 """
 
 from __future__ import annotations
@@ -39,9 +39,13 @@ def parse_args() -> argparse.Namespace:
 
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("status", help="Return timing service status as JSON")
+    subparsers.add_parser("wifi-status", help="Return saved and active Wi-Fi connections as JSON")
 
     restart_parser = subparsers.add_parser("restart-phc2sys", help="Safely restart the Pi time broadcast service")
     restart_parser.add_argument("--settle-sec", type=float, default=2.0, help="Seconds to wait after restart before re-checking status")
+
+    wifi_switch_parser = subparsers.add_parser("switch-wifi", help="Bring up a saved NetworkManager Wi-Fi connection")
+    wifi_switch_parser.add_argument("--connection", required=True, help="Saved NetworkManager connection name to activate")
 
     return parser.parse_args()
 
@@ -205,6 +209,95 @@ def shutil_which(name: str) -> str | None:
     return shutil.which(name)
 
 
+def list_wifi_connections() -> dict[str, Any]:
+    if not shutil_which("nmcli"):
+        return {
+            "available": False,
+            "summary": "NetworkManager tools are not installed.",
+            "active_connection": None,
+            "saved_connections": [],
+        }
+
+    active_cmd = run_command_capture(["nmcli", "-t", "-f", "NAME,TYPE,DEVICE", "connection", "show", "--active"])
+    saved_cmd = run_command_capture(["nmcli", "-t", "-f", "NAME,TYPE", "connection", "show"])
+
+    active_connection = None
+    active_entries: list[dict[str, str]] = []
+    if active_cmd["returncode"] == 0:
+        for line in active_cmd["stdout"].splitlines():
+            if not line.strip():
+                continue
+            parts = line.split(":")
+            if len(parts) < 3:
+                continue
+            name, conn_type, device = parts[0], parts[1], parts[2]
+            entry = {"name": name, "type": conn_type, "device": device}
+            active_entries.append(entry)
+            if conn_type == "wifi":
+                active_connection = name
+
+    saved_connections: list[str] = []
+    if saved_cmd["returncode"] == 0:
+        for line in saved_cmd["stdout"].splitlines():
+            if not line.strip():
+                continue
+            parts = line.split(":")
+            if len(parts) < 2:
+                continue
+            name, conn_type = parts[0], parts[1]
+            if conn_type == "wifi":
+                saved_connections.append(name)
+
+    summary = (
+        f"Active Wi-Fi: {active_connection}."
+        if active_connection
+        else "No active Wi-Fi connection is currently selected."
+    )
+    if not saved_connections:
+        summary = "No saved Wi-Fi connections were found."
+
+    return {
+        "available": True,
+        "summary": summary,
+        "active_connection": active_connection,
+        "active_entries": active_entries,
+        "saved_connections": saved_connections,
+        "active_cmd": active_cmd,
+        "saved_cmd": saved_cmd,
+    }
+
+
+def switch_wifi(connection_name: str) -> dict[str, Any]:
+    before = list_wifi_connections()
+    if not before["available"]:
+        return {
+            "ok": False,
+            "summary": before["summary"],
+            "status": before,
+        }
+    if connection_name not in before["saved_connections"]:
+        return {
+            "ok": False,
+            "summary": f"Saved Wi-Fi connection '{connection_name}' was not found.",
+            "status": before,
+        }
+
+    switch_cmd = run_command_capture(["nmcli", "connection", "up", connection_name])
+    time.sleep(1.0)
+    after = list_wifi_connections()
+    ok = switch_cmd["returncode"] == 0 and after.get("active_connection") == connection_name
+    return {
+        "ok": ok,
+        "summary": (
+            f"Switched Wi-Fi to '{connection_name}'."
+            if ok
+            else f"Tried to switch Wi-Fi to '{connection_name}', but it did not become active."
+        ),
+        "switch_cmd": switch_cmd,
+        "status": after,
+    }
+
+
 def build_status(iface: str) -> dict[str, Any]:
     chrony_snapshot = collect_chrony_snapshot()
     chrony_evaluation = evaluate_chrony_local_gps_pps_sync(chrony_snapshot)
@@ -305,8 +398,12 @@ def main() -> None:
 
     if args.command == "status":
         payload = build_status(args.iface)
+    elif args.command == "wifi-status":
+        payload = list_wifi_connections()
     elif args.command == "restart-phc2sys":
         payload = restart_phc2sys(args.iface, args.settle_sec)
+    elif args.command == "switch-wifi":
+        payload = switch_wifi(args.connection)
     else:
         raise SystemExit(f"Unsupported command: {args.command}")
 

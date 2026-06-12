@@ -383,6 +383,20 @@ def build_timing_status_snapshot() -> dict[str, Any]:
         }
 
 
+def build_wifi_status_snapshot() -> dict[str, Any]:
+    try:
+        return run_timing_helper("wifi-status")
+    except Exception as exc:
+        return {
+            "ok": False,
+            "available": False,
+            "summary": "Wi-Fi status is unavailable.",
+            "active_connection": None,
+            "saved_connections": [],
+            "error": str(exc),
+        }
+
+
 def apply_log_line_updates(state: dict[str, Any], line: str) -> None:
     if "GPS fix acquired" in line:
         state["gps_fix_ready"] = True
@@ -1019,6 +1033,28 @@ HTML_TEMPLATE = """<!doctype html>
             </details>
           </div>
           <div class="field full">
+            <label>Wi-Fi Control</label>
+            <div class="status-grid">
+              <div class="status-card">
+                <strong>Current Wi-Fi</strong>
+                <div class="status-value mini" id="wifi_active_status">Loading…</div>
+              </div>
+              <div class="status-card">
+                <strong>Available Profiles</strong>
+                <div class="status-value mini" id="wifi_profiles_status">Loading…</div>
+              </div>
+            </div>
+            <div class="field full">
+              <label for="wifi_connection_name">Switch To</label>
+              <select id="wifi_connection_name"></select>
+              <div class="hint">Switching away from the Pi hotspot will usually disconnect this page until your phone joins the other network.</div>
+            </div>
+            <div class="actions">
+              <button class="secondary" id="refresh_wifi_btn">Refresh Wi-Fi</button>
+              <button class="secondary" id="switch_wifi_btn">Switch Wi-Fi</button>
+            </div>
+          </div>
+          <div class="field full">
             <label>UI Messages</label>
             <pre id="ui_message_box">-</pre>
           </div>
@@ -1320,6 +1356,74 @@ HTML_TEMPLATE = """<!doctype html>
       }
     }
 
+    function setWifiOptions(activeConnection, savedConnections) {
+      const select = document.getElementById("wifi_connection_name");
+      const previous = select.value;
+      select.innerHTML = "";
+      const options = Array.isArray(savedConnections) ? savedConnections : [];
+      if (options.length === 0) {
+        const option = document.createElement("option");
+        option.value = "";
+        option.textContent = "No saved Wi-Fi profiles found";
+        select.appendChild(option);
+        select.disabled = true;
+        return;
+      }
+      for (const name of options) {
+        const option = document.createElement("option");
+        option.value = name;
+        option.textContent = name === activeConnection ? `${name} (Current)` : name;
+        select.appendChild(option);
+      }
+      select.disabled = false;
+      if (options.includes(previous)) {
+        select.value = previous;
+      } else if (activeConnection && options.includes(activeConnection)) {
+        select.value = activeConnection;
+      } else {
+        select.value = options[0];
+      }
+    }
+
+    async function refreshWifiStatus() {
+      try {
+        const response = await fetch("/api/wifi-status");
+        const data = await response.json();
+        document.getElementById("wifi_active_status").textContent = data?.active_connection || "No active Wi-Fi";
+        document.getElementById("wifi_profiles_status").textContent = data?.summary || "-";
+        setWifiOptions(data?.active_connection || null, data?.saved_connections || []);
+      } catch (error) {
+        document.getElementById("wifi_active_status").textContent = "Error";
+        document.getElementById("wifi_profiles_status").textContent = String(error);
+      }
+    }
+
+    async function switchWifiConnection() {
+      const select = document.getElementById("wifi_connection_name");
+      const connectionName = select.value;
+      if (!connectionName) {
+        setUiMessage("No saved Wi-Fi profile is available to switch to.");
+        return;
+      }
+      setUiMessage(`Switching Wi-Fi to ${connectionName}. If you leave the hotspot, this page may disconnect for a moment.`);
+      try {
+        const response = await fetch("/api/wifi-switch", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ connection_name: connectionName })
+        });
+        const data = await response.json();
+        if (!response.ok) {
+          setUiMessage(data.error || data.summary || "Wi-Fi switch failed.");
+          return;
+        }
+        setUiMessage(data.summary || `Switched Wi-Fi to ${connectionName}.`);
+        await refreshWifiStatus();
+      } catch (error) {
+        setUiMessage(`Wi-Fi switch request failed: ${error}`);
+      }
+    }
+
     document.getElementById("capture_mode").addEventListener("change", applyModeVisibility);
     document.getElementById("lidar_resolution").addEventListener("change", () => syncLidarFields("resolution"));
     document.getElementById("lidar_hz").addEventListener("change", () => syncLidarFields("hz"));
@@ -1327,10 +1431,13 @@ HTML_TEMPLATE = """<!doctype html>
     document.getElementById("stop_btn").addEventListener("click", stopCapture);
     document.getElementById("refresh_timing_btn").addEventListener("click", refreshTimingStatus);
     document.getElementById("restart_timing_btn").addEventListener("click", restartTimingBroadcast);
+    document.getElementById("refresh_wifi_btn").addEventListener("click", refreshWifiStatus);
+    document.getElementById("switch_wifi_btn").addEventListener("click", switchWifiConnection);
     document.getElementById("refresh_btn").addEventListener("click", async () => {
       await refreshStatus();
       await refreshPreflight();
       await refreshTimingStatus();
+      await refreshWifiStatus();
     });
 
     setDefaults();
@@ -1338,10 +1445,12 @@ HTML_TEMPLATE = """<!doctype html>
     refreshLogs();
     refreshPreflight();
     refreshTimingStatus();
+    refreshWifiStatus();
     setInterval(refreshStatus, 2000);
     setInterval(refreshLogs, 1000);
     setInterval(refreshPreflight, 5000);
     setInterval(refreshTimingStatus, 5000);
+    setInterval(refreshWifiStatus, 10000);
   </script>
 </body>
 </html>
@@ -1402,6 +1511,10 @@ class CaptureRequestHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.OK, build_timing_status_snapshot())
             return
 
+        if parsed.path == "/api/wifi-status":
+            self._send_json(HTTPStatus.OK, build_wifi_status_snapshot())
+            return
+
         self.send_error(HTTPStatus.NOT_FOUND)
 
     def do_POST(self) -> None:  # noqa: N802
@@ -1432,6 +1545,23 @@ class CaptureRequestHandler(BaseHTTPRequestHandler):
                 return
             status_code = HTTPStatus.OK if payload.get("ok") else HTTPStatus.CONFLICT
             self._send_json(status_code, payload)
+            return
+
+        if parsed.path == "/api/wifi-switch":
+            try:
+                payload = self._read_json_body()
+                connection_name = optional_text(payload.get("connection_name"))
+                if not connection_name:
+                    raise ValueError("connection_name is required")
+                result = run_timing_helper("switch-wifi", "--connection", connection_name)
+            except ValueError as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+            except Exception as exc:
+                self._send_json(HTTPStatus.BAD_GATEWAY, {"error": str(exc)})
+                return
+            status_code = HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT
+            self._send_json(status_code, result)
             return
 
         self.send_error(HTTPStatus.NOT_FOUND)

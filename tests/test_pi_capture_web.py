@@ -317,3 +317,17 @@ def test_build_timing_status_snapshot_returns_friendly_error_payload():
     assert snapshot["ok"] is False
     assert snapshot["summary"] == "Timing status is unavailable."
     assert "sudo is not configured" in snapshot["recommended_action"]
+
+
+def test_build_wifi_status_snapshot_returns_helper_payload():
+    expected = {
+        "available": True,
+        "active_connection": "URP-RPI-Net",
+        "saved_connections": ["URP-RPI-Net", "AirRowdy"],
+        "summary": "Active Wi-Fi: URP-RPI-Net.",
+    }
+    with mock.patch.object(web_capture, "run_timing_helper", return_value=expected) as helper_mock:
+        snapshot = web_capture.build_wifi_status_snapshot()
+
+    assert snapshot == expected
+    helper_mock.assert_called_once_with("wifi-status")
