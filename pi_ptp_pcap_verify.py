@@ -48,6 +48,8 @@ from pi_capture_ptp import (
 )
 
 PCAP_WINDOW_SLOP_SEC = 5.0
+PCAP_OUTPUT_SETTLE_SEC = 1.0
+MIN_RELIABLE_CAPTURE_SEC = 10
 
 
 def parse_args() -> argparse.Namespace:
@@ -67,8 +69,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--seconds",
         type=int,
-        default=5,
-        help="Length of the short verification capture (default: 5).",
+        default=10,
+        help="Length of the short verification capture (default: 10).",
     )
     parser.add_argument(
         "--output-dir",
@@ -86,6 +88,13 @@ def parse_args() -> argparse.Namespace:
         help="Print the full Ouster timing JSON before and after capture.",
     )
     return parser.parse_args()
+
+
+def choose_capture_attempts(seconds: int) -> list[int]:
+    attempts = [max(1, seconds)]
+    if attempts[0] < MIN_RELIABLE_CAPTURE_SEC:
+        attempts.append(MIN_RELIABLE_CAPTURE_SEC)
+    return attempts
 
 
 def extract_first_scan(item: Any) -> Any:
@@ -145,6 +154,44 @@ def summarize_pcap_timestamps(pcap_path: str) -> dict[str, Any]:
         "scan_count": scan_count,
         "valid_scan_count": valid_scan_count,
         "pcap_path": pcap_path,
+    }
+
+
+def wait_for_capture_file(pcap_path: str, timeout_sec: float = PCAP_OUTPUT_SETTLE_SEC) -> dict[str, Any]:
+    path = Path(pcap_path)
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        if path.exists():
+            size = path.stat().st_size
+            if size > 0:
+                return {
+                    "ready": True,
+                    "summary": f"Verification pcap was written ({size} bytes).",
+                    "pcap_path": pcap_path,
+                    "size_bytes": size,
+                }
+        time.sleep(0.1)
+
+    if path.exists():
+        size = path.stat().st_size
+        return {
+            "ready": False,
+            "summary": (
+                "Verification pcap file exists but is empty. "
+                "The short capture likely ended before packets were written."
+            ),
+            "pcap_path": pcap_path,
+            "size_bytes": size,
+        }
+
+    return {
+        "ready": False,
+        "summary": (
+            "Verification pcap file was not created. "
+            "The short capture likely ended before ouster-cli began writing packets."
+        ),
+        "pcap_path": pcap_path,
+        "size_bytes": 0,
     }
 
 
@@ -228,19 +275,41 @@ def main() -> int:
 
     print_section("Short Capture")
     print(f"Writing verification files to: {output_dir}")
-    stop_event = threading.Event()
-    capture_start_pi_ns = time.time_ns()
-    rc = run_ouster_capture(
-        host=args.ouster_host,
-        seconds=args.seconds,
-        requested_output_path=requested_output_path,
-        stop_event=stop_event,
-        output_mode="pcap_raw",
-    )
-    capture_end_pi_ns = time.time_ns()
-    print(f"capture_start_pi_ns={capture_start_pi_ns}")
-    print(f"capture_end_pi_ns={capture_end_pi_ns}")
-    print(f"ouster-cli return code={rc}")
+    capture_start_pi_ns: Optional[int] = None
+    capture_end_pi_ns: Optional[int] = None
+    rc: Optional[int] = None
+    capture_file = {"ready": False, "summary": "Verification capture did not run.", "pcap_path": requested_output_path, "size_bytes": 0}
+    attempts = choose_capture_attempts(args.seconds)
+    attempt_count = len(attempts)
+
+    for index, attempt_seconds in enumerate(attempts, start=1):
+        if index > 1:
+            print(
+                f"Retrying verification capture with a longer window ({attempt_seconds}s) "
+                "because the first attempt did not produce a usable pcap."
+            )
+        stale_path = Path(requested_output_path)
+        if stale_path.exists():
+            stale_path.unlink()
+        stop_event = threading.Event()
+        capture_start_pi_ns = time.time_ns()
+        rc = run_ouster_capture(
+            host=args.ouster_host,
+            seconds=attempt_seconds,
+            requested_output_path=requested_output_path,
+            stop_event=stop_event,
+            output_mode="pcap_raw",
+        )
+        capture_end_pi_ns = time.time_ns()
+        capture_file = wait_for_capture_file(requested_output_path)
+        print(f"attempt={index}/{attempt_count} capture_seconds={attempt_seconds}")
+        print(f"capture_start_pi_ns={capture_start_pi_ns}")
+        print(f"capture_end_pi_ns={capture_end_pi_ns}")
+        print(f"ouster-cli return code={rc}")
+        print(capture_file["summary"])
+        if capture_file.get("ready"):
+            break
+
     print()
 
     print_section("Ouster After Capture")
@@ -259,7 +328,17 @@ def main() -> int:
     print()
 
     print_section("Pcap Timestamps")
-    pcap_summary = summarize_pcap_timestamps(requested_output_path)
+    if capture_file.get("ready"):
+        pcap_summary = summarize_pcap_timestamps(requested_output_path)
+    else:
+        pcap_summary = {
+            "first_lidar_timestamp_ns": None,
+            "last_lidar_timestamp_ns": None,
+            "scan_count": 0,
+            "valid_scan_count": 0,
+            "pcap_path": requested_output_path,
+            "capture_file": capture_file,
+        }
     print(json.dumps(pcap_summary, indent=2))
     print()
 
@@ -275,8 +354,11 @@ def main() -> int:
     print(f"Ouster sensor time aligned before capture: {before_alignment.get('ready')}")
     print(f"Ouster locked after capture: {after_locked}")
     print(f"Ouster sensor time aligned after capture: {after_alignment.get('ready')}")
+    print(f"Verification pcap file ready: {capture_file.get('ready')}")
     print(f"Pcap timestamps in live PTP window: {pcap_window.get('ready')}")
     print(pcap_window.get("summary", "-"))
+    if not capture_file.get("ready"):
+        print(capture_file.get("summary", "-"))
     if pcap_window.get("ready") and not (before_alignment.get("ready") and after_alignment.get("ready")):
         print(
             "Important: the pcap is faithfully recording the Ouster's current live timestamps, "
@@ -289,6 +371,7 @@ def main() -> int:
         and after_locked
         and before_alignment.get("ready")
         and after_alignment.get("ready")
+        and capture_file.get("ready")
         and pcap_window.get("ready")
     )
 

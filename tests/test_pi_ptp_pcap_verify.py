@@ -37,3 +37,22 @@ def test_evaluate_pcap_time_window_rejects_old_epoch():
     )
     assert result["ready"] is False
     assert "do not match" in result["summary"]
+
+
+def test_choose_capture_attempts_retries_short_windows():
+    assert pcap_verify.choose_capture_attempts(5) == [5, 10]
+    assert pcap_verify.choose_capture_attempts(10) == [10]
+
+
+def test_wait_for_capture_file_reports_missing_path(tmp_path):
+    result = pcap_verify.wait_for_capture_file(str(tmp_path / "missing.pcap"), timeout_sec=0.01)
+    assert result["ready"] is False
+    assert "not created" in result["summary"]
+
+
+def test_wait_for_capture_file_accepts_written_file(tmp_path):
+    pcap_path = tmp_path / "verify_capture.pcap"
+    pcap_path.write_bytes(b"pcap")
+    result = pcap_verify.wait_for_capture_file(str(pcap_path), timeout_sec=0.01)
+    assert result["ready"] is True
+    assert result["size_bytes"] == 4
