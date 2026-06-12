@@ -252,10 +252,11 @@ def test_build_timing_status_snapshot_returns_helper_payload():
         "summary": "Timing stack looks ready for PTP capture.",
         "recommended_action": "You can start a PTP capture session.",
     }
-    with mock.patch.object(web_capture, "run_timing_helper", return_value=expected):
+    with mock.patch.object(web_capture, "run_timing_helper", return_value=expected) as helper_mock:
         snapshot = web_capture.build_timing_status_snapshot()
 
     assert snapshot == expected
+    helper_mock.assert_called_once_with("--iface", web_capture.TIMING_IFACE, "status")
 
 
 def test_build_timing_status_snapshot_returns_friendly_error_payload():

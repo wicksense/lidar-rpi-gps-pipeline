@@ -365,7 +365,7 @@ def run_timing_helper(*args: str, require_root: bool = True) -> dict[str, Any]:
 
 def build_timing_status_snapshot() -> dict[str, Any]:
     try:
-        return run_timing_helper("status", "--iface", TIMING_IFACE)
+        return run_timing_helper("--iface", TIMING_IFACE, "status")
     except Exception as exc:
         return {
             "ok": False,
@@ -1403,7 +1403,7 @@ class CaptureRequestHandler(BaseHTTPRequestHandler):
 
         if parsed.path == "/api/timing-restart-phc2sys":
             try:
-                payload = run_timing_helper("restart-phc2sys", "--iface", TIMING_IFACE)
+                payload = run_timing_helper("--iface", TIMING_IFACE, "restart-phc2sys")
             except Exception as exc:
                 self._send_json(HTTPStatus.BAD_GATEWAY, {"error": str(exc)})
                 return
