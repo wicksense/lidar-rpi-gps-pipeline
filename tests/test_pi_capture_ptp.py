@@ -226,6 +226,51 @@ def test_evaluate_ouster_sensor_time_alignment_rejects_large_delta():
     assert "not aligned" in evaluation["summary"]
 
 
+def test_choose_ptp_profile_reacquire_target_flips_default_and_gptp():
+    assert ptp_capture.choose_ptp_profile_reacquire_target("default") == "gptp"
+    assert ptp_capture.choose_ptp_profile_reacquire_target("gptp") == "default"
+    assert ptp_capture.choose_ptp_profile_reacquire_target("custom") is None
+
+
+def test_wait_for_ouster_sensor_time_alignment_recovers_stale_slave_time():
+    stale_status = {
+        "timestamp_mode": "TIME_FROM_PTP_1588",
+        "ptp": {
+            "port_data_set": {"port_state": "SLAVE"},
+            "time_status_np": {"gm_present": True},
+            "parent_data_set": {"grandmaster_identity": "00-11"},
+        },
+        "time": {"sensor": {"timestamp": {"time": 1781032462.8541107}}},
+    }
+    recovered_status = {
+        "timestamp_mode": "TIME_FROM_PTP_1588",
+        "ptp": {
+            "port_data_set": {"port_state": "SLAVE"},
+            "time_status_np": {"gm_present": True},
+            "parent_data_set": {"grandmaster_identity": "00-11"},
+        },
+        "time": {"sensor": {"timestamp": {"time": 1781280168.6174073}}},
+    }
+
+    with (
+        mock.patch.object(ptp_capture, "get_ouster_time_status", return_value=stale_status),
+        mock.patch.object(ptp_capture, "force_ouster_ptp_reacquire", return_value=recovered_status) as reacquire,
+        mock.patch.object(ptp_capture.time, "time", return_value=1781280168.602482),
+    ):
+        ready, result = ptp_capture.wait_for_ouster_sensor_time_alignment(
+            host="192.168.50.2",
+            stop_event=threading.Event(),
+            timeout_sec=1,
+            poll_sec=0,
+            timestamp_mode="TIME_FROM_PTP_1588",
+            ptp_profile="default",
+        )
+
+    assert ready is True
+    assert result["ready"] is True
+    reacquire.assert_called_once()
+
+
 def test_collect_phc_alignment_reports_ready_when_delta_small():
     with mock.patch.object(
         ptp_capture,

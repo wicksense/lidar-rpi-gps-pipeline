@@ -92,6 +92,7 @@ OUSTER_API_TIMEOUT_SEC = 5
 PTP_IFACE = "eth0"
 PHC_ALIGNMENT_READY_DELTA_SEC = 0.05
 OUSTER_SENSOR_TIME_READY_DELTA_SEC = 1.0
+OUSTER_PTP_REACQUIRE_SETTLE_SEC = 2
 TIMING_ARCHITECTURE = "gps_pps_to_pi__chrony_to_pi_clock__ptp_to_ouster"
 LOCAL_CHRONY_SOURCE_NAMES = frozenset({"GPS", "PPS"})
 
@@ -1143,10 +1144,13 @@ def wait_for_ouster_sensor_time_alignment(
     stop_event: threading.Event,
     timeout_sec: int,
     poll_sec: int,
+    timestamp_mode: Optional[str] = None,
+    ptp_profile: Optional[str] = None,
 ) -> tuple[bool, dict[str, Any]]:
     """Wait until the Ouster-reported sensor time is close to the Pi clock."""
     deadline = time.time() + timeout_sec
     last_result: dict[str, Any] = {}
+    recovery_attempted = False
 
     while not stop_event.is_set():
         try:
@@ -1160,6 +1164,35 @@ def wait_for_ouster_sensor_time_alignment(
             if alignment["ready"]:
                 log(f"Ouster sensor time aligned: {alignment['summary']}")
                 return True, last_result
+            if (
+                not recovery_attempted
+                and ouster_ptp_locked(status)
+                and isinstance(alignment.get("delta_seconds"), (int, float))
+                and abs(float(alignment["delta_seconds"])) > OUSTER_SENSOR_TIME_READY_DELTA_SEC
+            ):
+                recovery_attempted = True
+                try:
+                    recovered_status = force_ouster_ptp_reacquire(
+                        host,
+                        timestamp_mode=timestamp_mode,
+                        ptp_profile=ptp_profile,
+                    )
+                except Exception as exc:
+                    log(f"Ouster PTP reacquire attempt failed: {exc}")
+                else:
+                    recovered_alignment = evaluate_ouster_sensor_time_alignment(recovered_status)
+                    last_result = {
+                        "status": recovered_status,
+                        "alignment": recovered_alignment,
+                        "recovery_attempted": True,
+                        **recovered_alignment,
+                    }
+                    if recovered_alignment["ready"]:
+                        log(
+                            "Ouster sensor time aligned after forced PTP reacquire: "
+                            f"{recovered_alignment['summary']}"
+                        )
+                        return True, last_result
             log(f"Waiting for Ouster sensor time alignment: {alignment['summary']}")
 
         if time.time() >= deadline:
@@ -1198,6 +1231,52 @@ def configure_ouster_lidar_mode(host: str, lidar_mode: Optional[str]) -> bool:
         )
     log(f"Ouster lidar mode configured: {lidar_mode}")
     return True
+
+
+def choose_ptp_profile_reacquire_target(profile: Optional[str]) -> Optional[str]:
+    normalized = normalize_optional_string(profile)
+    if normalized == "default":
+        return "gptp"
+    if normalized == "gptp":
+        return "default"
+    return None
+
+
+def force_ouster_ptp_reacquire(
+    host: str,
+    *,
+    timestamp_mode: Optional[str],
+    ptp_profile: Optional[str],
+) -> dict[str, Any]:
+    """Force the Ouster to drop and reacquire PTP time when it is stuck in a stale slave state."""
+    desired_timestamp_mode = normalize_optional_string(timestamp_mode) or "TIME_FROM_PTP_1588"
+    desired_ptp_profile = normalize_optional_string(ptp_profile) or "default"
+
+    log(
+        "Ouster is PTP-locked but sensor time is stale. "
+        "Forcing timestamp/PTP reacquisition..."
+    )
+
+    if desired_timestamp_mode == "TIME_FROM_PTP_1588":
+        log("Temporarily switching Ouster timestamp mode to TIME_FROM_INTERNAL_OSC.")
+        ouster_api_request("PUT", host, "/api/v1/sensor/config/timestamp_mode", "TIME_FROM_INTERNAL_OSC")
+        time.sleep(OUSTER_PTP_REACQUIRE_SETTLE_SEC)
+        log(f"Restoring Ouster timestamp mode to {desired_timestamp_mode}.")
+        ouster_api_request("PUT", host, "/api/v1/sensor/config/timestamp_mode", desired_timestamp_mode)
+        time.sleep(OUSTER_PTP_REACQUIRE_SETTLE_SEC)
+
+    alternate_profile = choose_ptp_profile_reacquire_target(desired_ptp_profile)
+    if alternate_profile:
+        log(f"Temporarily switching Ouster PTP profile to {alternate_profile}.")
+        ouster_api_request("PUT", host, "/api/v1/time/ptp/profile", alternate_profile)
+        time.sleep(OUSTER_PTP_REACQUIRE_SETTLE_SEC)
+        log(f"Restoring Ouster PTP profile to {desired_ptp_profile}.")
+        ouster_api_request("PUT", host, "/api/v1/time/ptp/profile", desired_ptp_profile)
+        time.sleep(OUSTER_PTP_REACQUIRE_SETTLE_SEC)
+
+    status = get_ouster_time_status(host)
+    log(f"Ouster timing after forced reacquire: {summarize_ouster_ptp_status(status)}")
+    return status
 
 
 def configure_ouster_time_mode(
@@ -1610,6 +1689,8 @@ def main() -> None:
             stop_event=stop_event,
             timeout_sec=readiness_timeout_sec,
             poll_sec=READINESS_POLL_SEC,
+            timestamp_mode=timestamp_mode,
+            ptp_profile=ptp_profile,
         )
         readiness["ouster_sensor_time_alignment"]["ready"] = sensor_time_ready
         readiness["ouster_sensor_time_alignment"]["status"] = sensor_time_status
