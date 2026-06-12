@@ -286,6 +286,35 @@ def test_collect_phc_alignment_reports_ready_when_delta_small():
     assert abs(result["delta_seconds"]) < ptp_capture.PHC_ALIGNMENT_READY_DELTA_SEC
 
 
+def test_collect_phc_alignment_falls_back_to_timing_helper_when_direct_phc_denied():
+    with (
+        mock.patch.object(
+            ptp_capture,
+            "run_command_capture",
+            side_effect=[
+                {"returncode": 0, "stdout": "phc_ctl[1]: clock time is 1781280168.602482101 or Fri Jun 12 11:02:48 2026", "stderr": "", "cmd": []},
+                {"returncode": 1, "stdout": "", "stderr": "phc_ctl[1]: cannot open /dev/ptp0 for eth0: Permission denied", "cmd": []},
+            ],
+        ),
+        mock.patch.object(
+            ptp_capture,
+            "run_timing_helper_status",
+            return_value={
+                "phc_alignment": {
+                    "available": True,
+                    "ready": True,
+                    "delta_seconds": 0.001,
+                    "summary": "Pi network time broadcast is aligned.",
+                }
+            },
+        ),
+    ):
+        result = ptp_capture.collect_phc_alignment("eth0")
+
+    assert result["ready"] is True
+    assert result["summary"] == "Pi network time broadcast is aligned."
+
+
 def test_evaluate_chrony_local_gps_pps_sync_accepts_local_selected_source():
     snapshot = {
         "waitsync": {"returncode": 0, "stdout": "ok", "stderr": ""},

@@ -95,6 +95,8 @@ OUSTER_SENSOR_TIME_READY_DELTA_SEC = 1.0
 OUSTER_PTP_REACQUIRE_SETTLE_SEC = 2
 TIMING_ARCHITECTURE = "gps_pps_to_pi__chrony_to_pi_clock__ptp_to_ouster"
 LOCAL_CHRONY_SOURCE_NAMES = frozenset({"GPS", "PPS"})
+TIMING_HELPER_INSTALLED_PATH = "/usr/local/bin/pi_timing_helper.py"
+TIMING_HELPER_PATH = os.environ.get("PI_TIMING_HELPER_PATH", TIMING_HELPER_INSTALLED_PATH)
 
 
 def log(message: str) -> None:
@@ -777,6 +779,35 @@ def run_command_capture(cmd: list[str]) -> dict[str, Any]:
     }
 
 
+def resolve_timing_helper_path() -> str:
+    if os.path.exists(TIMING_HELPER_PATH):
+        return TIMING_HELPER_PATH
+    local_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pi_timing_helper.py")
+    if os.path.exists(local_path):
+        return local_path
+    return TIMING_HELPER_PATH
+
+
+def run_timing_helper_status(iface: str) -> dict[str, Any]:
+    helper_path = resolve_timing_helper_path()
+    result = subprocess.run(
+        ["sudo", "-n", helper_path, "--iface", iface, "status"],
+        capture_output=True,
+        text=True,
+    )
+    stdout = result.stdout.strip()
+    stderr = result.stderr.strip()
+    if result.returncode != 0:
+        raise RuntimeError(stderr or stdout or f"Timing helper failed with exit code {result.returncode}")
+    try:
+        payload = json.loads(stdout or "{}")
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Timing helper returned invalid JSON: {stdout or stderr}") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("Timing helper returned an unexpected payload.")
+    return payload
+
+
 def ouster_cli_command(*args: str) -> list[str]:
     """Build an `ouster-cli` command using the best-resolved executable."""
     return [resolve_ouster_cli_executable(), *args]
@@ -871,7 +902,21 @@ def collect_phc_alignment(iface: str = PTP_IFACE) -> dict[str, Any]:
     phc_out = run_command_capture(["phc_ctl", iface, "get"])
 
     if sys_out["returncode"] != 0 or phc_out["returncode"] != 0:
+        helper_error = None
+        try:
+            helper_payload = run_timing_helper_status(iface)
+        except Exception as exc:
+            helper_error = str(exc)
+        else:
+            helper_alignment = helper_payload.get("phc_alignment")
+            if isinstance(helper_alignment, dict):
+                merged = dict(helper_alignment)
+                merged.setdefault("helper_status", helper_payload)
+                return merged
+
         stderr_parts = [part for part in (sys_out.get("stderr"), phc_out.get("stderr")) if part]
+        if helper_error:
+            stderr_parts.append(f"timing helper: {helper_error}")
         detail = " ".join(stderr_parts).strip()
         if detail:
             summary = f"Could not read the Pi network hardware clock. {detail}"
