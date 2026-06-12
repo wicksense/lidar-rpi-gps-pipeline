@@ -277,6 +277,11 @@ def main() -> int:
     print(f"Ouster sensor time aligned after capture: {after_alignment.get('ready')}")
     print(f"Pcap timestamps in live PTP window: {pcap_window.get('ready')}")
     print(pcap_window.get("summary", "-"))
+    if pcap_window.get("ready") and not (before_alignment.get("ready") and after_alignment.get("ready")):
+        print(
+            "Important: the pcap is faithfully recording the Ouster's current live timestamps, "
+            "but the Ouster's live PTP time is still not aligned to the Pi clock."
+        )
 
     ok = bool(
         phc_alignment.get("ready")

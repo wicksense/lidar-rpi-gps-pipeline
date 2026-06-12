@@ -870,7 +870,12 @@ def collect_phc_alignment(iface: str = PTP_IFACE) -> dict[str, Any]:
     phc_out = run_command_capture(["phc_ctl", iface, "get"])
 
     if sys_out["returncode"] != 0 or phc_out["returncode"] != 0:
-        summary = "Could not read the Pi network hardware clock."
+        stderr_parts = [part for part in (sys_out.get("stderr"), phc_out.get("stderr")) if part]
+        detail = " ".join(stderr_parts).strip()
+        if detail:
+            summary = f"Could not read the Pi network hardware clock. {detail}"
+        else:
+            summary = "Could not read the Pi network hardware clock."
         return {
             "available": False,
             "ready": False,
