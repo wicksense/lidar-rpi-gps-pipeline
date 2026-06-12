@@ -31,6 +31,7 @@ SERVICE_UNITS = {
     "ptp4l": "ptp4l.service",
     "phc2sys": "phc2sys.service",
 }
+WIFI_CONNECTION_TYPES = {"wifi", "802-11-wireless"}
 
 
 def parse_args() -> argparse.Namespace:
@@ -209,6 +210,10 @@ def shutil_which(name: str) -> str | None:
     return shutil.which(name)
 
 
+def is_wifi_connection_type(conn_type: str) -> bool:
+    return conn_type.strip().lower() in WIFI_CONNECTION_TYPES
+
+
 def list_wifi_connections() -> dict[str, Any]:
     if not shutil_which("nmcli"):
         return {
@@ -233,7 +238,7 @@ def list_wifi_connections() -> dict[str, Any]:
             name, conn_type, device = parts[0], parts[1], parts[2]
             entry = {"name": name, "type": conn_type, "device": device}
             active_entries.append(entry)
-            if conn_type == "wifi":
+            if is_wifi_connection_type(conn_type):
                 active_connection = name
 
     saved_connections: list[str] = []
@@ -245,7 +250,7 @@ def list_wifi_connections() -> dict[str, Any]:
             if len(parts) < 2:
                 continue
             name, conn_type = parts[0], parts[1]
-            if conn_type == "wifi":
+            if is_wifi_connection_type(conn_type):
                 saved_connections.append(name)
 
     summary = (

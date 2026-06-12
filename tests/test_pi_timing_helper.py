@@ -81,12 +81,12 @@ def test_restart_phc2sys_refuses_when_gps_time_not_ready():
 def test_list_wifi_connections_parses_active_and_saved_profiles():
     active_cmd = {
         "returncode": 0,
-        "stdout": "AirRowdy:wifi:wlan0\nURP-Ouster-Link:ethernet:eth0",
+        "stdout": "AirRowdy:802-11-wireless:wlan0\nURP-Ouster-Link:802-3-ethernet:eth0",
         "stderr": "",
     }
     saved_cmd = {
         "returncode": 0,
-        "stdout": "URP-RPI-Net:wifi\nAirRowdy:wifi\nURP-Ouster-Link:ethernet",
+        "stdout": "URP-RPI-Net:802-11-wireless\nAirRowdy:802-11-wireless\nURP-Ouster-Link:802-3-ethernet",
         "stderr": "",
     }
     with (
@@ -98,6 +98,12 @@ def test_list_wifi_connections_parses_active_and_saved_profiles():
     assert status["available"] is True
     assert status["active_connection"] == "AirRowdy"
     assert status["saved_connections"] == ["URP-RPI-Net", "AirRowdy"]
+
+
+def test_is_wifi_connection_type_accepts_both_nmcli_labels():
+    assert timing_helper.is_wifi_connection_type("wifi") is True
+    assert timing_helper.is_wifi_connection_type("802-11-wireless") is True
+    assert timing_helper.is_wifi_connection_type("802-3-ethernet") is False
 
 
 def test_switch_wifi_rejects_unknown_connection():
