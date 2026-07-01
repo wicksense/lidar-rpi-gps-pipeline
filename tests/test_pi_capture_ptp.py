@@ -33,6 +33,55 @@ def test_normalize_lidar_mode_rejects_invalid_input():
         raise AssertionError("Expected ValueError for invalid lidar mode")
 
 
+def test_build_ouster_capture_command_places_split_before_filename():
+    with mock.patch.object(
+        ptp_capture,
+        "resolve_ouster_cli_executable",
+        return_value="/tmp/ouster-cli",
+    ):
+        cmd = ptp_capture.build_ouster_capture_command(
+            host="192.168.50.2",
+            seconds=0,
+            requested_output_path="/tmp/capture.pcap",
+            output_mode="pcap_raw",
+            split_size_mb=320,
+        )
+
+    assert cmd == [
+        "/tmp/ouster-cli",
+        "source",
+        "192.168.50.2",
+        "save_raw",
+        "--split",
+        "320",
+        "/tmp/capture.pcap",
+    ]
+
+
+def test_build_ouster_capture_command_places_duration_before_filename():
+    with mock.patch.object(
+        ptp_capture,
+        "resolve_ouster_cli_executable",
+        return_value="/tmp/ouster-cli",
+    ):
+        cmd = ptp_capture.build_ouster_capture_command(
+            host="192.168.50.2",
+            seconds=30,
+            requested_output_path="/tmp/capture.pcap",
+            output_mode="pcap_raw",
+        )
+
+    assert cmd == [
+        "/tmp/ouster-cli",
+        "source",
+        "192.168.50.2",
+        "save_raw",
+        "-D",
+        "30",
+        "/tmp/capture.pcap",
+    ]
+
+
 def test_gpsd_time_to_epoch_ns_parses_utc_z_suffix():
     epoch_ns = ptp_capture.gpsd_time_to_epoch_ns("2026-05-12T13:47:29.123456Z")
     assert epoch_ns == 1778593649123456000

@@ -1465,32 +1465,13 @@ def run_ouster_capture(
     split_size_mb: Optional[int] = None,
 ) -> int:
     """Start one ouster-cli capture and return the process exit code."""
-    if output_mode == "csv":
-        cmd = [
-            *ouster_cli_command(
-                "source",
-                host,
-                "slice",
-                f"0s:{seconds}s",
-                "save",
-                requested_output_path,
-            ),
-        ]
-    elif output_mode == "pcap_raw":
-        cmd = [
-            *ouster_cli_command(
-                "source",
-                host,
-                "save_raw",
-                requested_output_path,
-            ),
-        ]
-        if split_size_mb is not None:
-            cmd.extend(["--split", str(split_size_mb)])
-        elif seconds > 0:
-            cmd.extend(["-D", str(seconds)])
-    else:
-        raise ValueError(f"Unsupported LIDAR_OUTPUT_MODE: {output_mode}")
+    cmd = build_ouster_capture_command(
+        host=host,
+        seconds=seconds,
+        requested_output_path=requested_output_path,
+        output_mode=output_mode,
+        split_size_mb=split_size_mb,
+    )
 
     log("Starting ouster capture:")
     log("  " + " ".join(cmd))
@@ -1530,6 +1511,69 @@ def run_ouster_capture(
     return return_code
 
 
+def build_ouster_capture_command(
+    *,
+    host: str,
+    seconds: int,
+    requested_output_path: str,
+    output_mode: str,
+    split_size_mb: Optional[int] = None,
+) -> list[str]:
+    """Build the ouster-cli command used for raw or CSV capture."""
+    if output_mode == "csv":
+        return [
+            *ouster_cli_command(
+                "source",
+                host,
+                "slice",
+                f"0s:{seconds}s",
+                "save",
+                requested_output_path,
+            ),
+        ]
+    elif output_mode == "pcap_raw":
+        cmd = [
+            *ouster_cli_command(
+                "source",
+                host,
+                "save_raw",
+                requested_output_path,
+            ),
+        ]
+        if split_size_mb is not None:
+            return [
+                *ouster_cli_command(
+                    "source",
+                    host,
+                    "save_raw",
+                    "--split",
+                    str(split_size_mb),
+                    requested_output_path,
+                ),
+            ]
+        if seconds > 0:
+            return [
+                *ouster_cli_command(
+                    "source",
+                    host,
+                    "save_raw",
+                    "-D",
+                    str(seconds),
+                    requested_output_path,
+                ),
+            ]
+        return [
+            *ouster_cli_command(
+                "source",
+                host,
+                "save_raw",
+                requested_output_path,
+            ),
+        ]
+    else:
+        raise ValueError(f"Unsupported LIDAR_OUTPUT_MODE: {output_mode}")
+
+
 def run_ouster_split_capture(
     host: str,
     requested_output_path: str,
@@ -1541,16 +1585,13 @@ def run_ouster_split_capture(
     ptp_profile: Optional[str],
 ) -> tuple[int, list[dict[str, Any]]]:
     """Run one rolling save_raw process and surface each split pcap as a chunk."""
-    cmd = [
-        *ouster_cli_command(
-            "source",
-            host,
-            "save_raw",
-            requested_output_path,
-        ),
-        "--split",
-        str(split_size_mb),
-    ]
+    cmd = build_ouster_capture_command(
+        host=host,
+        seconds=0,
+        requested_output_path=requested_output_path,
+        output_mode="pcap_raw",
+        split_size_mb=split_size_mb,
+    )
 
     log("Starting ouster capture:")
     log("  " + " ".join(cmd))
