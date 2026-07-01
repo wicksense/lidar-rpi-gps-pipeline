@@ -420,6 +420,10 @@ def apply_log_line_updates(state: dict[str, Any], line: str) -> None:
         state["phase"] = "waiting for ouster ptp lock"
     if "Capture mode: continuous chunks" in line or "Capture mode: single chunk." in line:
         state["phase"] = "capturing"
+    if "Capture startup failed" in line or "Capture aborted before start:" in line:
+        state["phase"] = "failed"
+    if "Capture complete." in line:
+        state["phase"] = "complete"
 
     chunk_match = re.search(r"Starting chunk (\d+):", line)
     if chunk_match:
@@ -573,7 +577,19 @@ class CaptureManager:
         with self._lock:
             proc = self._proc
             if not proc or proc.poll() is not None:
-                self._append_internal_log("[web] Stop requested but no capture process is running.")
+                phase = self._state.get("phase")
+                exit_code = self._state.get("exit_code")
+                if phase == "failed" or (isinstance(exit_code, int) and exit_code != 0):
+                    self._append_internal_log(
+                        "[web] Stop requested, but the last capture already exited "
+                        f"(phase={phase}, exit_code={exit_code})."
+                    )
+                elif phase == "complete" or exit_code == 0:
+                    self._append_internal_log(
+                        "[web] Stop requested, but the last capture already finished."
+                    )
+                else:
+                    self._append_internal_log("[web] Stop requested but no capture process is running.")
                 snapshot = self._snapshot_unlocked()
                 return snapshot
             self._state["stop_requested"] = True

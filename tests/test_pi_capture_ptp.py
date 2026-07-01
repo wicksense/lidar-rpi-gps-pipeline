@@ -424,3 +424,38 @@ def test_main_discards_artifacts_when_waiting_for_gps_and_no_fix(tmp_path):
 
     assert list(tmp_path.glob("raw_gps_*.csv")) == []
     assert list(tmp_path.glob("capture_manifest_*.json")) == []
+
+
+def test_main_exits_cleanly_when_ouster_setup_fails(tmp_path):
+    cli = SimpleNamespace(
+        wait_for_gps_fix=False,
+        wait_for_pi_clock_sync=False,
+        wait_for_ouster_ptp_lock=False,
+        readiness_timeout_sec=None,
+        lidar_mode=None,
+        timestamp_mode=None,
+        ptp_profile=None,
+        gps_input_mode="bridge",
+        gps_port=None,
+        gps_baud=None,
+        gpsd_host=None,
+        gpsd_port=None,
+        bridge_fix_path=str(tmp_path / "latest_fix.json"),
+        ouster_host="192.168.50.2",
+    )
+
+    with (
+        mock.patch.object(ptp_capture, "OUTPUT_DIR", str(tmp_path)),
+        mock.patch.object(ptp_capture, "parse_cli_args", return_value=cli),
+        mock.patch.object(ptp_capture, "configure_ouster_sensor", side_effect=RuntimeError("timed out")),
+        mock.patch.object(ptp_capture.signal, "signal", return_value=None),
+    ):
+        try:
+            ptp_capture.main()
+        except SystemExit as exc:
+            assert exc.code == 1
+        else:
+            raise AssertionError("Expected SystemExit(1) when Ouster setup fails")
+
+    assert list(tmp_path.glob("raw_gps_*.csv")) == []
+    assert list(tmp_path.glob("capture_manifest_*.json")) == []

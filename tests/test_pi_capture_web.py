@@ -198,6 +198,19 @@ def test_capture_manager_start_and_stop_do_not_deadlock():
         assert fake_proc._sent_signal == web_capture.signal.SIGINT
 
 
+def test_capture_manager_stop_reports_already_failed_run():
+    manager = web_capture.CaptureManager()
+    manager._state["phase"] = "failed"
+    manager._state["exit_code"] = 1
+    manager._state["running"] = False
+
+    snapshot = manager.stop()
+
+    assert snapshot["phase"] == "failed"
+    logs = manager.logs_after(0)["entries"]
+    assert any("already exited" in entry["text"] for entry in logs)
+
+
 def test_capture_manager_restart_increments_run_token_and_resets_log_ids():
     manager = web_capture.CaptureManager()
 
@@ -271,6 +284,15 @@ def test_html_template_contains_compact_preflight_summary():
     assert 'cache: "no-store"' in html
     assert "visibilitychange" in html
     assert "refreshLogsInFlight" in html
+
+
+def test_apply_log_line_updates_marks_failed_startup_as_failed_phase():
+    state = {"phase": "starting", "current_chunk_index": None}
+    web_capture.apply_log_line_updates(
+        state,
+        "[2026-07-01 12:00:00] Capture startup failed during Ouster setup: timed out",
+    )
+    assert state["phase"] == "failed"
 
 
 def test_build_preflight_snapshot_requires_local_gps_pps_sync_for_chrony_ready():

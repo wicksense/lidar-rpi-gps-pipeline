@@ -91,6 +91,8 @@ CHRONY_MAX_CORRECTION_SEC = 0.01
 CHRONY_WAITSYNC_TRIES = 1
 CHRONY_WAITSYNC_INTERVAL_SEC = 1
 OUSTER_API_TIMEOUT_SEC = 5
+OUSTER_API_RETRIES = 3
+OUSTER_API_RETRY_DELAY_SEC = 0.5
 PTP_IFACE = "eth0"
 PHC_ALIGNMENT_READY_DELTA_SEC = 0.05
 OUSTER_SENSOR_TIME_READY_DELTA_SEC = 1.0
@@ -1047,14 +1049,24 @@ def ouster_api_request(
         headers["Content-Type"] = "application/json"
 
     request = urllib.request.Request(url, data=data, method=method, headers=headers)
-    try:
-        with urllib.request.urlopen(request, timeout=OUSTER_API_TIMEOUT_SEC) as response:
-            body = response.read().decode("utf-8").strip()
-    except urllib.error.HTTPError as exc:
-        error_body = exc.read().decode("utf-8", errors="replace").strip()
-        raise RuntimeError(f"Ouster HTTP {method} {path} failed with {exc.code}: {error_body}") from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"Ouster HTTP {method} {path} failed: {exc}") from exc
+    last_error: Optional[Exception] = None
+    for attempt in range(1, OUSTER_API_RETRIES + 1):
+        try:
+            with urllib.request.urlopen(request, timeout=OUSTER_API_TIMEOUT_SEC) as response:
+                body = response.read().decode("utf-8").strip()
+            break
+        except urllib.error.HTTPError as exc:
+            error_body = exc.read().decode("utf-8", errors="replace").strip()
+            raise RuntimeError(f"Ouster HTTP {method} {path} failed with {exc.code}: {error_body}") from exc
+        except urllib.error.URLError as exc:
+            last_error = exc
+            if attempt >= OUSTER_API_RETRIES:
+                raise RuntimeError(f"Ouster HTTP {method} {path} failed: {exc}") from exc
+            time.sleep(OUSTER_API_RETRY_DELAY_SEC)
+    else:  # pragma: no cover - defensive fallback
+        if last_error is not None:
+            raise RuntimeError(f"Ouster HTTP {method} {path} failed: {last_error}") from last_error
+        raise RuntimeError(f"Ouster HTTP {method} {path} failed unexpectedly without a response.")
 
     if not body:
         return None
@@ -1768,12 +1780,16 @@ def main() -> None:
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
 
-    configure_ouster_sensor(
-        ouster_host,
-        lidar_mode=lidar_mode,
-        timestamp_mode=timestamp_mode,
-        ptp_profile=ptp_profile,
-    )
+    try:
+        configure_ouster_sensor(
+            ouster_host,
+            lidar_mode=lidar_mode,
+            timestamp_mode=timestamp_mode,
+            ptp_profile=ptp_profile,
+        )
+    except Exception as exc:
+        log(f"Capture startup failed during Ouster setup: {exc}")
+        raise SystemExit(1) from exc
 
     gps_logger = build_gps_logger(
         gps_input_mode=gps_input_mode,
