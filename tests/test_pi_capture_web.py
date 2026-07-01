@@ -295,6 +295,15 @@ def test_apply_log_line_updates_marks_failed_startup_as_failed_phase():
     assert state["phase"] == "failed"
 
 
+def test_apply_log_line_updates_marks_capture_error_as_failed_phase():
+    state = {"phase": "capturing", "current_chunk_index": 0}
+    web_capture.apply_log_line_updates(
+        state,
+        "[2026-07-01 12:00:10] Capture failed: ouster-cli exited with code 1 before stop was requested.",
+    )
+    assert state["phase"] == "failed"
+
+
 def test_build_preflight_snapshot_requires_local_gps_pps_sync_for_chrony_ready():
     with mock.patch.object(
         web_capture.ptp_capture,

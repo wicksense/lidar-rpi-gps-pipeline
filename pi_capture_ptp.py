@@ -1993,6 +1993,9 @@ def main() -> None:
 
     run_start_iso = dt.datetime.now(dt.timezone.utc).isoformat()
     run_start_ns = time.time_ns()
+    capture_failed = False
+    capture_failure_reason: Optional[str] = None
+    capture_exit_code: Optional[int] = None
 
     if CONTINUOUS_CHUNKS:
         log("Capture mode: continuous chunks. Press Ctrl+C to stop.")
@@ -2014,7 +2017,17 @@ def main() -> None:
             timestamp_mode=timestamp_mode,
             ptp_profile=ptp_profile,
         )
+        capture_exit_code = _rc
         chunks.extend(split_chunks)
+        if not stop_event.is_set():
+            if _rc != 0:
+                capture_failed = True
+                capture_failure_reason = (
+                    f"ouster-cli exited with code {_rc} before stop was requested."
+                )
+            elif not split_chunks:
+                capture_failed = True
+                capture_failure_reason = "Capture ended before any LiDAR chunk files were written."
     else:
         chunk_index = 0
         while not stop_event.is_set():
@@ -2034,6 +2047,7 @@ def main() -> None:
                 stop_event=stop_event,
                 output_mode=LIDAR_OUTPUT_MODE,
             )
+            capture_exit_code = rc
 
             chunk_end_ns = time.time_ns()
             chunk_end_iso = dt.datetime.now(dt.timezone.utc).isoformat()
@@ -2071,6 +2085,10 @@ def main() -> None:
                 if LIDAR_OUTPUT_MODE == "pcap_raw" and pcap_candidates:
                     log(f"Chunk ended (exit code {rc}) after timed stop. Continuing...")
                 else:
+                    capture_failed = True
+                    capture_failure_reason = (
+                        f"ouster-cli exited with code {rc} before capture could continue."
+                    )
                     log(f"Stopping capture loop because ouster-cli returned non-zero exit code: {rc}")
                     break
 
@@ -2078,6 +2096,13 @@ def main() -> None:
                 break
 
             chunk_index += 1
+
+    if not stop_event.is_set() and not chunks and not capture_failed:
+        capture_failed = True
+        capture_failure_reason = "Capture ended before any LiDAR chunk files were written."
+
+    if capture_failed and capture_failure_reason:
+        log(f"Capture failed: {capture_failure_reason}")
 
     run_end_ns = time.time_ns()
     run_end_iso = dt.datetime.now(dt.timezone.utc).isoformat()
@@ -2119,15 +2144,23 @@ def main() -> None:
         "readiness_snapshot": readiness,
         "chunks_captured": len(chunks),
         "chunks": chunks,
+        "completed_successfully": not capture_failed,
+        "capture_error": capture_failure_reason,
+        "capture_exit_code": capture_exit_code,
     }
 
     with open(manifest_path, "w", encoding="utf-8") as f_out:
         json.dump(manifest, f_out, indent=2)
 
-    log("Capture complete.")
+    if capture_failed:
+        log("Capture finished with errors.")
+    else:
+        log("Capture complete.")
     log(f"LiDAR chunks: {len(chunks)}")
     log(f"GPS CSV:     {gps_csv_path}")
     log(f"Manifest:    {manifest_path}")
+    if capture_failed:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

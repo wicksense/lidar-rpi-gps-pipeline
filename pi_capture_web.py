@@ -422,6 +422,8 @@ def apply_log_line_updates(state: dict[str, Any], line: str) -> None:
         state["phase"] = "capturing"
     if "Capture startup failed" in line or "Capture aborted before start:" in line:
         state["phase"] = "failed"
+    if "Capture failed:" in line or "Capture finished with errors." in line:
+        state["phase"] = "failed"
     if "Capture complete." in line:
         state["phase"] = "complete"
 

@@ -459,3 +459,56 @@ def test_main_exits_cleanly_when_ouster_setup_fails(tmp_path):
 
     assert list(tmp_path.glob("raw_gps_*.csv")) == []
     assert list(tmp_path.glob("capture_manifest_*.json")) == []
+
+
+def test_main_fails_when_split_capture_exits_before_writing_any_chunks(tmp_path):
+    class _FakeLogger:
+        rows_written = 0
+        first_fix_time_ns = None
+        latest_fix = None
+
+        def start(self):
+            return None
+
+        def join(self, timeout=None):
+            return None
+
+    cli = SimpleNamespace(
+        wait_for_gps_fix=False,
+        wait_for_pi_clock_sync=False,
+        wait_for_ouster_ptp_lock=False,
+        readiness_timeout_sec=None,
+        lidar_mode=None,
+        timestamp_mode=None,
+        ptp_profile=None,
+        gps_input_mode="bridge",
+        gps_port=None,
+        gps_baud=None,
+        gpsd_host=None,
+        gpsd_port=None,
+        bridge_fix_path=str(tmp_path / "latest_fix.json"),
+        ouster_host="192.168.50.2",
+    )
+
+    with (
+        mock.patch.object(ptp_capture, "OUTPUT_DIR", str(tmp_path)),
+        mock.patch.object(ptp_capture, "parse_cli_args", return_value=cli),
+        mock.patch.object(ptp_capture, "configure_ouster_sensor", return_value=None),
+        mock.patch.object(ptp_capture, "build_gps_logger", return_value=_FakeLogger()),
+        mock.patch.object(ptp_capture, "run_ouster_split_capture", return_value=(1, [])),
+        mock.patch.object(ptp_capture.signal, "signal", return_value=None),
+        mock.patch.object(ptp_capture.time, "sleep", return_value=None),
+    ):
+        try:
+            ptp_capture.main()
+        except SystemExit as exc:
+            assert exc.code == 1
+        else:
+            raise AssertionError("Expected SystemExit(1) when split capture exits early")
+
+    manifests = list(tmp_path.glob("capture_manifest_*.json"))
+    assert len(manifests) == 1
+    manifest = json.loads(manifests[0].read_text(encoding="utf-8"))
+    assert manifest["completed_successfully"] is False
+    assert manifest["capture_exit_code"] == 1
+    assert "before stop was requested" in manifest["capture_error"]
