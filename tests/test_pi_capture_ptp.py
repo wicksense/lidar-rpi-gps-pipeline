@@ -52,6 +52,35 @@ def test_build_gps_logger_supports_bridge_mode(tmp_path):
     assert isinstance(logger, ptp_capture.BridgeGpsLogger)
 
 
+def test_find_split_capture_artifacts_orders_rotated_pcaps_and_metadata(tmp_path):
+    base_pcap = tmp_path / "raw_lidar_20260622_143901_chunk0000.pcap"
+    split_pcap = tmp_path / "raw_lidar_20260622_143901_chunk0000-1.pcap"
+    split_pcap_2 = tmp_path / "raw_lidar_20260622_143901_chunk0000-2.pcap"
+    metadata = tmp_path / "raw_lidar_20260622_143901_chunk0000_0.json"
+
+    for path in (base_pcap, split_pcap, split_pcap_2):
+        path.write_bytes(b"")
+    metadata.write_text("{}", encoding="utf-8")
+
+    artifacts = ptp_capture.find_split_capture_artifacts(str(base_pcap))
+
+    assert artifacts["pcap_files"] == [str(base_pcap), str(split_pcap), str(split_pcap_2)]
+    assert artifacts["metadata_files"] == [str(metadata)]
+
+
+def test_ensure_split_metadata_sidecars_copies_base_metadata_for_rotated_pcap(tmp_path):
+    split_pcap = tmp_path / "raw_lidar_20260622_143901_chunk0000-1.pcap"
+    metadata = tmp_path / "raw_lidar_20260622_143901_chunk0000_0.json"
+    split_pcap.write_bytes(b"")
+    metadata.write_text('{"sensor":"os1"}', encoding="utf-8")
+
+    aliases = ptp_capture.ensure_split_metadata_sidecars(str(split_pcap), [str(metadata)])
+
+    expected_alias = tmp_path / "raw_lidar_20260622_143901_chunk0000-1_0.json"
+    assert aliases == [str(expected_alias)]
+    assert expected_alias.read_text(encoding="utf-8") == '{"sensor":"os1"}'
+
+
 def test_bridge_gps_logger_writes_fix_from_json(tmp_path):
     fix_path = tmp_path / "latest_fix.json"
     fix_path.write_text(

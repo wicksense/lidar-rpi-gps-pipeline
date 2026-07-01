@@ -37,6 +37,7 @@ import math
 import os
 import re
 import signal
+import shutil
 import socket
 import subprocess
 import threading
@@ -71,6 +72,7 @@ OUSTER_TIMESTAMP_MODE: Optional[str] = "TIME_FROM_PTP_1588"
 OUSTER_PTP_PROFILE: Optional[str] = "default"
 SENSOR_CONFIG_SETTLE_SEC = 10
 CAPTURE_DURATION_SEC = 30
+CAPTURE_SPLIT_SIZE_MB = 320
 CONTINUOUS_CHUNKS = True
 WAIT_FOR_GPS_FIX_BEFORE_CAPTURE = True
 WAIT_FOR_PI_CLOCK_SYNC_BEFORE_CAPTURE = True
@@ -1383,12 +1385,72 @@ def find_chunk_files(requested_output_path: str) -> list[str]:
     return sorted([path for path in glob.glob(stem + "*") if os.path.isfile(path)])
 
 
+def split_capture_file_index(requested_output_path: str, candidate_path: str) -> Optional[int]:
+    """Return the split index for a save_raw pcap file, or None if unrelated."""
+    requested_name = os.path.basename(requested_output_path)
+    candidate_name = os.path.basename(candidate_path)
+    requested_stem, requested_ext = os.path.splitext(requested_name)
+    candidate_stem, candidate_ext = os.path.splitext(candidate_name)
+    if candidate_ext.lower() != requested_ext.lower():
+        return None
+    if candidate_name == requested_name:
+        return 0
+    match = re.fullmatch(re.escape(requested_stem) + r"-(\d+)", candidate_stem)
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def find_split_capture_artifacts(requested_output_path: str) -> dict[str, list[str]]:
+    """Find rolling save_raw output files for a capture family."""
+    stem = os.path.splitext(requested_output_path)[0]
+    artifacts = [path for path in glob.glob(stem + "*") if os.path.isfile(path)]
+    pcap_files: list[tuple[int, str]] = []
+    metadata_files: list[str] = []
+    base_name = os.path.basename(requested_output_path)
+    base_stem, _base_ext = os.path.splitext(base_name)
+    metadata_pattern = re.compile(re.escape(base_stem) + r"_\d+\.json$")
+    for path in artifacts:
+        split_index = split_capture_file_index(requested_output_path, path)
+        if split_index is not None:
+            pcap_files.append((split_index, path))
+            continue
+        if metadata_pattern.fullmatch(os.path.basename(path)):
+            metadata_files.append(path)
+    pcap_files.sort(key=lambda item: item[0])
+    metadata_files.sort()
+    return {
+        "pcap_files": [path for _index, path in pcap_files],
+        "metadata_files": metadata_files,
+        "all_files": sorted({path for _index, path in pcap_files} | set(metadata_files)),
+    }
+
+
+def ensure_split_metadata_sidecars(pcap_path: str, metadata_files: list[str]) -> list[str]:
+    """Copy base metadata sidecars so rotated split pcaps remain self-describing."""
+    chunk_base = os.path.splitext(pcap_path)[0]
+    created_or_existing: list[str] = []
+    for meta_path in metadata_files:
+        match = re.search(r"_(\d+)\.json$", os.path.basename(meta_path))
+        suffix = match.group(1) if match else "0"
+        alias_path = f"{chunk_base}_{suffix}.json"
+        if alias_path == meta_path:
+            created_or_existing.append(alias_path)
+            continue
+        if not os.path.exists(alias_path):
+            shutil.copyfile(meta_path, alias_path)
+        created_or_existing.append(alias_path)
+    return created_or_existing
+
+
 def run_ouster_capture(
     host: str,
     seconds: int,
     requested_output_path: str,
     stop_event: threading.Event,
     output_mode: str,
+    *,
+    split_size_mb: Optional[int] = None,
 ) -> int:
     """Start one ouster-cli capture and return the process exit code."""
     if output_mode == "csv":
@@ -1411,6 +1473,10 @@ def run_ouster_capture(
                 requested_output_path,
             ),
         ]
+        if split_size_mb is not None:
+            cmd.extend(["--split", str(split_size_mb)])
+        elif seconds > 0:
+            cmd.extend(["-D", str(seconds)])
     else:
         raise ValueError(f"Unsupported LIDAR_OUTPUT_MODE: {output_mode}")
 
@@ -1433,7 +1499,6 @@ def run_ouster_capture(
     t_out.start()
     t_err.start()
 
-    deadline = time.time() + seconds
     sent_sigint = False
     while proc.poll() is None:
         if stop_event.is_set():
@@ -1441,11 +1506,6 @@ def run_ouster_capture(
                 proc.send_signal(signal.SIGINT)
                 sent_sigint = True
             time.sleep(0.2)
-            continue
-
-        if output_mode == "pcap_raw" and time.time() >= deadline and not sent_sigint:
-            proc.send_signal(signal.SIGINT)
-            sent_sigint = True
             continue
 
         time.sleep(0.2)
@@ -1456,6 +1516,147 @@ def run_ouster_capture(
     return_code = proc.wait()
     log(f"ouster-cli exited with code {return_code}")
     return return_code
+
+
+def run_ouster_split_capture(
+    host: str,
+    requested_output_path: str,
+    stop_event: threading.Event,
+    *,
+    split_size_mb: int,
+    lidar_mode: Optional[str],
+    timestamp_mode: Optional[str],
+    ptp_profile: Optional[str],
+) -> tuple[int, list[dict[str, Any]]]:
+    """Run one rolling save_raw process and surface each split pcap as a chunk."""
+    cmd = [
+        *ouster_cli_command(
+            "source",
+            host,
+            "save_raw",
+            requested_output_path,
+        ),
+        "--split",
+        str(split_size_mb),
+    ]
+
+    log("Starting ouster capture:")
+    log("  " + " ".join(cmd))
+
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    discovered_pcaps: set[str] = set()
+    discovered_metadata: set[str] = set()
+    chunk_by_path: dict[str, dict[str, Any]] = {}
+    chunks: list[dict[str, Any]] = []
+    active_chunk_path: Optional[str] = None
+
+    def stream(pipe: Any, label: str) -> None:
+        for line in iter(pipe.readline, ""):
+            if stop_event.is_set():
+                break
+            text = line.strip()
+            if text:
+                log(f"[ouster {label}] {text}")
+        pipe.close()
+
+    def discover_outputs() -> None:
+        nonlocal active_chunk_path
+        artifacts = find_split_capture_artifacts(requested_output_path)
+        if artifacts["metadata_files"] and chunks:
+            first_chunk = chunks[0]
+            for meta_path in artifacts["metadata_files"]:
+                if meta_path in discovered_metadata:
+                    continue
+                discovered_metadata.add(meta_path)
+                if meta_path not in first_chunk["produced_files"]:
+                    first_chunk["produced_files"].append(meta_path)
+            for chunk in chunks[1:]:
+                for alias_path in ensure_split_metadata_sidecars(chunk["lidar_pcap_path"], artifacts["metadata_files"]):
+                    if alias_path not in chunk["produced_files"]:
+                        chunk["produced_files"].append(alias_path)
+
+        for pcap_path in artifacts["pcap_files"]:
+            if pcap_path in discovered_pcaps:
+                continue
+            split_index = split_capture_file_index(requested_output_path, pcap_path)
+            if split_index is None:
+                continue
+
+            now_iso = dt.datetime.now(dt.timezone.utc).isoformat()
+            now_ns = time.time_ns()
+            if active_chunk_path is not None:
+                previous_chunk = chunk_by_path[active_chunk_path]
+                previous_chunk["capture_end_iso_utc"] = now_iso
+                previous_chunk["capture_end_ns"] = now_ns
+                previous_chunk["duration_sec"] = max(
+                    0.0,
+                    (previous_chunk["capture_end_ns"] - previous_chunk["capture_start_ns"]) / 1e9,
+                )
+
+            chunk_record = {
+                "chunk_index": split_index,
+                "capture_start_iso_utc": now_iso,
+                "capture_end_iso_utc": now_iso,
+                "capture_start_ns": now_ns,
+                "capture_end_ns": now_ns,
+                "duration_sec": 0.0,
+                "ouster_exit_code": None,
+                "lidar_output_mode": LIDAR_OUTPUT_MODE,
+                "lidar_mode": lidar_mode,
+                "ouster_timestamp_mode": timestamp_mode,
+                "ouster_ptp_profile": ptp_profile,
+                "requested_output_path": pcap_path,
+                "produced_files": [pcap_path],
+                "split_size_mb": split_size_mb,
+                "chunking_strategy": "save_raw_split",
+            }
+            if split_index == 0:
+                for meta_path in artifacts["metadata_files"]:
+                    if meta_path not in chunk_record["produced_files"]:
+                        chunk_record["produced_files"].append(meta_path)
+                        discovered_metadata.add(meta_path)
+            else:
+                for alias_path in ensure_split_metadata_sidecars(pcap_path, artifacts["metadata_files"]):
+                    if alias_path not in chunk_record["produced_files"]:
+                        chunk_record["produced_files"].append(alias_path)
+
+            chunk_record["lidar_pcap_path"] = pcap_path
+            chunks.append(chunk_record)
+            chunk_by_path[pcap_path] = chunk_record
+            discovered_pcaps.add(pcap_path)
+            active_chunk_path = pcap_path
+            log(f"Starting chunk {split_index}: {pcap_path}")
+
+    t_out = threading.Thread(target=stream, args=(proc.stdout, "out"), daemon=True)
+    t_err = threading.Thread(target=stream, args=(proc.stderr, "err"), daemon=True)
+    t_out.start()
+    t_err.start()
+
+    sent_sigint = False
+    while proc.poll() is None:
+        discover_outputs()
+        if stop_event.is_set() and not sent_sigint:
+            proc.send_signal(signal.SIGINT)
+            sent_sigint = True
+        time.sleep(0.2)
+
+    discover_outputs()
+    return_code = proc.wait()
+    final_end_iso = dt.datetime.now(dt.timezone.utc).isoformat()
+    final_end_ns = time.time_ns()
+    if active_chunk_path is not None:
+        final_chunk = chunk_by_path[active_chunk_path]
+        final_chunk["capture_end_iso_utc"] = final_end_iso
+        final_chunk["capture_end_ns"] = final_end_ns
+        final_chunk["duration_sec"] = max(
+            0.0,
+            (final_chunk["capture_end_ns"] - final_chunk["capture_start_ns"]) / 1e9,
+        )
+    for index, chunk in enumerate(chunks):
+        chunk["ouster_exit_code"] = return_code if index == len(chunks) - 1 else 0
+
+    log(f"ouster-cli exited with code {return_code}")
+    return return_code, chunks
 
 
 def build_abort_manifest(
@@ -1497,6 +1698,7 @@ def build_abort_manifest(
         "ouster_timestamp_mode": timestamp_mode,
         "ouster_ptp_profile": ptp_profile,
         "chunk_duration_sec": CAPTURE_DURATION_SEC,
+        "chunk_split_size_mb": CAPTURE_SPLIT_SIZE_MB if LIDAR_OUTPUT_MODE == "pcap_raw" else None,
         "continuous_chunks": CONTINUOUS_CHUNKS,
         "wait_for_gps_fix_before_capture": wait_for_gps_fix,
         "wait_for_pi_clock_sync_before_capture": wait_for_pi_clock_sync,
@@ -1775,74 +1977,91 @@ def main() -> None:
 
     run_start_iso = dt.datetime.now(dt.timezone.utc).isoformat()
     run_start_ns = time.time_ns()
-    chunk_index = 0
 
     if CONTINUOUS_CHUNKS:
         log("Capture mode: continuous chunks. Press Ctrl+C to stop.")
     else:
         log("Capture mode: single chunk.")
 
-    while not stop_event.is_set():
-        chunk_stem = f"raw_lidar_{session_id}_chunk{chunk_index:04d}"
-        ext = ".pcap" if LIDAR_OUTPUT_MODE == "pcap_raw" else ".csv"
-        requested_output_path = os.path.join(OUTPUT_DIR, chunk_stem + ext)
-
-        existing_files = set(find_chunk_files(requested_output_path))
-        chunk_start_iso = dt.datetime.now(dt.timezone.utc).isoformat()
-        chunk_start_ns = time.time_ns()
-
-        log(f"Starting chunk {chunk_index}: {requested_output_path}")
-        rc = run_ouster_capture(
+    if LIDAR_OUTPUT_MODE == "pcap_raw" and CONTINUOUS_CHUNKS:
+        requested_output_path = os.path.join(OUTPUT_DIR, f"raw_lidar_{session_id}_chunk0000.pcap")
+        log(
+            "Using one continuous raw capture process with rolling split files "
+            f"(~{CAPTURE_SPLIT_SIZE_MB} MB each)."
+        )
+        _rc, split_chunks = run_ouster_split_capture(
             host=ouster_host,
-            seconds=CAPTURE_DURATION_SEC,
             requested_output_path=requested_output_path,
             stop_event=stop_event,
-            output_mode=LIDAR_OUTPUT_MODE,
+            split_size_mb=CAPTURE_SPLIT_SIZE_MB,
+            lidar_mode=lidar_mode,
+            timestamp_mode=timestamp_mode,
+            ptp_profile=ptp_profile,
         )
+        chunks.extend(split_chunks)
+    else:
+        chunk_index = 0
+        while not stop_event.is_set():
+            chunk_stem = f"raw_lidar_{session_id}_chunk{chunk_index:04d}"
+            ext = ".pcap" if LIDAR_OUTPUT_MODE == "pcap_raw" else ".csv"
+            requested_output_path = os.path.join(OUTPUT_DIR, chunk_stem + ext)
 
-        chunk_end_ns = time.time_ns()
-        chunk_end_iso = dt.datetime.now(dt.timezone.utc).isoformat()
-        generated_files = sorted(set(find_chunk_files(requested_output_path)) - existing_files)
+            existing_files = set(find_chunk_files(requested_output_path))
+            chunk_start_iso = dt.datetime.now(dt.timezone.utc).isoformat()
+            chunk_start_ns = time.time_ns()
 
-        chunk_record = {
-            "chunk_index": chunk_index,
-            "capture_start_iso_utc": chunk_start_iso,
-            "capture_end_iso_utc": chunk_end_iso,
-            "capture_start_ns": chunk_start_ns,
-            "capture_end_ns": chunk_end_ns,
-            "duration_sec": CAPTURE_DURATION_SEC,
-            "ouster_exit_code": rc,
-            "lidar_output_mode": LIDAR_OUTPUT_MODE,
-            "lidar_mode": lidar_mode,
-            "ouster_timestamp_mode": timestamp_mode,
-            "ouster_ptp_profile": ptp_profile,
-            "requested_output_path": requested_output_path,
-            "produced_files": generated_files,
-        }
+            log(f"Starting chunk {chunk_index}: {requested_output_path}")
+            rc = run_ouster_capture(
+                host=ouster_host,
+                seconds=CAPTURE_DURATION_SEC,
+                requested_output_path=requested_output_path,
+                stop_event=stop_event,
+                output_mode=LIDAR_OUTPUT_MODE,
+            )
 
-        csv_candidates = [path for path in generated_files if path.lower().endswith(".csv")]
-        if csv_candidates:
-            chunk_record["lidar_csv_path"] = csv_candidates[0]
-        pcap_candidates = [path for path in generated_files if path.lower().endswith(".pcap")]
-        if pcap_candidates:
-            chunk_record["lidar_pcap_path"] = pcap_candidates[0]
+            chunk_end_ns = time.time_ns()
+            chunk_end_iso = dt.datetime.now(dt.timezone.utc).isoformat()
+            generated_files = sorted(set(find_chunk_files(requested_output_path)) - existing_files)
 
-        chunks.append(chunk_record)
+            chunk_record = {
+                "chunk_index": chunk_index,
+                "capture_start_iso_utc": chunk_start_iso,
+                "capture_end_iso_utc": chunk_end_iso,
+                "capture_start_ns": chunk_start_ns,
+                "capture_end_ns": chunk_end_ns,
+                "duration_sec": CAPTURE_DURATION_SEC,
+                "ouster_exit_code": rc,
+                "lidar_output_mode": LIDAR_OUTPUT_MODE,
+                "lidar_mode": lidar_mode,
+                "ouster_timestamp_mode": timestamp_mode,
+                "ouster_ptp_profile": ptp_profile,
+                "requested_output_path": requested_output_path,
+                "produced_files": generated_files,
+            }
 
-        if stop_event.is_set():
-            break
+            csv_candidates = [path for path in generated_files if path.lower().endswith(".csv")]
+            if csv_candidates:
+                chunk_record["lidar_csv_path"] = csv_candidates[0]
+            pcap_candidates = [path for path in generated_files if path.lower().endswith(".pcap")]
+            if pcap_candidates:
+                chunk_record["lidar_pcap_path"] = pcap_candidates[0]
 
-        if rc != 0:
-            if LIDAR_OUTPUT_MODE == "pcap_raw" and pcap_candidates:
-                log(f"Chunk ended (exit code {rc}) after timed stop. Continuing...")
-            else:
-                log(f"Stopping capture loop because ouster-cli returned non-zero exit code: {rc}")
+            chunks.append(chunk_record)
+
+            if stop_event.is_set():
                 break
 
-        if not CONTINUOUS_CHUNKS:
-            break
+            if rc != 0:
+                if LIDAR_OUTPUT_MODE == "pcap_raw" and pcap_candidates:
+                    log(f"Chunk ended (exit code {rc}) after timed stop. Continuing...")
+                else:
+                    log(f"Stopping capture loop because ouster-cli returned non-zero exit code: {rc}")
+                    break
 
-        chunk_index += 1
+            if not CONTINUOUS_CHUNKS:
+                break
+
+            chunk_index += 1
 
     run_end_ns = time.time_ns()
     run_end_iso = dt.datetime.now(dt.timezone.utc).isoformat()
@@ -1864,6 +2083,7 @@ def main() -> None:
         "ouster_timestamp_mode": timestamp_mode,
         "ouster_ptp_profile": ptp_profile,
         "chunk_duration_sec": CAPTURE_DURATION_SEC,
+        "chunk_split_size_mb": CAPTURE_SPLIT_SIZE_MB if LIDAR_OUTPUT_MODE == "pcap_raw" else None,
         "continuous_chunks": CONTINUOUS_CHUNKS,
         "wait_for_gps_fix_before_capture": require_gps_fix,
         "wait_for_pi_clock_sync_before_capture": require_pi_clock_sync,
