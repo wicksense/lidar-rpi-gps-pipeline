@@ -124,6 +124,12 @@ class _BaseModeWidget(QWidget):
 
         self.slam_deskew = QComboBox()
         self.slam_deskew.addItems(["auto", "none", "constant_velocity", "imu_deskew"])
+        self.slam_deskew.setToolTip(
+            "auto: try IMU deskew, otherwise fall back to constant velocity.\n"
+            "imu_deskew: best default for moving captures when IMU timing is healthy.\n"
+            "constant_velocity: good fallback when IMU deskew is unavailable.\n"
+            "none: only for near-static captures or debugging."
+        )
         slam_row.addWidget(QLabel("Deskew"))
         slam_row.addWidget(self.slam_deskew)
 

@@ -452,6 +452,29 @@ def _is_raw_lidar_path(path: str) -> bool:
     return lower.endswith(".pcap") or lower.endswith(".osf")
 
 
+def _raw_lidar_path_sort_key(path: str) -> Tuple[str, int, int, str]:
+    """
+    Sort split raw captures in chronological chunk order.
+
+    Example desired order:
+    - raw_lidar_<session>_chunk0000.pcap
+    - raw_lidar_<session>_chunk0000-1.pcap
+    - raw_lidar_<session>_chunk0000-2.pcap
+    """
+    parent = os.path.dirname(path)
+    base = os.path.basename(path)
+    match = re.search(r"(.*_chunk)(\d+)(?:-(\d+))?(\.[^.]+)$", base)
+    if not match:
+        return (parent, 10**9, 10**9, base)
+
+    chunk_index = int(match.group(2))
+    split_index = -1 if match.group(3) is None else int(match.group(3))
+    prefix = match.group(1)
+    suffix = match.group(4)
+    normalized_base = f"{prefix}{chunk_index:04d}{suffix}"
+    return (parent, chunk_index, split_index, normalized_base)
+
+
 def _extract_session_id_from_gps_csv_path(gps_csv: str) -> Optional[str]:
     """
     Infer session id from a GPS CSV filename.
@@ -509,14 +532,14 @@ def expand_raw_lidar_inputs(raw_inputs: List[str]) -> List[str]:
 
     for item in raw_inputs:
         if os.path.isdir(item):
-            for name in sorted(os.listdir(item)):
+            for name in sorted(os.listdir(item), key=_raw_lidar_path_sort_key):
                 path = os.path.join(item, name)
                 if os.path.isfile(path) and _is_raw_lidar_path(path):
                     expanded.append(path)
             continue
 
         if any(ch in item for ch in "*?[]"):
-            for path in sorted(glob.glob(item)):
+            for path in sorted(glob.glob(item), key=_raw_lidar_path_sort_key):
                 if os.path.isfile(path) and _is_raw_lidar_path(path):
                     expanded.append(path)
             continue
@@ -615,48 +638,50 @@ def _extract_first_sensor_info(source: Any) -> Any:
     raise ValueError("Could not obtain sensor metadata from source.")
 
 
-def _extract_first_scan(item: Any) -> Any:
-    if item is None:
-        return None
-
-    if (
+def _is_scan_like(item: Any) -> bool:
+    return bool(
         hasattr(item, "fields")
         and hasattr(item, "field")
         and hasattr(item, "h")
         and hasattr(item, "w")
         and hasattr(item, "timestamp")
-    ):
-        return item
+    )
+
+
+def _iter_scans(item: Any) -> Iterable[Any]:
+    if item is None:
+        return
+
+    if _is_scan_like(item):
+        yield item
+        return
 
     if isinstance(item, (list, tuple)):
         for candidate in item:
-            if candidate is None:
-                continue
-            if (
-                hasattr(candidate, "fields")
-                and hasattr(candidate, "field")
-                and hasattr(candidate, "h")
-                and hasattr(candidate, "w")
-                and hasattr(candidate, "timestamp")
-            ):
-                return candidate
+            if candidate is not None and _is_scan_like(candidate):
+                yield candidate
+        return
 
     if hasattr(item, "__iter__"):
         try:
             for candidate in item:
-                if candidate is None:
-                    continue
-                if (
-                    hasattr(candidate, "fields")
-                    and hasattr(candidate, "field")
-                    and hasattr(candidate, "h")
-                    and hasattr(candidate, "w")
-                    and hasattr(candidate, "timestamp")
-                ):
-                    return candidate
+                if candidate is not None and _is_scan_like(candidate):
+                    yield candidate
         except Exception:
-            return None
-    return None
+            return
+
+
+def _extract_first_scan(item: Any) -> Any:
+    return next(_iter_scans(item), None)
+
+
+def _scan_valid_timestamp_count(scan: Any) -> int:
+    timestamps = np.asarray(scan.timestamp, dtype=np.int64)
+    return int(np.count_nonzero(timestamps > 0))
+
+
+def _updated_has_any_valid_timestamps(item: Any) -> bool:
+    return any(_scan_valid_timestamp_count(scan) > 0 for scan in _iter_scans(item))
 
 
 def _scan_has_range_field(scan: Any, ChanField: Any) -> bool:
@@ -1532,6 +1557,7 @@ def slam_raw_to_single_las(
     slam_engine = None
     total_scans = 0
     osf_writer = None
+    skipped_osf_updates = 0
 
     try:
         for file_idx, raw_path in enumerate(raw_paths, start=1):
@@ -1575,8 +1601,10 @@ def slam_raw_to_single_las(
                     _check_cancel(should_cancel)
                     assert slam_engine is not None
                     updated = slam_engine.update(scans)
-                    if osf_writer is not None:
+                    if osf_writer is not None and _updated_has_any_valid_timestamps(updated):
                         osf_writer.save(updated)
+                    elif osf_writer is not None:
+                        skipped_osf_updates += 1
                     total_scans += 1
 
                     if scan_idx % 10 == 0:
@@ -1604,6 +1632,16 @@ def slam_raw_to_single_las(
 
         if slam_engine is None or total_scans == 0:
             raise ValueError("No scans processed for SLAM map generation.")
+
+        if skipped_osf_updates > 0:
+            _emit(
+                emit_event,
+                "status",
+                message=(
+                    f"Skipped {skipped_osf_updates} scan updates with no valid "
+                    "timestamps while writing OSF."
+                ),
+            )
 
         if osf_writer is not None:
             osf_writer.close()
@@ -1711,6 +1749,7 @@ def slam_raw_to_gps_anchored_las(
     traj_timestamps: List[int] = []
     traj_xyz_local: List[np.ndarray] = []
     osf_writer = None
+    skipped_osf_updates = 0
 
     try:
         for file_idx, raw_path in enumerate(raw_paths, start=1):
@@ -1754,8 +1793,10 @@ def slam_raw_to_gps_anchored_las(
                     _check_cancel(should_cancel)
                     assert slam_engine is not None
                     updated = slam_engine.update(scans)
-                    if osf_writer is not None:
+                    if osf_writer is not None and _updated_has_any_valid_timestamps(updated):
                         osf_writer.save(updated)
+                    elif osf_writer is not None:
+                        skipped_osf_updates += 1
                     scan = _extract_first_scan(updated)
                     if scan is not None:
                         try:
@@ -1793,6 +1834,16 @@ def slam_raw_to_gps_anchored_las(
             raise ValueError("No scans processed for SLAM map generation.")
         if len(traj_timestamps) < 2:
             raise ValueError("Not enough SLAM trajectory samples to anchor map to GPS.")
+
+        if skipped_osf_updates > 0:
+            _emit(
+                emit_event,
+                "status",
+                message=(
+                    f"Skipped {skipped_osf_updates} scan updates with no valid "
+                    "timestamps while writing OSF."
+                ),
+            )
 
         if osf_writer is not None:
             osf_writer.close()
@@ -2020,6 +2071,7 @@ def slam_raw_to_gps_anchored_las_pose_optimizer(
     chosen_time_mode = "auto"
     final_cost = None
     writer = None
+    skipped_osf_updates = 0
 
     try:
         for file_idx, raw_path in enumerate(raw_paths, start=1):
@@ -2063,7 +2115,10 @@ def slam_raw_to_gps_anchored_las_pose_optimizer(
                     assert slam_engine is not None
                     updated = slam_engine.update(scans)
                     assert writer is not None
-                    writer.save(updated)
+                    if _updated_has_any_valid_timestamps(updated):
+                        writer.save(updated)
+                    else:
+                        skipped_osf_updates += 1
                     total_scans += 1
 
                     if scan_idx % 10 == 0:
@@ -2095,6 +2150,16 @@ def slam_raw_to_gps_anchored_las_pose_optimizer(
 
         if total_scans == 0:
             raise ValueError("No scans processed for SLAM map generation.")
+
+        if skipped_osf_updates > 0:
+            _emit(
+                emit_event,
+                "status",
+                message=(
+                    f"Skipped {skipped_osf_updates} scan updates with no valid "
+                    "timestamps while building pose-optimizer OSF."
+                ),
+            )
 
         _emit(emit_event, "status", message="Running pose optimization with GPS constraints...")
 

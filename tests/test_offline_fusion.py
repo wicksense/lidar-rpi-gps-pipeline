@@ -18,8 +18,11 @@ from lidar_rpi_gps_pipeline.jobs.offline_fusion import (
     _extract_session_id_from_gps_csv_path,
     _filter_raw_paths_by_session,
     _lookup_pose_columns,
+    _scan_valid_timestamp_count,
     _trim_query_to_gps_range,
+    _updated_has_any_valid_timestamps,
     choose_time_mode,
+    expand_raw_lidar_inputs,
     filter_gps_outliers_by_speed,
     load_gps_for_interpolation,
     preferred_gps_time_column_from_manifest,
@@ -213,6 +216,63 @@ def test_filter_raw_paths_by_session_raises_when_no_match() -> None:
     raw_paths = ["/data/raw_lidar_20260317_093703_chunk0000.pcap"]
     with pytest.raises(ValueError, match="No raw LiDAR files matched session filter"):
         _filter_raw_paths_by_session(raw_paths, "20260317_094022")
+
+
+def test_expand_raw_lidar_inputs_directory_sorts_split_chunks_chronologically(tmp_path: Path) -> None:
+    names = [
+        "raw_lidar_20260701_191429_chunk0000-2.pcap",
+        "raw_lidar_20260701_191429_chunk0000-1.pcap",
+        "raw_lidar_20260701_191429_chunk0000.pcap",
+    ]
+    for name in names:
+        (tmp_path / name).write_bytes(b"")
+
+    expanded = expand_raw_lidar_inputs([str(tmp_path)])
+
+    assert expanded == [
+        str(tmp_path / "raw_lidar_20260701_191429_chunk0000.pcap"),
+        str(tmp_path / "raw_lidar_20260701_191429_chunk0000-1.pcap"),
+        str(tmp_path / "raw_lidar_20260701_191429_chunk0000-2.pcap"),
+    ]
+
+
+def test_expand_raw_lidar_inputs_glob_sorts_split_chunks_chronologically(tmp_path: Path) -> None:
+    names = [
+        "raw_lidar_20260701_191429_chunk0000-2.pcap",
+        "raw_lidar_20260701_191429_chunk0000-1.pcap",
+        "raw_lidar_20260701_191429_chunk0000.pcap",
+    ]
+    for name in names:
+        (tmp_path / name).write_bytes(b"")
+
+    expanded = expand_raw_lidar_inputs([str(tmp_path / "*.pcap")])
+
+    assert expanded == [
+        str(tmp_path / "raw_lidar_20260701_191429_chunk0000.pcap"),
+        str(tmp_path / "raw_lidar_20260701_191429_chunk0000-1.pcap"),
+        str(tmp_path / "raw_lidar_20260701_191429_chunk0000-2.pcap"),
+    ]
+
+
+class _FakeScan:
+    def __init__(self, timestamps: list[int]) -> None:
+        self.timestamp = timestamps
+        self.fields = []
+        self.h = 1
+        self.w = len(timestamps)
+
+    def field(self, _name: str) -> None:
+        raise KeyError
+
+
+def test_scan_valid_timestamp_count_counts_positive_entries() -> None:
+    scan = _FakeScan([0, 10, 20, 0, -1])
+    assert _scan_valid_timestamp_count(scan) == 2
+
+
+def test_updated_has_any_valid_timestamps_ignores_empty_scans() -> None:
+    assert _updated_has_any_valid_timestamps([_FakeScan([0, 0]), _FakeScan([0, 5, 0])]) is True
+    assert _updated_has_any_valid_timestamps([_FakeScan([0, 0])]) is False
 
 
 def test_preferred_gps_time_column_from_manifest_prefers_pi_time_for_ptp_architecture() -> None:

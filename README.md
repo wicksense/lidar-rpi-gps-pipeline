@@ -791,6 +791,25 @@ Guidance:
 - `--save-osf` save OSF playback file for SLAM modes
 - `--output-osf` explicit OSF path (optional)
 
+Deskew mode guidance:
+
+- `auto`:
+  recommended default. In the Ouster SDK version used by this project, `auto` tries IMU-based deskew first and falls back to `constant_velocity` if the required synchronous IMU data is not available.
+- `imu_deskew`:
+  uses the sensor IMU to estimate motion during each scan and correct point timing within the scan. This is usually the best choice for moving captures when IMU timing/data is healthy.
+- `constant_velocity`:
+  assumes the sensor moved with roughly constant velocity during the scan. This is a good fallback when `imu_deskew` is unavailable, unsupported, or behaves poorly on a given dataset.
+- `none`:
+  disables motion correction within each scan. Use this only for near-static captures, very slow tripod turns, or debugging. It is usually a bad choice for walking, driving, or push-cart captures.
+
+Practical recommendation for this pipeline:
+
+- For most mobile captures, start with `auto`.
+- If logs show the SDK is using `InertialIntegrationImuDeskewMethod`, then `auto` has selected IMU deskew.
+- If `auto` warns that synchronous IMU data is unavailable, it will fall back to `constant_velocity`.
+- If you are moving quickly or using `4096x5`, avoid `none`.
+- If a moving session looks smeared and `auto` is not using IMU deskew, try `constant_velocity` explicitly.
+
 ## Anchoring Options
 
 - `--anchor-min-motion-m` default `5.0` (below this, translation-only anchoring is used)
@@ -829,7 +848,10 @@ What each knob changes:
 - `--slam-max-range`:
   lower this in clutter/multipath environments to reduce unstable far returns.
 - `--slam-deskew-method`:
-  start with `auto`; use `constant_velocity` if motion distortion is visible and `auto` underperforms.
+  start with `auto`.
+  If `auto` resolves to IMU deskew, keep it unless results are clearly worse.
+  If `auto` cannot use IMU deskew, try `constant_velocity`.
+  Use `none` only for near-static captures or debugging.
 - `--poseopt-constraints-every-m`:
   lower value = more GPS constraints (more correction, more sensitivity to noisy GPS);
   higher value = fewer constraints (smoother but less anchored).
