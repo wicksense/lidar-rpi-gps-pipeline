@@ -16,6 +16,7 @@ import argparse
 import collections
 import datetime as dt
 import json
+import math
 import os
 import re
 import signal
@@ -115,6 +116,12 @@ LOG_HISTORY_LIMIT = 500
 TIMING_HELPER_INSTALLED_PATH = "/usr/local/bin/pi_timing_helper.py"
 TIMING_HELPER_PATH = os.environ.get("PI_TIMING_HELPER_PATH", TIMING_HELPER_INSTALLED_PATH)
 TIMING_IFACE = os.environ.get("PI_TIMING_IFACE", "eth0")
+GPS_FIX_JSON_PATH = os.environ.get(
+    "PI_GPS_FIX_JSON_PATH",
+    getattr(ptp_capture, "BRIDGE_FIX_JSON_PATH", "/run/ublox_i2c_chrony_bridge/latest_fix.json"),
+)
+GPS_QUALITY_TARGET = int(os.environ.get("PI_GPS_QUALITY_TARGET", "2"))
+GPS_FIX_STALE_SEC = float(os.environ.get("PI_GPS_FIX_STALE_SEC", "5"))
 
 DEFAULT_UI_CONFIG = {
     "capture_mode": "ptp",
@@ -397,6 +404,184 @@ def build_wifi_status_snapshot() -> dict[str, Any]:
         }
 
 
+def _safe_float_or_none(value: Any) -> Optional[float]:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number):
+        return None
+    return number
+
+
+def _safe_int_or_none(value: Any) -> Optional[int]:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_iso8601(value: Any) -> Optional[dt.datetime]:
+    text = optional_text(value)
+    if not text:
+        return None
+    try:
+        return dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _format_age_seconds(age_sec: Optional[float]) -> str:
+    if age_sec is None:
+        return "-"
+    if age_sec < 1:
+        return "<1s ago"
+    if age_sec < 60:
+        return f"{int(round(age_sec))}s ago"
+    minutes = age_sec / 60.0
+    if minutes < 60:
+        return f"{minutes:.1f} min ago"
+    hours = minutes / 60.0
+    return f"{hours:.1f} hr ago"
+
+
+def _nmea_gps_quality_label(raw_quality: Optional[int]) -> str:
+    mapping = {
+        0: "No fix",
+        1: "GPS fix",
+        2: "Differential / SBAS",
+        3: "PPS fix",
+        4: "RTK Fixed",
+        5: "RTK Float",
+        6: "Dead reckoning",
+        7: "Manual input",
+        8: "Simulation",
+    }
+    if raw_quality is None:
+        return "Unknown"
+    return mapping.get(raw_quality, f"Quality {raw_quality}")
+
+
+def build_gps_quality_snapshot() -> dict[str, Any]:
+    snapshot: dict[str, Any] = {
+        "available": False,
+        "source": "bridge",
+        "fix_path": GPS_FIX_JSON_PATH,
+        "target_quality": GPS_QUALITY_TARGET,
+        "stale_after_sec": GPS_FIX_STALE_SEC,
+        "raw_value": None,
+        "raw_text": "-",
+        "label": "Unavailable",
+        "status": "unavailable",
+        "status_class": "bad",
+        "meets_target": False,
+        "current_fix_valid": False,
+        "stale": True,
+        "num_sats": None,
+        "num_sats_text": "-",
+        "hdop": None,
+        "hdop_text": "-",
+        "age_sec": None,
+        "age_text": "-",
+        "last_update_iso": None,
+        "summary": (
+            f"No GPS bridge fix is available yet. Target for capture is raw quality >= {GPS_QUALITY_TARGET}."
+        ),
+    }
+
+    if not os.path.exists(GPS_FIX_JSON_PATH):
+        return snapshot
+
+    try:
+        with open(GPS_FIX_JSON_PATH, "r", encoding="utf-8") as f_in:
+            fix = json.load(f_in)
+    except (OSError, json.JSONDecodeError) as exc:
+        snapshot["summary"] = (
+            f"Could not read GPS bridge fix data from {GPS_FIX_JSON_PATH}: {exc}"
+        )
+        return snapshot
+
+    snapshot["available"] = True
+    snapshot["source"] = str(fix.get("source") or "bridge")
+    snapshot["last_update_iso"] = optional_text(fix.get("pi_time_iso"))
+
+    raw_quality = _safe_int_or_none(fix.get("gps_quality"))
+    num_sats = _safe_int_or_none(fix.get("num_sats"))
+    hdop = _safe_float_or_none(fix.get("hdop"))
+    latitude = _safe_float_or_none(fix.get("latitude"))
+    longitude = _safe_float_or_none(fix.get("longitude"))
+
+    last_update_dt = _parse_iso8601(fix.get("pi_time_iso"))
+    if last_update_dt is not None:
+        now = dt.datetime.now(dt.timezone.utc)
+        age_sec = max(0.0, (now - last_update_dt.astimezone(dt.timezone.utc)).total_seconds())
+    else:
+        age_sec = None
+
+    stale = age_sec is None or age_sec > GPS_FIX_STALE_SEC
+    current_fix_valid = (
+        raw_quality is not None
+        and raw_quality > 0
+        and latitude is not None
+        and longitude is not None
+    )
+    meets_target = current_fix_valid and raw_quality >= GPS_QUALITY_TARGET and not stale
+
+    if not current_fix_valid:
+        status = "no_fix"
+        label = "No valid fix"
+        status_class = "bad"
+    elif stale:
+        status = "stale"
+        label = f"{_nmea_gps_quality_label(raw_quality)} (stale)"
+        status_class = "warn"
+    elif raw_quality >= GPS_QUALITY_TARGET:
+        status = "ready"
+        label = _nmea_gps_quality_label(raw_quality)
+        status_class = "ok"
+    else:
+        status = "below_target"
+        label = f"{_nmea_gps_quality_label(raw_quality)} (below target)"
+        status_class = "warn"
+
+    if current_fix_valid:
+        readiness_text = (
+            f"Meets target (q >= {GPS_QUALITY_TARGET})"
+            if meets_target
+            else f"Below target or stale (target q >= {GPS_QUALITY_TARGET})"
+        )
+    else:
+        readiness_text = f"No current valid fix yet (target q >= {GPS_QUALITY_TARGET})"
+
+    sat_text = str(num_sats) if num_sats is not None else "-"
+    hdop_text = f"{hdop:.1f}" if hdop is not None else "-"
+
+    snapshot.update(
+        {
+            "raw_value": raw_quality,
+            "raw_text": str(raw_quality) if raw_quality is not None else "-",
+            "label": label,
+            "status": status,
+            "status_class": status_class,
+            "meets_target": meets_target,
+            "current_fix_valid": current_fix_valid,
+            "stale": stale,
+            "num_sats": num_sats,
+            "num_sats_text": sat_text,
+            "hdop": hdop,
+            "hdop_text": hdop_text,
+            "age_sec": age_sec,
+            "age_text": _format_age_seconds(age_sec),
+            "summary": (
+                f"{readiness_text}. Source: {snapshot['source']}. "
+                f"Last update: {_format_age_seconds(age_sec)}. "
+                f"Sats: {sat_text}. HDOP: {hdop_text}."
+            ),
+        }
+    )
+    return snapshot
+
+
 def apply_log_line_updates(state: dict[str, Any], line: str) -> None:
     if "GPS fix acquired" in line:
         state["gps_fix_ready"] = True
@@ -603,7 +788,9 @@ class CaptureManager:
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
-            return self._snapshot_unlocked()
+            snapshot = self._snapshot_unlocked()
+        snapshot["gps_quality"] = build_gps_quality_snapshot()
+        return snapshot
 
     def logs_after(self, after_id: int) -> dict[str, Any]:
         with self._lock:
@@ -974,6 +1161,29 @@ HTML_TEMPLATE = """<!doctype html>
         </div>
 
         <div class="field full">
+          <label>GPS Quality</label>
+          <div class="status-grid">
+            <div class="status-card">
+              <strong>Quality</strong>
+              <div class="status-value" id="gps_quality_status">Loading…</div>
+            </div>
+            <div class="status-card">
+              <strong>Raw q</strong>
+              <div class="status-value" id="gps_quality_raw">-</div>
+            </div>
+            <div class="status-card">
+              <strong>Satellites</strong>
+              <div class="status-value" id="gps_quality_sats">-</div>
+            </div>
+            <div class="status-card">
+              <strong>HDOP</strong>
+              <div class="status-value" id="gps_quality_hdop">-</div>
+            </div>
+          </div>
+          <div class="subtle" id="gps_quality_summary">Target: raw quality >= 2. Loading…</div>
+        </div>
+
+        <div class="field full">
           <label>Latest GPS Log</label>
           <pre id="latest_gps_log">-</pre>
         </div>
@@ -1195,12 +1405,24 @@ HTML_TEMPLATE = """<!doctype html>
       badge.classList.remove("ok", "warn", "bad");
       if (state === true) {
         badge.classList.add("ok");
+      } else if (state === "bad") {
+        badge.classList.add("bad");
       } else if (state === false) {
         badge.classList.add("warn");
       } else {
         badge.classList.add("warn");
       }
       badge.lastElementChild.textContent = labelText;
+    }
+
+    function updateGpsQualityPanel(gps) {
+      const quality = gps || {};
+      document.getElementById("gps_quality_status").textContent = quality.label || "Unavailable";
+      document.getElementById("gps_quality_raw").textContent = quality.raw_text || "-";
+      document.getElementById("gps_quality_sats").textContent = quality.num_sats_text || "-";
+      document.getElementById("gps_quality_hdop").textContent = quality.hdop_text || "-";
+      document.getElementById("gps_quality_summary").textContent =
+        quality.summary || `Target: raw quality >= ${quality.target_quality || 2}.`;
     }
 
     async function startCapture() {
@@ -1259,7 +1481,15 @@ HTML_TEMPLATE = """<!doctype html>
         document.getElementById("manifest_path").textContent = data.manifest_path || "-";
         document.getElementById("latest_gps_log").textContent = data.latest_gps_log || "-";
 
-        setBadge("badge_gps", data.gps_fix_ready, "GPS fix");
+        const gps = data.gps_quality || {};
+        updateGpsQualityPanel(gps);
+        const gpsBadgeState = gps.meets_target === true
+          ? true
+          : (gps.current_fix_valid === true ? false : "bad");
+        const gpsBadgeLabel = gps.raw_value !== null && gps.raw_value !== undefined
+          ? `GPS q=${gps.raw_text}`
+          : "GPS fix";
+        setBadge("badge_gps", gpsBadgeState, gpsBadgeLabel);
         const ptpMode = document.getElementById("capture_mode").value === "ptp";
         setBadge("badge_clock", ptpMode ? data.pi_clock_sync_ready : null, ptpMode ? "Pi clock sync" : "Pi clock sync n/a");
         setBadge("badge_ptp", ptpMode ? data.ouster_ptp_lock_ready : null, ptpMode ? "Ouster PTP" : "Ouster PTP n/a");
@@ -1269,6 +1499,13 @@ HTML_TEMPLATE = """<!doctype html>
         }
       } catch (error) {
         setUiMessage(`Status refresh failed: ${error}`);
+        updateGpsQualityPanel({
+          label: "Error",
+          raw_text: "-",
+          num_sats_text: "-",
+          hdop_text: "-",
+          summary: `Could not refresh GPS quality: ${error}`
+        });
       } finally {
         refreshStatusInFlight = false;
       }
