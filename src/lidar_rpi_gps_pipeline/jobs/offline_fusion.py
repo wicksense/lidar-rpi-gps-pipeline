@@ -11,7 +11,7 @@ import re
 import shutil
 import tempfile
 from io import StringIO
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 import laspy
 import numpy as np
@@ -854,7 +854,7 @@ def _source_infos(source: Any) -> List[Any]:
     return [_extract_first_sensor_info(source)]
 
 
-def _open_ouster_source(raw_path: str) -> Tuple[Any, Any, Any, Any, Any]:
+def _open_ouster_source(raw_path: str) -> Tuple[Any, Any, Any, Any, Any, Any]:
     """
     Open a raw Ouster source and return (source, info, infos, XYZLut, ChanField, destagger).
     """
@@ -878,15 +878,32 @@ def _extract_scan_arrays(
     info: Any,
     ChanField: Any,
     destagger: Any,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Flatten one scan into (timestamp_ns, x_local, y_local, z_local, reflectivity).
+
+    All five arrays are masked by the same validity test, so they stay row-aligned.
+    Reflectivity is zero-filled when the sensor profile does not carry the field.
+    """
     range_img = _scan_get_range_field(scan, ChanField)
     timestamps = np.tile(np.asarray(scan.timestamp, dtype=np.int64), (scan.h, 1))
     xyz = xyzlut(range_img)
+
+    refl_img = None
+    if _scan_has_reflectivity_field(scan, ChanField):
+        try:
+            refl_img = np.asarray(
+                _scan_get_reflectivity_field(scan, ChanField), dtype=np.float64
+            )
+        except Exception:
+            refl_img = None
 
     try:
         range_img = destagger(info, range_img)
         timestamps = destagger(info, timestamps)
         xyz = destagger(info, xyz)
+        if refl_img is not None:
+            refl_img = destagger(info, refl_img)
     except Exception:
         pass
 
@@ -894,11 +911,21 @@ def _extract_scan_arrays(
     x_local = -xyz[:, :, 0].reshape(-1).astype(np.float64)
     y_local = -xyz[:, :, 1].reshape(-1).astype(np.float64)
     z_local = xyz[:, :, 2].reshape(-1).astype(np.float64)
+    if refl_img is not None:
+        reflectivity = np.asarray(refl_img, dtype=np.float64).reshape(-1)
+    else:
+        reflectivity = np.zeros(timestamp_ns.shape, dtype=np.float64)
 
     valid = np.isfinite(x_local) & np.isfinite(y_local) & np.isfinite(z_local)
     valid = valid & (range_img.reshape(-1) > 0)
 
-    return timestamp_ns[valid], x_local[valid], y_local[valid], z_local[valid]
+    return (
+        timestamp_ns[valid],
+        x_local[valid],
+        y_local[valid],
+        z_local[valid],
+        reflectivity[valid],
+    )
 
 
 def _write_debug_converted_csv(
@@ -933,6 +960,59 @@ def _new_las_header(
     if utm_epsg is not None:
         header.add_crs(CRS.from_epsg(utm_epsg))
     return header
+
+
+def _check_slam_map_coverage(
+    points_xy: np.ndarray,
+    traj_xy: np.ndarray,
+    *,
+    emit_event: EventEmitter,
+    context: str,
+    min_span_ratio: float = 0.9,
+) -> Dict[str, float]:
+    """
+    Warn when an extracted SLAM map covers far less ground than the trajectory.
+
+    `SlamEngine.get_point_cloud()` returns the SLAM backend's rolling local map,
+    which prunes older voxels as the sensor moves away. On long sessions that map
+    can end up covering only the tail of the route while the trajectory - and
+    therefore the QA report, which is computed from the trajectory - still spans the
+    whole session. Without this check the shortfall is completely silent.
+
+    A complete map should span at least as much ground as the trajectory, since the
+    sensor also sees sideways, so anything below `min_span_ratio` is reported.
+    """
+    report: Dict[str, float] = {}
+    if points_xy.size == 0 or traj_xy.shape[0] < 2:
+        return report
+
+    map_span = points_xy.max(axis=0) - points_xy.min(axis=0)
+    traj_span = traj_xy.max(axis=0) - traj_xy.min(axis=0)
+    ratios = [
+        float(map_span[i] / traj_span[i]) if traj_span[i] > 1.0 else float("inf")
+        for i in range(2)
+    ]
+    report = {
+        "map_span_x_m": float(map_span[0]),
+        "map_span_y_m": float(map_span[1]),
+        "trajectory_span_x_m": float(traj_span[0]),
+        "trajectory_span_y_m": float(traj_span[1]),
+        "map_to_trajectory_span_ratio": float(min(ratios)),
+    }
+
+    if min(ratios) < min_span_ratio:
+        message = (
+            f"{context}: extracted map spans {map_span[0]:.0f}x{map_span[1]:.0f} m but the "
+            f"trajectory spans {traj_span[0]:.0f}x{traj_span[1]:.0f} m. The SLAM backend only "
+            "retains a rolling local map, so earlier parts of the route are missing from the "
+            "point cloud even though the QA report (computed from the trajectory) still looks "
+            "complete. Use --processing-mode slam_gps_anchor with --anchor-backend "
+            "pose_optimizer for full-route coverage."
+        )
+        log(f"WARNING: {message}")
+        _emit(emit_event, "status", message=f"WARNING: {message}")
+
+    return report
 
 
 def _extract_scan_pose_sample(scan: Any) -> Tuple[int, np.ndarray]:
@@ -1146,9 +1226,13 @@ def _build_point_cloud_from_raw_with_poses(
     map_voxel_size: float,
     emit_event: EventEmitter,
     should_cancel: CancelChecker,
-) -> Tuple[np.ndarray, Dict[str, int]]:
+) -> Tuple[np.ndarray, np.ndarray, Dict[str, int]]:
     """
     Build a global point cloud by replaying raw scans and dewarping with optimized poses.
+
+    Returns (points, attributes, stats) where `attributes` is an Nx2 array holding
+    per-point capture time in unix seconds and sensor reflectivity, aligned row-wise
+    with `points`.
     """
     try:
         from ouster.sdk.core import ChanField, XYZLut, dewarp, voxel_downsample
@@ -1158,6 +1242,12 @@ def _build_point_cloud_from_raw_with_poses(
     downsample_size = float(map_voxel_size)
     points_accum = np.zeros((0, 3), dtype=np.float64)
     pending_batches: List[np.ndarray] = []
+    # Per-point attributes carried alongside XYZ: [capture time (unix seconds), reflectivity].
+    # Time is stored in seconds rather than nanoseconds because the attribute array is
+    # float64: epoch nanoseconds (~1.8e18) exceed the 2^53 range where float64 is exact,
+    # while epoch seconds keep sub-microsecond resolution.
+    attrs_accum = np.zeros((0, 2), dtype=np.float64)
+    pending_attrs: List[np.ndarray] = []
     scans_seen = 0
 
     lookup_stats = {
@@ -1172,20 +1262,24 @@ def _build_point_cloud_from_raw_with_poses(
     }
 
     def flush_batches() -> None:
-        nonlocal points_accum, pending_batches
+        nonlocal points_accum, attrs_accum, pending_batches, pending_attrs
         if not pending_batches:
             return
         merged = np.concatenate(pending_batches, axis=0)
+        merged_attrs = np.concatenate(pending_attrs, axis=0)
         pending_batches = []
-        if points_accum.size == 0:
+        pending_attrs = []
+        if points_accum.shape[0] == 0:
             points_accum = merged
+            attrs_accum = merged_attrs
         else:
             points_accum = np.concatenate([points_accum, merged], axis=0)
+            attrs_accum = np.concatenate([attrs_accum, merged_attrs], axis=0)
         if downsample_size > 0 and points_accum.shape[0] > 0:
-            points_accum, _ = voxel_downsample(
+            points_accum, attrs_accum = voxel_downsample(
                 downsample_size,
                 points_accum,
-                np.zeros((points_accum.shape[0], 0), dtype=np.float64),
+                attrs_accum,
             )
 
     for file_idx, raw_path in enumerate(raw_paths, start=1):
@@ -1215,8 +1309,9 @@ def _build_point_cloud_from_raw_with_poses(
                 ranges = _scan_get_range_field(scan, ChanField)
                 ranges_m = np.asarray(ranges, dtype=np.float64) * 0.001
 
+                scan_col_ts = np.asarray(scan.timestamp, dtype=np.int64)
                 pose_cols, pose_inlier_cols, stats = _lookup_pose_columns(
-                    np.asarray(scan.timestamp, dtype=np.int64),
+                    scan_col_ts,
                     pose_timestamps_ns,
                     column_poses,
                 )
@@ -1236,17 +1331,30 @@ def _build_point_cloud_from_raw_with_poses(
                     valid = valid & (ranges_m >= min_range)
                 if max_range > 0:
                     valid = valid & (ranges_m <= max_range)
+
+                # Reflectivity is read on every scan, not only when filtering, so that it
+                # can be carried into the exported LAS as the intensity field.
+                if _scan_has_reflectivity_field(scan, ChanField):
+                    refl = np.asarray(
+                        _scan_get_reflectivity_field(scan, ChanField), dtype=np.float64
+                    )
+                else:
+                    refl = np.zeros(np.shape(ranges), dtype=np.float64)
+                    lookup_stats["reflectivity_scans_missing_field"] += 1
+
                 if reflectivity_filter:
-                    if _scan_has_reflectivity_field(scan, ChanField):
-                        refl = np.asarray(_scan_get_reflectivity_field(scan, ChanField), dtype=np.float64)
-                        valid = valid & (refl >= float(min_reflectivity))
-                    else:
-                        lookup_stats["reflectivity_scans_missing_field"] += 1
+                    valid = valid & (refl >= float(min_reflectivity))
 
                 selected = points_global[valid]
                 if selected.size == 0:
                     continue
+                scan_ts_sec = (
+                    np.broadcast_to(scan_col_ts[np.newaxis, :], valid.shape)[valid] / 1e9
+                )
                 pending_batches.append(np.asarray(selected, dtype=np.float64))
+                pending_attrs.append(
+                    np.column_stack([scan_ts_sec, refl[valid]]).astype(np.float64)
+                )
 
                 if scan_idx % 20 == 0:
                     flush_batches()
@@ -1265,7 +1373,7 @@ def _build_point_cloud_from_raw_with_poses(
                 close_fn()
 
     flush_batches()
-    return points_accum, lookup_stats
+    return points_accum, attrs_accum, lookup_stats
 
 
 def fuse_raw_to_single_las(
@@ -1351,11 +1459,15 @@ def fuse_raw_to_single_las(
                     if not _scan_has_range_field(scan, ChanField):
                         continue
 
-                    timestamp_ns, x_local, y_local, z_local = _extract_scan_arrays(
+                    timestamp_ns, x_local, y_local, z_local, refl_local = _extract_scan_arrays(
                         scan, xyzlut, info, ChanField, destagger
                     )
                     if timestamp_ns.size == 0:
                         continue
+                    # Absolute capture time is tracked separately from `lidar_t`, which may be
+                    # rebased to zero in relative_start mode; the LAS gps_time field must stay
+                    # absolute.
+                    abs_ts_ns = timestamp_ns
 
                     if keep_converted and converted_csv_dir:
                         base = os.path.splitext(os.path.basename(raw_path))[0]
@@ -1395,6 +1507,8 @@ def fuse_raw_to_single_las(
                         x_local = x_local[in_range]
                         y_local = y_local[in_range]
                         z_local = z_local[in_range]
+                        refl_local = refl_local[in_range]
+                        abs_ts_ns = abs_ts_ns[in_range]
                     if lidar_t_trimmed.size == 0:
                         continue
 
@@ -1423,25 +1537,19 @@ def fuse_raw_to_single_las(
                         y_global = y_global[finite_global]
                         z_global = z_global[finite_global]
                         lidar_t_trimmed = lidar_t_trimmed[finite_global]
+                        refl_local = refl_local[finite_global]
+                        abs_ts_ns = abs_ts_ns[finite_global]
 
                     if reflectivity_filter:
                         if _scan_has_reflectivity_field(scan, ChanField):
-                            try:
-                                refl_img = _scan_get_reflectivity_field(scan, ChanField)
-                                try:
-                                    refl_img = destagger(info, refl_img)
-                                except Exception:
-                                    pass
-                                refl_flat = np.asarray(refl_img, dtype=np.float64).reshape(-1)[in_range]
-                                refl_flat = refl_flat[finite_global]
-                                refl_keep = refl_flat >= float(min_reflectivity)
-                                if not np.any(refl_keep):
-                                    continue
-                                x_global = x_global[refl_keep]
-                                y_global = y_global[refl_keep]
-                                z_global = z_global[refl_keep]
-                            except Exception:
-                                reflectivity_scans_missing_field += 1
+                            refl_keep = refl_local >= float(min_reflectivity)
+                            if not np.any(refl_keep):
+                                continue
+                            x_global = x_global[refl_keep]
+                            y_global = y_global[refl_keep]
+                            z_global = z_global[refl_keep]
+                            refl_local = refl_local[refl_keep]
+                            abs_ts_ns = abs_ts_ns[refl_keep]
                         else:
                             reflectivity_scans_missing_field += 1
 
@@ -1455,6 +1563,10 @@ def fuse_raw_to_single_las(
                     point_record.x = x_global
                     point_record.y = y_global
                     point_record.z = z_global
+                    # gps_time holds absolute capture time in unix seconds; intensity holds
+                    # sensor reflectivity (LAS stores it as uint16, sensor range is 0-255).
+                    point_record.gps_time = abs_ts_ns.astype(np.float64) / 1e9
+                    point_record.intensity = np.clip(refl_local, 0, 65535).astype(np.uint16)
                     writer.write_points(point_record)
 
                     total_points += len(x_global)
@@ -1558,6 +1670,7 @@ def slam_raw_to_single_las(
     total_scans = 0
     osf_writer = None
     skipped_osf_updates = 0
+    traj_xyz_local: List[np.ndarray] = []
 
     try:
         for file_idx, raw_path in enumerate(raw_paths, start=1):
@@ -1605,6 +1718,15 @@ def slam_raw_to_single_las(
                         osf_writer.save(updated)
                     elif osf_writer is not None:
                         skipped_osf_updates += 1
+                    # One pose sample per scan is enough to compare the trajectory extent
+                    # against the extracted map and detect a truncated local map.
+                    pose_scan = _extract_first_scan(updated)
+                    if pose_scan is not None:
+                        try:
+                            _ts, pose_xyz = _extract_scan_pose_sample(pose_scan)
+                            traj_xyz_local.append(pose_xyz)
+                        except Exception:
+                            pass
                     total_scans += 1
 
                     if scan_idx % 10 == 0:
@@ -1660,6 +1782,15 @@ def slam_raw_to_single_las(
         if points.ndim != 2 or points.shape[1] < 3:
             raise ValueError("Unexpected SLAM point cloud shape; expected Nx3 points.")
 
+        coverage = _check_slam_map_coverage(
+            points[:, :2],
+            np.asarray(traj_xyz_local, dtype=np.float64)[:, :2]
+            if traj_xyz_local
+            else np.zeros((0, 2), dtype=np.float64),
+            emit_event=emit_event,
+            context="slam_map",
+        )
+
         header = _new_las_header(None, points[:, 0].min(), points[:, 1].min(), points[:, 2].min())
         las = laspy.LasData(header)
         las.x = points[:, 0]
@@ -1681,6 +1812,7 @@ def slam_raw_to_single_las(
             "slam_max_range": float(max_range),
             "slam_deskew_method": deskew_method,
             "output_osf": output_osf,
+            **coverage,
         }
     except Exception:
         if osf_writer is not None:
@@ -1920,6 +2052,17 @@ def slam_raw_to_gps_anchored_las(
         points_local = np.asarray(points_local, dtype=np.float64)
         if points_local.ndim != 2 or points_local.shape[1] < 3:
             raise ValueError("Unexpected SLAM point cloud shape; expected Nx3 points.")
+
+        # traj_xyz is in the same SLAM-local frame as points_local at this stage.
+        coverage = _check_slam_map_coverage(
+            points_local[:, :2],
+            traj_xyz[:, :2],
+            emit_event=emit_event,
+            context="slam_gps_anchor/rigid_fit",
+        )
+        # Recorded in the QA report because the QA metrics themselves are computed
+        # from the trajectory and cannot see a truncated point cloud.
+        qa_extra.update(coverage)
 
         xy_local = points_local[:, :2]
         xy_global = (rotation @ xy_local.T).T + translation
@@ -2279,7 +2422,7 @@ def slam_raw_to_gps_anchored_las_pose_optimizer(
         }
 
         _emit(emit_event, "status", message="Extracting point cloud from raw replay with optimized poses...")
-        map_points, pose_lookup = _build_point_cloud_from_raw_with_poses(
+        map_points, map_attrs, pose_lookup = _build_point_cloud_from_raw_with_poses(
             raw_paths,
             pose_timestamps_ns=ts_opt,
             column_poses=poses_opt,
@@ -2304,6 +2447,11 @@ def slam_raw_to_gps_anchored_las_pose_optimizer(
         las.x = map_points[:, 0]
         las.y = map_points[:, 1]
         las.z = map_points[:, 2]
+        if map_attrs.shape[0] == map_points.shape[0] and map_attrs.shape[1] >= 2:
+            # gps_time holds capture time in unix seconds; intensity holds sensor
+            # reflectivity (LAS stores it as uint16, sensor range is 0-255).
+            las.gps_time = map_attrs[:, 0]
+            las.intensity = np.clip(map_attrs[:, 1], 0, 65535).astype(np.uint16)
         las.write(tmp_output)
         os.replace(tmp_output, output_las)
 
