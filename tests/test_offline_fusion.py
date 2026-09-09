@@ -15,12 +15,18 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from lidar_rpi_gps_pipeline.jobs.offline_fusion import (
+    MAP_ATTR_COLUMNS,
+    _CaptureGapTracker,
     _extract_session_id_from_gps_csv_path,
     _filter_raw_paths_by_session,
+    _find_metadata_json_candidates,
     _lookup_pose_columns,
+    _new_las_header,
     _scan_valid_timestamp_count,
+    _trajectory_csv_path,
     _trim_query_to_gps_range,
     _updated_has_any_valid_timestamps,
+    _write_trajectory_csv,
     choose_time_mode,
     expand_raw_lidar_inputs,
     filter_gps_outliers_by_speed,
@@ -331,3 +337,117 @@ def test_filter_gps_outliers_by_speed_drops_jump_and_keeps_recovered_track() -> 
     assert stats["kept_rows"] == 4
     assert stats["dropped_rows"] == 1
     assert stats["dropped_speed"] == 1
+
+
+def test_capture_gap_tracker_reports_break_between_scans() -> None:
+    tracker = _CaptureGapTracker(threshold_s=0.5)
+
+    assert tracker.observe(_FakeScan([1_000_000_000, 1_050_000_000])) is None
+    # Next scan continues immediately: no gap.
+    assert tracker.observe(_FakeScan([1_100_000_000, 1_150_000_000])) is None
+    # Then two seconds of missing data.
+    gap = tracker.observe(_FakeScan([3_150_000_000, 3_200_000_000]))
+
+    assert gap is not None
+    assert gap["gap_s"] == pytest.approx(2.0)
+    summary = tracker.summary()
+    assert summary["count"] == 1
+    assert summary["total_s"] == pytest.approx(2.0)
+
+
+def test_capture_gap_tracker_ignores_scans_without_valid_timestamps() -> None:
+    tracker = _CaptureGapTracker(threshold_s=0.5)
+
+    tracker.observe(_FakeScan([1_000_000_000]))
+    # A scan the SDK invalidated carries zeroed timestamps; it must not be read as a
+    # jump back to the epoch, which would otherwise register a huge bogus gap.
+    assert tracker.observe(_FakeScan([0, 0])) is None
+    assert tracker.observe(_FakeScan([1_100_000_000])) is None
+    assert tracker.summary()["count"] == 0
+
+
+def test_find_metadata_json_candidates_skips_empty_sidecar_and_uses_sibling(
+    tmp_path: Path,
+) -> None:
+    pcap = tmp_path / "raw_lidar_20260826_094253_chunk0000.pcap"
+    pcap.write_bytes(b"\x00")
+    # The sidecar belonging to this chunk survived the transfer as zero bytes.
+    (tmp_path / "raw_lidar_20260826_094253_chunk0000_0.json").write_text("")
+    sibling = tmp_path / "raw_lidar_20260826_094253_chunk0000-1_0.json"
+    sibling.write_text('{"sensor_info": {}}')
+
+    candidates = _find_metadata_json_candidates(str(pcap))
+
+    assert str(sibling) in candidates
+    assert all(Path(p).stat().st_size > 0 for p in candidates)
+
+
+def test_find_metadata_json_candidates_prefers_own_sidecar_when_populated(
+    tmp_path: Path,
+) -> None:
+    pcap = tmp_path / "raw_lidar_20260826_094253_chunk0000.pcap"
+    pcap.write_bytes(b"\x00")
+    own = tmp_path / "raw_lidar_20260826_094253_chunk0000_0.json"
+    own.write_text('{"sensor_info": {"own": true}}')
+    (tmp_path / "raw_lidar_20260826_094253_chunk0000-1_0.json").write_text("{}")
+
+    assert _find_metadata_json_candidates(str(pcap))[0] == str(own)
+
+
+def test_write_trajectory_csv_strides_and_keeps_pose_columns(tmp_path: Path) -> None:
+    count = 100
+    timestamps = np.arange(count, dtype=np.int64) * 1_000_000 + 1_787_755_378_000_000_000
+    poses = np.tile(np.eye(4, dtype=np.float64), (count, 1, 1))
+    poses[:, 0, 3] = np.arange(count, dtype=np.float64)
+
+    path = _write_trajectory_csv(str(tmp_path / "out.las"), timestamps, poses, max_rows=10)
+
+    assert path == _trajectory_csv_path(str(tmp_path / "out.las"))
+    frame = pd.read_csv(path)
+    assert list(frame.columns) == [
+        "time_ns",
+        "time_s",
+        "x",
+        "y",
+        "z",
+        "roll_deg",
+        "pitch_deg",
+        "yaw_deg",
+    ]
+    assert len(frame) == 10
+    assert frame["x"].tolist() == [float(i) for i in range(0, 100, 10)]
+
+
+def test_write_trajectory_csv_returns_none_on_mismatched_inputs(tmp_path: Path) -> None:
+    poses = np.tile(np.eye(4, dtype=np.float64), (3, 1, 1))
+    timestamps = np.asarray([1, 2], dtype=np.int64)
+
+    assert _write_trajectory_csv(str(tmp_path / "out.las"), timestamps, poses) is None
+
+
+def test_new_las_header_point_format_8_carries_nir_and_extra_dims() -> None:
+    header = _new_las_header(
+        32614,
+        0.0,
+        0.0,
+        0.0,
+        point_format=8,
+        extra_dims=[("range_m", "f4", "Sensor-to-point range in metres")],
+    )
+
+    names = {d.name for d in header.point_format.dimensions}
+    assert "nir" in names
+    assert "range_m" in names
+    assert "gps_time" in names
+
+
+def test_map_attr_columns_match_documented_layout() -> None:
+    # The replay builds this array positionally and the LAS writer reads it back the
+    # same way, so the order is load-bearing.
+    assert MAP_ATTR_COLUMNS == (
+        "time_s",
+        "reflectivity",
+        "near_ir",
+        "range_m",
+        "beam_row",
+    )

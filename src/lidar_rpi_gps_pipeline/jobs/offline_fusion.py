@@ -4,12 +4,14 @@
 from __future__ import annotations
 
 import argparse
+import datetime
 import glob
 import json
 import os
 import re
 import shutil
 import tempfile
+import time
 from io import StringIO
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
@@ -26,6 +28,18 @@ class JobCancelledError(RuntimeError):
 EventEmitter = Optional[Callable[[Dict[str, Any]], None]]
 CancelChecker = Optional[Callable[[], bool]]
 
+# Column order of the per-point attribute array carried through the pose-optimizer
+# raw replay and written into the exported LAS. See the accumulator in
+# `_build_point_cloud_from_raw_with_poses` for why only averageable quantities
+# appear here.
+MAP_ATTR_COLUMNS = ("time_s", "reflectivity", "near_ir", "range_m", "beam_row")
+
+# A break in the LiDAR stream longer than this is treated as a capture dropout.
+# Scan-to-map registration cannot bridge one: at 5 m/s a one-second hole is five
+# metres of unobserved motion, and once the SLAM map absorbs the resulting bad
+# pose the trajectory never recovers.
+CAPTURE_GAP_THRESHOLD_S = 0.5
+
 
 def log(message: str) -> None:
     print(message, flush=True)
@@ -37,9 +51,80 @@ def _emit(emit_event: EventEmitter, kind: str, **payload: Any) -> None:
     emit_event({"kind": kind, **payload})
 
 
+def _log_and_emit(emit_event: EventEmitter, message: str) -> None:
+    """
+    Print a line and publish it as a status event without printing it twice.
+
+    Both sinks are wanted: stdout for CLI runs, the event stream for the GUI. The
+    `console_echoed` flag tells `_console_event_emitter` that stdout already carries
+    this line, which matters now that the CLI supplies an emitter of its own.
+    """
+    log(message)
+    _emit(emit_event, "status", message=message, console_echoed=True)
+
+
 def _check_cancel(should_cancel: CancelChecker) -> None:
     if should_cancel is not None and should_cancel():
         raise JobCancelledError("Job cancelled by user.")
+
+
+def _format_unix_utc(seconds: float) -> str:
+    return datetime.datetime.utcfromtimestamp(float(seconds)).strftime("%H:%M:%S.%f")[:12]
+
+
+class _CaptureGapTracker:
+    """
+    Detect breaks in the LiDAR stream as scans are fed to SLAM.
+
+    A dropout during capture leaves a hole that scan-to-map registration cannot
+    bridge: the sensor has moved metres with nothing observed in between, the
+    estimated pose for the first scan after the hole is wrong, and once the SLAM map
+    absorbs that pose the trajectory never recovers. The failure is invisible in the
+    QA report, which only compares the trajectory against GPS after the fact, so it
+    has to be reported while the scans are being read.
+
+    Timestamps come from the sensor clock, so a gap here means packets were lost or
+    the sensor stopped sending, not that files were supplied out of order.
+    """
+
+    def __init__(self, threshold_s: float = CAPTURE_GAP_THRESHOLD_S) -> None:
+        self.threshold_s = float(threshold_s)
+        self.gaps: List[Dict[str, float]] = []
+        self._last_ns: Optional[int] = None
+
+    def observe(self, scan: Any) -> Optional[Dict[str, float]]:
+        if scan is None:
+            return None
+        try:
+            timestamps = np.asarray(scan.timestamp, dtype=np.int64)
+        except Exception:
+            return None
+        timestamps = timestamps[timestamps > 0]
+        if timestamps.size == 0:
+            return None
+
+        first = int(timestamps.min())
+        last = int(timestamps.max())
+        gap: Optional[Dict[str, float]] = None
+        if self._last_ns is not None:
+            delta_s = (first - self._last_ns) / 1e9
+            if delta_s > self.threshold_s:
+                gap = {
+                    "after_unix_s": self._last_ns / 1e9,
+                    "before_unix_s": first / 1e9,
+                    "gap_s": delta_s,
+                }
+                self.gaps.append(gap)
+        self._last_ns = last if self._last_ns is None else max(self._last_ns, last)
+        return gap
+
+    def summary(self) -> Dict[str, Any]:
+        return {
+            "threshold_s": self.threshold_s,
+            "count": len(self.gaps),
+            "total_s": float(sum(g["gap_s"] for g in self.gaps)),
+            "gaps": self.gaps,
+        }
 
 
 def read_ouster_csv(path: str) -> pd.DataFrame:
@@ -613,13 +698,21 @@ def _find_metadata_json_candidates(raw_path: str) -> List[str]:
     candidates = [f"{base}.json", f"{base}_0.json"]
     candidates.extend(sorted(glob.glob(f"{base}*.json")))
 
+    # A failed transfer can leave a zero-byte sidecar beside an otherwise good
+    # capture, and `open_source` then fails with "empty metadata passed in" rather
+    # than looking further. Every chunk of one session carries a byte-identical
+    # sensor configuration, so any non-empty `*_0.json` in the same directory is a
+    # valid stand-in. Manifests are excluded by the `_0.json` suffix.
+    directory = os.path.dirname(raw_path) or "."
+    candidates.extend(sorted(glob.glob(os.path.join(directory, "*_0.json"))))
+
     ordered = []
     seen = set()
     for p in candidates:
         if p in seen:
             continue
         seen.add(p)
-        if os.path.isfile(p):
+        if os.path.isfile(p) and os.path.getsize(p) > 0:
             ordered.append(p)
     return ordered
 
@@ -734,6 +827,41 @@ def _scan_get_reflectivity_field(scan: Any, ChanField: Any) -> Any:
         return scan.field(ChanField.REFLECTIVITY)
     except Exception:
         return scan.field("REFLECTIVITY")
+
+
+def _scan_has_near_ir_field(scan: Any, ChanField: Any) -> bool:
+    try:
+        if ChanField.NEAR_IR in scan.fields:
+            return True
+    except Exception:
+        pass
+    try:
+        field_names = {str(f) for f in scan.fields}
+        if "NEAR_IR" in field_names or "ChanField.NEAR_IR" in field_names:
+            return True
+    except Exception:
+        pass
+    try:
+        scan.field("NEAR_IR")
+        return True
+    except Exception:
+        return False
+
+
+def _scan_get_near_ir_field(scan: Any, ChanField: Any) -> Any:
+    """
+    Ambient near-infrared image, present in the RNG/RFL/NIR sensor profiles.
+
+    Unlike reflectivity this is passive solar radiance around 865 nm rather than a
+    return from the sensor's own laser. Vegetation is far brighter in it than
+    asphalt or concrete, which makes it a useful discriminator downstream. It
+    depends on sun angle and shadowing, so values are comparable within one
+    session but not across sessions.
+    """
+    try:
+        return scan.field(ChanField.NEAR_IR)
+    except Exception:
+        return scan.field("NEAR_IR")
 
 
 def _next_available_output_path(path: str) -> str:
@@ -951,14 +1079,29 @@ def _new_las_header(
     first_x: float,
     first_y: float,
     first_z: float,
+    *,
+    point_format: int = 6,
+    extra_dims: Optional[List[Tuple[str, str, str]]] = None,
 ) -> laspy.LasHeader:
-    header = laspy.LasHeader(point_format=6, version="1.4")
+    """
+    Build the LAS 1.4 header.
+
+    `point_format` 6 carries X/Y/Z, intensity, classification and gps_time. Format 8
+    adds the standard `nir` field, which is where the sensor's ambient near-infrared
+    channel belongs; prefer it over an extra dimension so ordinary LAS readers
+    understand the data. `extra_dims` entries are (name, laspy type, description).
+    """
+    header = laspy.LasHeader(point_format=point_format, version="1.4")
     header.x_scale = header.y_scale = header.z_scale = 0.001
     header.x_offset = float(first_x)
     header.y_offset = float(first_y)
     header.z_offset = float(first_z)
     if utm_epsg is not None:
         header.add_crs(CRS.from_epsg(utm_epsg))
+    for name, type_str, description in extra_dims or []:
+        header.add_extra_dim(
+            laspy.ExtraBytesParams(name=name, type=type_str, description=description)
+        )
     return header
 
 
@@ -1120,6 +1263,67 @@ def _qa_report_path(output_las: str) -> str:
     return root + "_qa.json"
 
 
+def _trajectory_csv_path(output_las: str) -> str:
+    root, _ext = os.path.splitext(output_las)
+    return root + "_trajectory.csv"
+
+
+def _write_trajectory_csv(
+    output_las: str,
+    timestamps_ns: Any,
+    poses: Any,
+    *,
+    max_rows: int = 50000,
+) -> Optional[str]:
+    """
+    Write the optimized sensor trajectory next to the exported LAS.
+
+    The point cloud records where every point is but not where it was observed
+    from, and that viewing geometry is exactly what incidence angle, occlusion
+    reasoning and density normalisation need downstream. Carrying a sensor position
+    on every point would be wasteful, so the trajectory is written once and a point
+    is matched to it by `gps_time`.
+
+    Poses arrive sampled per lidar column - around 20,000 rows per second of
+    capture, far finer than the trajectory actually resolves - so rows are strided
+    down to at most `max_rows`. The default leaves better than per-scan resolution
+    for sessions up to roughly forty minutes.
+    """
+    ts = np.asarray(timestamps_ns, dtype=np.int64).reshape(-1)
+    p = np.asarray(poses, dtype=np.float64)
+    if ts.size == 0 or p.ndim != 3 or p.shape[1:] != (4, 4) or p.shape[0] != ts.size:
+        return None
+
+    stride = max(1, int(np.ceil(ts.size / float(max_rows))))
+    ts = ts[::stride]
+    p = p[::stride]
+
+    rot = p[:, :3, :3]
+    # ZYX (yaw-pitch-roll) decomposition; the pipeline never needs to recover the
+    # matrix bit-exactly, only to reason about where the sensor was pointing.
+    yaw = np.degrees(np.arctan2(rot[:, 1, 0], rot[:, 0, 0]))
+    pitch = np.degrees(
+        np.arctan2(-rot[:, 2, 0], np.hypot(rot[:, 2, 1], rot[:, 2, 2]))
+    )
+    roll = np.degrees(np.arctan2(rot[:, 2, 1], rot[:, 2, 2]))
+
+    frame = pd.DataFrame(
+        {
+            "time_ns": ts,
+            "time_s": ts / 1e9,
+            "x": p[:, 0, 3],
+            "y": p[:, 1, 3],
+            "z": p[:, 2, 3],
+            "roll_deg": roll,
+            "pitch_deg": pitch,
+            "yaw_deg": yaw,
+        }
+    )
+    path = _trajectory_csv_path(output_las)
+    frame.to_csv(path, index=False)
+    return path
+
+
 def _write_anchor_qa_report(
     output_las: str,
     *,
@@ -1242,11 +1446,21 @@ def _build_point_cloud_from_raw_with_poses(
     downsample_size = float(map_voxel_size)
     points_accum = np.zeros((0, 3), dtype=np.float64)
     pending_batches: List[np.ndarray] = []
-    # Per-point attributes carried alongside XYZ: [capture time (unix seconds), reflectivity].
+    # Per-point attributes carried alongside XYZ, in MAP_ATTR_COLUMNS order:
+    # [capture time (unix seconds), reflectivity, near infrared, range (m), beam row].
+    #
     # Time is stored in seconds rather than nanoseconds because the attribute array is
     # float64: epoch nanoseconds (~1.8e18) exceed the 2^53 range where float64 is exact,
     # while epoch seconds keep sub-microsecond resolution.
-    attrs_accum = np.zeros((0, 2), dtype=np.float64)
+    #
+    # `voxel_downsample` AVERAGES attributes over the points in a voxel, so only
+    # quantities that survive averaging belong here. Time, reflectivity, near
+    # infrared and range all do. Discrete identifiers such as a frame number do not,
+    # which is why none is carried; gps_time already locates a point in time and
+    # stays meaningful when averaged. Beam row averages to the typical beam that saw
+    # the voxel, which is a usable proxy for viewing geometry; it is exact only when
+    # downsampling is disabled with --poseopt-map-voxel-size 0.
+    attrs_accum = np.zeros((0, len(MAP_ATTR_COLUMNS)), dtype=np.float64)
     pending_attrs: List[np.ndarray] = []
     scans_seen = 0
 
@@ -1259,6 +1473,7 @@ def _build_point_cloud_from_raw_with_poses(
         "nearest_columns": 0,
         "max_delta_ns": 0,
         "reflectivity_scans_missing_field": 0,
+        "near_ir_scans_missing_field": 0,
     }
 
     def flush_batches() -> None:
@@ -1342,6 +1557,17 @@ def _build_point_cloud_from_raw_with_poses(
                     refl = np.zeros(np.shape(ranges), dtype=np.float64)
                     lookup_stats["reflectivity_scans_missing_field"] += 1
 
+                # Ambient near-infrared. Absent from range-only sensor profiles, in
+                # which case the channel is exported as zero rather than dropped so
+                # the LAS layout stays the same across sessions.
+                if _scan_has_near_ir_field(scan, ChanField):
+                    near_ir = np.asarray(
+                        _scan_get_near_ir_field(scan, ChanField), dtype=np.float64
+                    )
+                else:
+                    near_ir = np.zeros(np.shape(ranges), dtype=np.float64)
+                    lookup_stats["near_ir_scans_missing_field"] += 1
+
                 if reflectivity_filter:
                     valid = valid & (refl >= float(min_reflectivity))
 
@@ -1351,9 +1577,24 @@ def _build_point_cloud_from_raw_with_poses(
                 scan_ts_sec = (
                     np.broadcast_to(scan_col_ts[np.newaxis, :], valid.shape)[valid] / 1e9
                 )
+                # Row index in the staggered range image is the beam index. Kept
+                # because point density falls off as 1/range^2 and varies per beam,
+                # so any density-dependent downstream step needs the viewing
+                # geometry rather than the point alone.
+                beam_rows = np.broadcast_to(
+                    np.arange(valid.shape[0], dtype=np.float64)[:, np.newaxis], valid.shape
+                )[valid]
                 pending_batches.append(np.asarray(selected, dtype=np.float64))
                 pending_attrs.append(
-                    np.column_stack([scan_ts_sec, refl[valid]]).astype(np.float64)
+                    np.column_stack(
+                        [
+                            scan_ts_sec,
+                            refl[valid],
+                            near_ir[valid],
+                            ranges_m[valid],
+                            beam_rows,
+                        ]
+                    ).astype(np.float64)
                 )
 
                 if scan_idx % 20 == 0:
@@ -1770,8 +2011,7 @@ def slam_raw_to_single_las(
             osf_writer = None
             assert tmp_output_osf is not None and output_osf is not None
             os.replace(tmp_output_osf, output_osf)
-            _emit(emit_event, "status", message=f"Saved SLAM OSF: {output_osf}")
-            log(f"Saved SLAM OSF: {output_osf}")
+            _log_and_emit(emit_event, f"Saved SLAM OSF: {output_osf}")
 
         _emit(emit_event, "status", message="Building final SLAM point cloud...")
         points = slam_engine.get_point_cloud()
@@ -1799,8 +2039,7 @@ def slam_raw_to_single_las(
         las.write(tmp_output)
         os.replace(tmp_output, output_las)
 
-        _emit(emit_event, "status", message=f"Done. Final SLAM LAS: {output_las}")
-        log(f"Done. Final SLAM LAS: {output_las}")
+        _log_and_emit(emit_event, f"Done. Final SLAM LAS: {output_las}")
         return {
             "mode": "slam_map",
             "output_las": output_las,
@@ -1982,13 +2221,12 @@ def slam_raw_to_gps_anchored_las(
             osf_writer = None
             assert tmp_output_osf is not None and output_osf is not None
             os.replace(tmp_output_osf, output_osf)
-            _emit(emit_event, "status", message=f"Saved local SLAM OSF: {output_osf}")
+            _log_and_emit(emit_event, f"Saved local SLAM OSF: {output_osf}")
             _emit(
                 emit_event,
                 "status",
                 message="OSF stores local SLAM poses for rigid_fit backend (LAS is GPS-anchored output).",
             )
-            log(f"Saved local SLAM OSF: {output_osf}")
 
         traj_t = np.asarray(traj_timestamps, dtype=np.int64)
         traj_xyz = np.asarray(traj_xyz_local, dtype=np.float64)
@@ -2083,22 +2321,13 @@ def slam_raw_to_gps_anchored_las(
             metrics=qa_metrics,
             extra=qa_extra,
         )
-        _emit(
+        _log_and_emit(
             emit_event,
-            "status",
-            message=(
-                f"Anchor QA: median={qa_metrics['xy_median_m']:.2f} m, "
-                f"p95={qa_metrics['xy_p95_m']:.2f} m, pass={qa_pass} "
-                f"({qa_path})"
-            ),
-        )
-        log(
             f"Anchor QA: median={qa_metrics['xy_median_m']:.2f} m, "
-            f"p95={qa_metrics['xy_p95_m']:.2f} m, pass={qa_pass} ({qa_path})"
+            f"p95={qa_metrics['xy_p95_m']:.2f} m, pass={qa_pass} ({qa_path})",
         )
 
-        _emit(emit_event, "status", message=f"Done. Final anchored LAS: {output_las}")
-        log(f"Done. Final anchored LAS: {output_las}")
+        _log_and_emit(emit_event, f"Done. Final anchored LAS: {output_las}")
         return {
             "mode": "slam_gps_anchor",
             "output_las": output_las,
@@ -2215,6 +2444,8 @@ def slam_raw_to_gps_anchored_las_pose_optimizer(
     final_cost = None
     writer = None
     skipped_osf_updates = 0
+    gap_tracker = _CaptureGapTracker()
+    trajectory_path: Optional[str] = None
 
     try:
         for file_idx, raw_path in enumerate(raw_paths, start=1):
@@ -2256,6 +2487,19 @@ def slam_raw_to_gps_anchored_las_pose_optimizer(
                 for scan_idx, scans in enumerate(source, start=1):
                     _check_cancel(should_cancel)
                     assert slam_engine is not None
+
+                    gap = gap_tracker.observe(_extract_first_scan(scans))
+                    if gap is not None:
+                        message = (
+                            f"Capture gap of {gap['gap_s']:.2f} s at "
+                            f"{_format_unix_utc(gap['after_unix_s'])} UTC "
+                            f"({os.path.basename(raw_path)}). Scan-to-map "
+                            "registration cannot bridge a hole this long; SLAM may "
+                            "diverge here and not recover."
+                        )
+                        log(f"WARNING: {message}")
+                        _emit(emit_event, "status", message=message)
+
                     updated = slam_engine.update(scans)
                     assert writer is not None
                     if _updated_has_any_valid_timestamps(updated):
@@ -2293,6 +2537,18 @@ def slam_raw_to_gps_anchored_las_pose_optimizer(
 
         if total_scans == 0:
             raise ValueError("No scans processed for SLAM map generation.")
+
+        capture_gaps = gap_tracker.summary()
+        if capture_gaps["count"] > 0:
+            summary_message = (
+                f"{capture_gaps['count']} capture gap(s) totalling "
+                f"{capture_gaps['total_s']:.2f} s were crossed while building the SLAM "
+                "trajectory. Poses after the first gap may be unusable. Consider "
+                "processing the continuous stretches as separate runs and merging the "
+                "georeferenced outputs, which stay in the same CRS."
+            )
+            log(f"WARNING: {summary_message}")
+            _emit(emit_event, "status", message=summary_message)
 
         if skipped_osf_updates > 0:
             _emit(
@@ -2332,6 +2588,20 @@ def slam_raw_to_gps_anchored_las_pose_optimizer(
         gps_y_interp = np.interp(slam_t, gps_t, gps_n)
         gps_z_interp = np.interp(slam_t, gps_t, gps_z)
 
+        # Constraints are placed every `poseopt_constraints_every_m` of distance
+        # travelled along the SLAM trajectory, so a diverged trajectory generates
+        # them without limit: the distance counter clears the spacing again within a
+        # handful of columns and every column earns a constraint. Left unbounded that
+        # turns a run that should fail in minutes into hours of solving a hopeless
+        # problem. The GPS track is the ground truth for how far the rig actually
+        # went, so cap the count against it with a wide margin for legitimate jitter.
+        gps_path_m = float(
+            np.sum(np.hypot(np.diff(gps_x_interp), np.diff(gps_y_interp)))
+        )
+        max_constraints = max(
+            100, int(20.0 * gps_path_m / max(float(poseopt_constraints_every_m), 0.1))
+        )
+
         local_xy = poses_cols[:, :2, 3]
         last_xy = None
         dist_since = float("inf")
@@ -2342,6 +2612,16 @@ def slam_raw_to_gps_anchored_las_pose_optimizer(
             last_xy = xy
             if constraints_added > 0 and dist_since < poseopt_constraints_every_m:
                 continue
+
+            if constraints_added >= max_constraints:
+                raise ValueError(
+                    f"SLAM trajectory diverged: {constraints_added} GPS constraints "
+                    f"were needed before {_format_unix_utc(ts_cols[idx] / 1e9)} UTC, "
+                    f"against roughly {gps_path_m / max(float(poseopt_constraints_every_m), 0.1):.0f} "
+                    f"expected for a {gps_path_m:.0f} m GPS track. Divergence usually "
+                    "follows a capture gap; check the capture-gap warnings above and "
+                    "process the continuous stretches separately."
+                )
 
             pose = np.eye(4, dtype=np.float64)
             pose[0, 3] = float(gps_x_interp[idx])
@@ -2379,8 +2659,7 @@ def slam_raw_to_gps_anchored_las_pose_optimizer(
             po.save(tmp_output_osf)
             assert output_osf is not None
             os.replace(tmp_output_osf, output_osf)
-            _emit(emit_event, "status", message=f"Saved optimized OSF: {output_osf}")
-            log(f"Saved optimized OSF: {output_osf}")
+            _log_and_emit(emit_event, f"Saved optimized OSF: {output_osf}")
 
         ts_opt = np.asarray(po.get_timestamps(SamplingMode.COLUMNS), dtype=np.int64)
         poses_opt = np.asarray(po.get_poses(SamplingMode.COLUMNS), dtype=np.float64)
@@ -2419,6 +2698,9 @@ def slam_raw_to_gps_anchored_las_pose_optimizer(
             "constraints_added": int(constraints_added),
             "poseopt_cost": final_cost,
             "anchor_z_mode": anchor_z_mode,
+            # Recorded because the QA metrics compare the trajectory against GPS and
+            # cannot see that the trajectory was built across a break in the data.
+            "capture_gaps": capture_gaps,
         }
 
         _emit(emit_event, "status", message="Extracting point cloud from raw replay with optimized poses...")
@@ -2437,23 +2719,42 @@ def slam_raw_to_gps_anchored_las_pose_optimizer(
         if map_points.size == 0:
             raise ValueError("Optimized point cloud is empty.")
 
+        # Point format 8 rather than 6 so the sensor's ambient near-infrared channel
+        # lands in the standard `nir` field that ordinary LAS readers understand.
+        # Range goes to an extra dimension because LAS has no standard slot for it.
         header = _new_las_header(
             utm_epsg,
             map_points[:, 0].min(),
             map_points[:, 1].min(),
             map_points[:, 2].min(),
+            point_format=8,
+            extra_dims=[
+                ("range_m", "f4", "Sensor-to-point range in metres"),
+            ],
         )
         las = laspy.LasData(header)
         las.x = map_points[:, 0]
         las.y = map_points[:, 1]
         las.z = map_points[:, 2]
-        if map_attrs.shape[0] == map_points.shape[0] and map_attrs.shape[1] >= 2:
-            # gps_time holds capture time in unix seconds; intensity holds sensor
-            # reflectivity (LAS stores it as uint16, sensor range is 0-255).
+        if map_attrs.shape[0] == map_points.shape[0] and map_attrs.shape[1] >= len(
+            MAP_ATTR_COLUMNS
+        ):
+            # gps_time holds capture time in unix seconds and intensity the sensor
+            # reflectivity, 0-255. nir carries the ambient near-infrared channel as
+            # the SDK reports it: an 8-bit measurement already shifted left by four
+            # bits, so values are multiples of 16 running 0-4080. It is stored
+            # unscaled to stay lossless and to match what other Ouster tooling
+            # displays. user_data holds the beam row, which fits a uint8 for every
+            # current Ouster line.
             las.gps_time = map_attrs[:, 0]
             las.intensity = np.clip(map_attrs[:, 1], 0, 65535).astype(np.uint16)
+            las.nir = np.clip(map_attrs[:, 2], 0, 65535).astype(np.uint16)
+            las.range_m = map_attrs[:, 3].astype(np.float32)
+            las.user_data = np.clip(np.rint(map_attrs[:, 4]), 0, 255).astype(np.uint8)
         las.write(tmp_output)
         os.replace(tmp_output, output_las)
+
+        trajectory_path = _write_trajectory_csv(output_las, ts_opt, poses_opt)
 
         qa_path, qa_pass = _write_anchor_qa_report(
             output_las,
@@ -2462,22 +2763,13 @@ def slam_raw_to_gps_anchored_las_pose_optimizer(
             metrics=qa_metrics,
             extra=qa_extra,
         )
-        _emit(
+        _log_and_emit(
             emit_event,
-            "status",
-            message=(
-                f"Anchor QA: median={qa_metrics['xy_median_m']:.2f} m, "
-                f"p95={qa_metrics['xy_p95_m']:.2f} m, pass={qa_pass} "
-                f"({qa_path})"
-            ),
-        )
-        log(
             f"Anchor QA: median={qa_metrics['xy_median_m']:.2f} m, "
-            f"p95={qa_metrics['xy_p95_m']:.2f} m, pass={qa_pass} ({qa_path})"
+            f"p95={qa_metrics['xy_p95_m']:.2f} m, pass={qa_pass} ({qa_path})",
         )
 
-        _emit(emit_event, "status", message=f"Done. Final anchored LAS: {output_las}")
-        log(f"Done. Final anchored LAS: {output_las}")
+        _log_and_emit(emit_event, f"Done. Final anchored LAS: {output_las}")
         return {
             "mode": "slam_gps_anchor",
             "anchor_backend": "pose_optimizer",
@@ -2506,6 +2798,9 @@ def slam_raw_to_gps_anchored_las_pose_optimizer(
             "reflectivity_filter": bool(reflectivity_filter),
             "min_reflectivity": int(min_reflectivity),
             "reflectivity_scans_missing_field": int(pose_lookup["reflectivity_scans_missing_field"]),
+            "near_ir_scans_missing_field": int(pose_lookup["near_ir_scans_missing_field"]),
+            "output_trajectory_csv": trajectory_path,
+            "capture_gaps": capture_gaps,
             "output_osf": output_osf,
             "output_osf_kind": "optimized_gps_anchored",
         }
@@ -3231,10 +3526,51 @@ def run_offline_job(
     return summary
 
 
+def _console_event_emitter(min_interval_s: float = 30.0) -> EventEmitter:
+    """
+    Print progress events for CLI runs.
+
+    `run_from_args` emits progress throughout, but the CLI passed no emitter, so a
+    full session showed nothing between "Processing raw LiDAR" and the final QA line
+    - over an hour of silence on both the SLAM and replay phases, with no way to
+    tell a working run from a hung one. Scan progress is throttled by wall time
+    because it fires every ten scans, which is twice a second.
+    """
+    state = {"last_progress": 0.0}
+
+    def emit(event: Dict[str, Any]) -> None:
+        kind = event.get("kind")
+        if kind == "status":
+            if event.get("console_echoed"):
+                return
+            log(str(event.get("message", "")))
+        elif kind == "file_started":
+            log(
+                f"[{event.get('file_index')}/{event.get('file_total')}] "
+                f"{os.path.basename(str(event.get('path', '')))}"
+            )
+        elif kind == "scan_progress":
+            now = time.monotonic()
+            if now - state["last_progress"] < min_interval_s:
+                return
+            state["last_progress"] = now
+            parts = [
+                f"  [{event.get('file_index')}/{event.get('file_total')}]",
+                f"scan {event.get('scan_index')}",
+                f"total {event.get('total_scans')}",
+            ]
+            points = event.get("total_points")
+            if points is not None:
+                parts.append(f"points {int(points):,}")
+            log(" ".join(parts))
+
+    return emit
+
+
 def main(argv: Optional[List[str]] = None) -> None:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
-    run_from_args(args)
+    run_from_args(args, emit_event=_console_event_emitter())
 
 
 if __name__ == "__main__":

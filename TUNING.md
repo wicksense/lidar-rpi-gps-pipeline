@@ -1,11 +1,18 @@
 # Offline Processing: Verified Settings and Known Defects
 
-Findings from processing a full vehicle-mounted session (2026-07-21, San Antonio
-residential streets: 6 chunks, 176 s, 957 m, OS-1-128 at 1024x20 on the PTP timing
-path, DGPS-quality GPS with no dropouts).
+Findings from processing full vehicle-mounted sessions, both OS-1-128 at 1024x20 on
+the PTP timing path with DGPS-quality GPS:
 
-Everything below was measured on that session. Read
-"[What transfers and what does not](#what-transfers-and-what-does-not)" before
+- **2026-07-21**, San Antonio residential streets: 6 chunks, 176 s, 957 m, no
+  dropouts. Source of the parameter values below.
+- **2026-08-26**, downtown San Antonio: 13 chunks, 370 s, 1692 m, with four capture
+  dropouts. Source of the capture-gap findings and of the output-field work.
+
+This file is the current operating guidance. `HANDOFF.md` describes an earlier
+hardware configuration and an earlier CLI and should not be used for parameter
+choices.
+
+Read "[What transfers and what does not](#what-transfers-and-what-does-not)" before
 reusing the numbers on a different route.
 
 ## Environment
@@ -42,6 +49,13 @@ python3 offline_fuse_lidar_gps.py \
 | `--poseopt-map-voxel-size` | `0.5` | `0.1` | Output thinning only; it does not affect accuracy. At 0.5 m the cloud is too sparse to even measure surface thickness, and the beam pattern on the ground survives thinning as visible rings. 0.1 m is 25x denser and still tractable (~52 M points, 1.5 GB for this session). |
 | `--gps-time-column` | `auto` | `pi_time_ns` | Required whenever `--lidar-raw` is used without a manifest. `gps_epoch_ns` comes from NMEA and is truncated to whole seconds, which at 5 m/s is up to 5 m of along-track error, and `auto` prefers it. With `--manifest-json` the manifest's `timing_architecture` field makes `auto` pick `pi_time_ns` on its own. |
 
+`--slam-min-range 2.5` was re-measured on the 2026-08-26 rig and still holds. Taking
+300 frames from a moving chunk and looking for pixels that return something almost
+every frame at an almost constant range puts the rig's own returns at 1.22-1.76 m
+(592 pixels, per-pixel range standard deviation below 0.05 m, 0.58 % of all
+returns). The 1.0-1.5 m band has a median standard deviation of 0.016 m; from 1.5 m
+outward nothing stays constant. So 2.5 m clears the body with 0.7 m of margin.
+
 `--reflectivity-filter` is best left off. It drops returns with reflectivity 1,
 which removed only 1% of points here and did not change the stray-point rate at
 all, while discarding genuine weak returns from dark asphalt and dark vehicles.
@@ -61,6 +75,116 @@ placed them, and below the sensor's own precision extra points just resample the
 same surface. Exporting this session with no thinning produced 61.6 M points per
 29-second chunk at essentially the same measured surface thickness as 0.1 m
 thinning.
+
+## Capture gaps break SLAM, and no amount of tuning fixes it
+
+A dropout during capture leaves a hole in the LiDAR stream that scan-to-map
+registration cannot bridge. At 5 m/s a 1.5 s hole is 7.5 m of unobserved motion:
+the first scan after it registers against a map that no longer overlaps, the
+resulting pose is wrong, and once that pose is folded into the SLAM map the
+trajectory never recovers. Everything after the gap is unusable.
+
+Observed on the 2026-08-26 downtown session (session `20260826_094253`, 13 chunks,
+370 s, 1692 m). Four dropouts totalling 6.7 s fell inside a fifteen-second window:
+
+| Time (UTC) | Gap | Chunk |
+|---|---|---|
+| 14:44:54 | 1.51 s | `chunk0000-3` |
+| 14:44:59 | 0.40 s | `chunk0000-4` |
+| 14:45:04 | 2.34 s | `chunk0000-4` |
+| 14:45:09 | 2.46 s | `chunk0000-4` |
+
+SLAM diverged at 14:44:50 and stayed diverged for the remaining 4 min 20 s, 70 % of
+the session. The same data processed as gap-free stretches is fine: a single clean
+chunk reaches 0.23 m median / 0.71 m p95.
+
+### How it shows up
+
+Not in the QA report, which only compares the finished trajectory against GPS and
+has no idea the trajectory was built across a break. It shows up in the **number of
+GPS constraints**. Constraints are placed every `--poseopt-constraints-every-m` of
+distance travelled *along the SLAM trajectory*, so a diverged trajectory generates
+them without limit - the counter clears the spacing again every few columns:
+
+| | Constraints |
+|---|---|
+| Expected for a 1692 m track at 10 m spacing | ~170 |
+| Healthy 8-chunk run | 309 |
+| Run spanning the gaps | 218,600 and still climbing |
+
+Left unbounded that turns a run that should fail in minutes into hours of solving a
+hopeless problem. The pipeline now aborts once the count exceeds twenty times what
+the GPS track can justify, and names the time at which it happened.
+
+### What to do about it
+
+Split the session at the gaps and process each continuous stretch as its own run.
+SLAM only needs continuity *within* a run; GPS supplies the absolute frame, so the
+outputs land in the same CRS and merge by concatenation with no further
+registration. The cost is that each stretch carries its own independent error, so
+where two of them cover the same ground the surfaces may disagree by a metre or
+two.
+
+For the 2026-08-26 session that means:
+
+| Segment | Chunks | Window | Length |
+|---|---|---|---|
+| A | `chunk0000` … `chunk0000-3` | 14:42:58 - 14:44:57 | 119 s |
+| dropped | `chunk0000-4` | 14:44:57 - 14:45:31 | 34 s, holds three of the four gaps |
+| B | `chunk0000-5` … `chunk0000-12` | 14:45:31 - 14:49:08 | 217 s |
+
+Gaps are now detected while scans are read, warned about individually and in
+summary, and recorded under `extra.capture_gaps` in the QA report. The threshold is
+`CAPTURE_GAP_THRESHOLD_S`, 0.5 s.
+
+Gaps are packet loss at capture time, not a transfer problem: the timestamps come
+from the sensor clock. They are invisible in file sizes and in anything that only
+checks that a pcap parses.
+
+## What the exported LAS carries
+
+The `pose_optimizer` backend writes LAS 1.4 **point format 8**. The other two
+backends still write format 6 with X/Y/Z only, which is one more reason to prefer
+`pose_optimizer`.
+
+| Field | Contents |
+|---|---|
+| `X` `Y` `Z` | UTM easting/northing in metres, orthometric-ish height from GPS MSL |
+| `gps_time` | Capture time, Unix seconds |
+| `intensity` | Sensor reflectivity, 0-255 |
+| `nir` | Ambient near-infrared |
+| `range_m` | Sensor-to-point range in metres (extra dimension) |
+| `user_data` | Beam row, 0-127 |
+| `classification` | Unused, reserved for downstream labelling |
+
+`nir` is passive solar radiance near 865 nm rather than a return from the sensor's
+own laser, so vegetation is far brighter in it than asphalt or concrete. The SDK
+reports the sensor's 8-bit measurement already shifted left by four bits; values are
+therefore multiples of 16 running 0-4080, and are stored unscaled to stay lossless
+and to match what other Ouster tooling displays. It depends on sun angle and
+shadowing, so it is comparable within a session but not across sessions.
+
+`range_m` and `user_data` exist because point density falls off as 1/range² and
+varies per beam. Any density-dependent step needs the viewing geometry, not just
+the point.
+
+**These are voxel averages.** `voxel_downsample` averages attributes over the points
+that share a voxel, which is why no discrete identifier such as a frame number is
+carried: averaging one is meaningless. `user_data` is exact only when downsampling
+is disabled with `--poseopt-map-voxel-size 0`.
+
+### The trajectory CSV
+
+Each `pose_optimizer` run also writes `<output>_trajectory.csv`: `time_ns`,
+`time_s`, `x`, `y`, `z`, `roll_deg`, `pitch_deg`, `yaw_deg`.
+
+The point cloud records where each point is but not where it was seen from, and
+that viewing geometry is what incidence angle, occlusion reasoning and density
+normalisation all need. Carrying a sensor position on every point would be
+wasteful, so the trajectory is written once and a point is matched to it by
+`gps_time`. Rows are strided down from the per-column poses to at most 50,000,
+which stays better than per-scan resolution for sessions up to roughly forty
+minutes.
 
 ## Acceptance checks
 
@@ -103,7 +227,38 @@ Fixed in this branch:
   per-point time there is no way to trim the unconverged startup period, drop
   stationary stretches, or trace a suspect point back to a capture moment.
 
+Fixed while processing the 2026-08-26 session:
+
+- **Nothing bounded the GPS constraint count.** A diverged SLAM trajectory made the
+  spacing rule fire on almost every column; one run reached 218,600 constraints and
+  was still growing after 70 minutes, having stopped being salvageable an hour
+  earlier. The count is now capped against the GPS track length and the failure
+  names the time of divergence.
+- **Capture gaps were neither detected nor reported.** See
+  [Capture gaps break SLAM](#capture-gaps-break-slam-and-no-amount-of-tuning-fixes-it).
+- **The near-infrared channel was discarded.** The sensor profile is
+  `RNG15_RFL8_NIR8` and the pipeline read only range and reflectivity.
+- **Range and beam row were discarded**, leaving no way to reconstruct viewing
+  geometry, and no sensor position was written anywhere, so incidence angle and
+  occlusion were not recoverable from the output at all.
+- **The CLI was silent through the long phases.** `run_from_args` emits progress
+  throughout, but `main` passed no emitter, so a full session printed nothing
+  between the first file and the final QA line - over an hour with no way to
+  distinguish a working run from a hung one.
+- **A zero-byte metadata sidecar aborted the run.** A failed transfer can leave one
+  beside a perfectly good pcap, and `open_source` then fails with "empty metadata
+  passed in" rather than looking further. Every chunk of a session carries a
+  byte-identical sensor configuration, so any non-empty `*_0.json` in the same
+  directory now serves as a fallback.
+
 Reported but not fixed, because the fix is a design decision:
+
+- **The replay accumulates the whole cloud in memory.** Incremental voxel
+  downsampling bounds it to the thinned size rather than the raw point count, but a
+  217 s segment at `--poseopt-map-voxel-size 0.1` still peaked around 8 GB on a
+  17 GB machine. A ten-minute session will not fit. The fix is to write the LAS
+  incrementally or tile spatially; until then, raise the export voxel size on long
+  runs and re-export a fine-voxel copy of just the area of interest.
 
 - **`slam_map` and `rigid_fit` truncate long routes.** Both build their cloud from
   `SlamEngine.get_point_cloud()`, which returns the SLAM backend's rolling local
@@ -127,6 +282,13 @@ backend but never used, while the GUI offers the control for both backends.
   denser than ground 20-30 m away. This is real measurement density, not an
   artefact, but it does mean any density-dependent step (ground classification,
   segmentation, outlier removal, meshing) should run on a uniformly resampled copy.
+- **Packet loss during capture is the failure that costs the most.** A few seconds
+  of dropped UDP is a rounding error as a fraction of a session but severs the SLAM
+  chain, and everything after the first gap is lost rather than degraded. On
+  2026-08-26 that turned 6.7 s of loss into 4 min 20 s of unusable poses. It is
+  worth watching the capture host's network and disk headroom for this reason
+  alone; nothing in offline processing can recover it.
+
 - **The first chunk of a rolling split may not open in `ouster-cli`.** On this
   session `chunk0000.pcap` failed with "Duplicate lidar port/sn found in pcap" and
   needed an explicit `-m <metadata>.json`. The Python pipeline is unaffected because
