@@ -1,7 +1,27 @@
 # CivicScan Pipeline — Agent Handoff Document
 
-Generated: 2026-03-30. This is the complete context transfer for continuing development
-on a new machine. Read it fully before touching any code.
+Generated: 2026-03-30. Architectural context transfer for continuing development on a
+new machine.
+
+> **This document is out of date in specifics. Read `TUNING.md` first.**
+>
+> It still describes the architecture, the module layout and the design rules
+> accurately. It is wrong about the hardware, the parameters and the CLI:
+>
+> - The rig now runs `1024x20` (20 Hz) with `TIME_FROM_PTP_1588`, not `1024x10`
+>   with `TIME_FROM_SYNC_PULSE_IN` + `INPUT_NMEA_UART` as section 1 says. Section 9
+>   is stale for the same reason.
+> - Section 9 recommends `pi_time_ns`; `TUNING.md` explains when that is required
+>   and when `gps_epoch_ns` is preferable, and the CLI help is authoritative.
+> - The flag list in section 12 is missing `--lidar-session-filter`,
+>   `--reflectivity-filter`, `--min-reflectivity`, `--gps-outlier-filter`,
+>   `--gps-outlier-max-speed-mps` and `--poseopt-map-voxel-size`.
+> - The line numbers in section 6 no longer match the source.
+> - Section 8 predates point format 8, the near-infrared and range fields and the
+>   trajectory CSV; see "What the exported LAS carries" in `TUNING.md`.
+>
+> **The repo defaults are known to produce unusable output.** Start from the
+> recommended invocation in `TUNING.md`, not from the defaults.
 
 ---
 
