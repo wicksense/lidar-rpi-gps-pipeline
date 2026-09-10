@@ -30,20 +30,28 @@ a wrong SDK version looks like broken code rather than a broken environment.
 ```bash
 python3 offline_fuse_lidar_gps.py \
   --processing-mode slam_gps_anchor \
+  --anchor-backend rigid_fit \
   --slam-voxel-size 0.25 \
   --slam-min-range 2.5 \
-  --poseopt-map-voxel-size 0.1 \
-  --poseopt-constraint-weights 1.0,1.0,1.0 \
+  --poseopt-map-voxel-size 0.05 \
   --gps-time-column pi_time_ns \
   --utm-epsg 32614 \
-  --lidar-raw /path/to/session_dir \
+  --lidar-raw /path/to/gap_free_stretch \
   --gps-csv /path/to/raw_gps_<session>.csv \
   --output-dir /path/to/output
 ```
 
+`rigid_fit` replaced `pose_optimizer` as the recommendation on 2026-09-10. See
+[Placing the cloud without distorting it](#placing-the-cloud-without-distorting-it)
+for the measurements behind that; in short, per-node optimisation against
+metre-accurate GPS smears surfaces by a factor of six for an accuracy gain that is
+inside GPS's own noise. Keep `pose_optimizer` for routes long enough that SLAM
+drift exceeds GPS error, and use the settings in that section.
+
 | Flag | Repo default | Use | Why |
 |---|---|---|---|
-| `--poseopt-constraint-weights` | `0.01,0.01,0.001` | `1.0,1.0,1.0` | The default is 1000x weaker than the SDK's internal trajectory weight (10), so the solver effectively ignores GPS. On this session it produced a 13.53 m median error and failed QA; balanced weights gave 0.55 m. Asymmetric weights such as `1,1,0.1` score even better on QA (0.41 m) but distort the poses, throwing 19% of points tens of metres above or below ground - see [QA does not inspect the cloud](#qa-does-not-inspect-the-point-cloud). |
+| `--anchor-backend` | `pose_optimizer` | `rigid_fit` | Places the cloud without reshaping it. Same surface quality as pure SLAM, positioning inside GPS's own error. Only switch back for routes where SLAM drift exceeds GPS error. |
+| `--poseopt-constraint-weights` | `0.01,0.01,0.001` | `0.3,0.3,0.1` *(pose_optimizer only)* | The default is 1000x weaker than the SDK's internal trajectory weight (10). On the 957 m 2026-07-21 session that left GPS effectively ignored, at 13.53 m median error. On a 165 m chunk the same default passes at 0.69 m, because SLAM barely drifts over that distance - so the defect is route-length dependent, not absolute. Its real failure is vertical: a Z weight of 0.001 leaves height unanchored, measured at 3.83 m RMSE. Balanced `1,1,1` anchors well but smears surfaces sixfold; `0.3,0.3,0.1` is the best compromise found. |
 | `--slam-voxel-size` | `0.0` (auto) | `0.25` | Auto-estimation chose 1.64 m here, above the 0.8-1.5 m the SDK itself documents for outdoor use. That coarse registration map is what produced smeared surfaces and concentric ring artefacts. Pure-SLAM runs at 0.25 m reached 1.9-2.1 cm surface thickness on all four chunks tested. |
 | `--slam-min-range` | `1.0` | `2.5` | Returns from the vehicle body sit at 1.1-2.0 m on this rig (identified by their range being constant across frames, std 2.8 cm, while real scene returns at 2.0-2.5 m vary by over 1 m). The 1.0 m default removes essentially nothing. 2.5 m clears the body with margin at a cost of 1.3% of points. |
 | `--poseopt-map-voxel-size` | `0.5` | `0.1` | Output thinning only; it does not affect accuracy. At 0.5 m the cloud is too sparse to even measure surface thickness, and the beam pattern on the ground survives thinning as visible rings. 0.1 m is 25x denser and still tractable (~52 M points, 1.5 GB for this session). |
@@ -75,6 +83,92 @@ placed them, and below the sensor's own precision extra points just resample the
 same surface. Exporting this session with no thinning produced 61.6 M points per
 29-second chunk at essentially the same measured surface thickness as 0.1 m
 thinning.
+
+The export voxel does not change accuracy, but it does change **measured** surface
+thickness, so hold it fixed when comparing configurations. The same chunk from the
+same run measures 5.9 cm exported at 0.05 m and 8.7 cm at 0.10 m: a coarser voxel
+makes each point an average over a larger cube and spreads the neighbourhood the
+measurement uses. Reading that difference as an accuracy difference would be wrong.
+
+Below about 0.05 m there is little left to gain. Point spacing in a mobile scan
+grows with range - roughly `range x 0.006` for a 128-beam sensor, so 10 cm at 16 m
+and 30 cm at 50 m - which means a fine voxel only bites in the near field, where
+the data is already dense. Going 0.10 m to 0.05 m on a 165 m chunk multiplied
+points by 2.3, not by 8.
+
+## Placing the cloud without distorting it
+
+Anchoring a SLAM cloud to GPS is a trade, and until 2026-09-10 only one side of it
+was being measured.
+
+- **QA residual** says how closely the trajectory follows GPS. Denser and stronger
+  constraints always improve it.
+- **Surface thickness** says how sharp the cloud is. Denser and stronger constraints
+  always make it worse, because GPS is accurate to about a metre and every
+  constraint writes a share of that noise into the shape of the trajectory.
+
+Measured on one 29 s / 165 m chunk of the 2026-08-26 session, everything else
+fixed at `--slam-voxel-size 0.25`, `--slam-min-range 2.5`,
+`--poseopt-map-voxel-size 0.05`:
+
+| Backend | Spacing | Weights | Constraints | Thickness p50 | QA median | QA max | Z RMSE |
+|---|---|---|---|---|---|---|---|
+| pure SLAM, no GPS | - | - | - | **1.0 cm** | - | - | - |
+| pose_optimizer | 10 m | `1,1,1` | 17 | 5.9 cm | **0.28 m** | 1.1 m | 0.05 m |
+| pose_optimizer | 30 m | `1,1,1` | 6 | 5.0 cm | 0.31 m | 1.2 m | 0.12 m |
+| pose_optimizer | 100 m | `1,1,1` | 2 | 1.0 cm | 42.35 m | 121.5 m | 2.09 m |
+| pose_optimizer | 10 m | `0.3,0.3,0.1` | 17 | 3.6 cm | 0.41 m | 1.4 m | 0.15 m |
+| pose_optimizer | 30 m | `0.3,0.3,0.1` | 6 | 2.9 cm | 0.44 m | 1.5 m | 0.16 m |
+| pose_optimizer | 10 m | `0.1,0.1,0.1` | 17 | 3.2 cm | 0.55 m | 1.5 m | 0.11 m |
+| pose_optimizer | 10 m | `0.01,0.01,0.001` | 17 | 0.9 cm | 0.69 m | 1.21 m | **3.83 m** |
+| **rigid_fit** | - | - | - | **0.9 cm** | **0.88 m** | 1.39 m | 0.93 m |
+
+What the table says:
+
+**Weight matters more than spacing.** Loosening spacing alone (10 m to 30 m) barely
+moved thickness, 5.9 to 5.0 cm. Lowering weight alone took it from 5.9 to 3.2 cm.
+The damage comes from each constraint pulling hard, not from there being many.
+
+**Two constraints is not the same as a rigid fit.** The 100 m row has the thickness
+of pure SLAM and a 42 m median error. The pose optimizer treats absolute
+constraints as suggestions competing with a prior that keeps the SLAM shape, and
+two weak suggestions lose; the trajectory stays near where SLAM left it. Fitting
+four parameters over the whole trajectory is a different operation from asking an
+optimiser to honour two soft constraints.
+
+**A better QA score can mean a worse cloud.** The `1,1,1` row scores 0.28 m against
+GPS that is itself accurate to about a metre. It is fitting noise, and the cloud is
+six times thicker for it.
+
+**`rigid_fit` wins on this length of route.** One rotation, two translations and a
+height offset, least-squares fitted over the whole trajectory, applied to every
+point. Nothing internal can move, so thickness stays at what SLAM produced, and
+because all 585 trajectory samples feed the fit, GPS noise averages out rather than
+being written into the shape. Positioning lands at 0.88 m, which is where GPS's own
+accuracy puts the floor.
+
+The supporting number: the fitted trajectory measures 167.19 m against GPS's
+166.64 m, 0.3 % apart. Over this distance SLAM neither drifts nor mis-scales enough
+to need correcting, so bending it can only add error.
+
+### When to go back to pose_optimizer
+
+Rigid placement assumes SLAM drift across the segment is small compared to GPS
+error. That holds for a few hundred metres and stops holding at some point beyond
+it - on a kilometres-long route the drift accumulates and one transform will leave
+an end of the route misplaced. The check is to look at QA residual along the route
+rather than as a single median: flat means one rigid fit is enough, a bow shape
+means the segment needs subdividing or the optimizer.
+
+### Merging multiple chunks
+
+Run SLAM continuously across a whole gap-free stretch and fit once at the end.
+Do not anchor each chunk separately and concatenate: chunk boundaries are just the
+320 MB point at which the recorder rolled over, they carry no physical meaning, and
+each independently anchored piece brings its own ~0.9 m GPS error. Where two of
+them meet, a wall can appear twice a metre apart, which downstream classification
+reads as a real object. A uniform offset across the whole cloud is harmless by
+comparison - classification works on local shape and height above ground.
 
 ## Capture gaps break SLAM, and no amount of tuning fixes it
 
@@ -200,6 +294,20 @@ passed QA while only one produced a usable cloud. Run all three checks:
 3. **Height distribution** - fraction of points more than 10 m below or 30 m above
    local ground. Under 1% is healthy; the accepted run here was 0.004%. A
    distorted-pose run reached 19%.
+4. **Surface thickness** - the spread perpendicular to locally flat surfaces. This
+   is the check that caught anchoring distortion; none of the other three would
+   have. Under 2 cm is what good SLAM produces on this rig. Measure it with PDAL:
+
+   ```
+   filters.eigenvalues (knn 20) -> sqrt(Eigenvalue0)
+   filters.covariancefeatures (knn 20) -> keep the top quartile of Planarity
+   ```
+
+   The square root of the smallest eigenvalue is the out-of-plane spread of a
+   point's neighbourhood, so it does not care how the cloud is oriented - which
+   matters because `slam_map` writes its output in the SLAM local frame where the
+   road is not horizontal. Restricting to planar neighbourhoods keeps tree crowns,
+   where thickness is meaningless, out of the statistic.
 
 Only the point cloud itself can settle map quality. Load it and look for doubled
 walls, stepped ground, or concentric rings, all of which QA is blind to.
@@ -211,7 +319,11 @@ it cannot see a truncated cloud or one whose poses were twisted by over-weighted
 constraints. Treat a passing QA as "the trajectory is where GPS says it should be",
 nothing more. It is also partly self-reporting for the `pose_optimizer` backend,
 which minimises the very residual QA measures - raising the constraint weights
-always improves the score, whether or not the map improves.
+always improves the score, whether or not the map improves. That is now measured
+rather than suspected: the configuration scoring best on QA, 0.28 m, produced the
+worst cloud in the comparison at 5.9 cm surface thickness, against 0.9 cm for the
+configuration scoring 0.88 m. See
+[Placing the cloud without distorting it](#placing-the-cloud-without-distorting-it).
 
 ## Defects found
 
@@ -251,7 +363,7 @@ Fixed while processing the 2026-08-26 session:
   byte-identical sensor configuration, so any non-empty `*_0.json` in the same
   directory now serves as a fallback.
 
-Reported but not fixed, because the fix is a design decision:
+Reported but not fixed:
 
 - **The replay accumulates the whole cloud in memory.** Incremental voxel
   downsampling bounds it to the thinned size rather than the raw point count, but a
@@ -260,13 +372,30 @@ Reported but not fixed, because the fix is a design decision:
   incrementally or tile spatially; until then, raise the export voxel size on long
   runs and re-export a fine-voxel copy of just the area of interest.
 
-- **`slam_map` and `rigid_fit` truncate long routes.** Both build their cloud from
-  `SlamEngine.get_point_cloud()`, which returns the SLAM backend's rolling local
-  map. On the six-chunk session `rigid_fit` reported `pass` with a 1.25 m median
-  while its cloud spanned 288x263 m against a 563x446 m trajectory, centred on the
-  end of the route. A full fix means replaying the raw scans against the SLAM poses,
-  as the `pose_optimizer` backend already does. For now the mismatch is detected,
-  warned about, and recorded in the QA report.
+Fixed on 2026-09-10:
+
+- **`rigid_fit` truncated long routes and threw away every field but position.**
+  Both symptoms had one cause: it built its cloud from
+  `SlamEngine.get_point_cloud()`, the SLAM backend's rolling local map. That map
+  prunes older voxels as the sensor moves away, which is why a six-chunk run
+  reported `pass` at a 1.25 m median while its cloud spanned 288x263 m against a
+  563x446 m trajectory, centred on the end of the route. It also stores nothing but
+  coordinates, because registration has no use for reflectivity - so the
+  attributes were never available to write, rather than being dropped at export.
+  `rigid_fit` now applies its transform to the SLAM poses and replays the raw scans
+  through the same path `pose_optimizer` uses. Transforming poses rather than points
+  keeps the result exactly as rigid as before. On the reference chunk the output
+  went from 8.3 M points with X/Y/Z only to 16.8 M points carrying the full field
+  set, with thickness unchanged at 0.9 cm and QA unchanged at 0.88 m.
+  `--reflectivity-filter` and `--poseopt-map-voxel-size` now apply to this backend
+  too.
+
+Reported but not fixed, because the fix is a design decision:
+
+- **`slam_map` still builds its cloud from `SlamEngine.get_point_cloud()`** and so
+  keeps both of the problems `rigid_fit` just shed. It is a diagnostic mode rather
+  than an output path - it is what pure-SLAM thickness is measured on - so the
+  truncation matters less, but the same replay would fix it.
 
 Minor: `--anchor-min-motion-m` is accepted and validated by the `pose_optimizer`
 backend but never used, while the GUI offers the control for both backends.

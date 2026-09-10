@@ -1177,6 +1177,44 @@ def _extract_scan_pose_sample(scan: Any) -> Tuple[int, np.ndarray]:
     return ts, xyz
 
 
+def _extract_scan_column_poses(scan: Any) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Every valid column pose of a SLAM-updated scan, with its timestamp.
+
+    `_extract_scan_pose_sample` keeps one pose per scan, which is enough to fit a
+    trajectory against GPS but not to replay the raw scans: dewarping needs the
+    pose that was current for each individual column, because the sensor moves
+    measurably during the 50 ms a frame takes.
+    """
+    timestamps = np.asarray(scan.timestamp, dtype=np.int64)
+    poses = np.asarray(scan.pose, dtype=np.float64)
+    if timestamps.ndim != 1 or poses.ndim != 3 or poses.shape[1:] != (4, 4):
+        raise ValueError("Unexpected scan timestamp/pose layout from Ouster SDK.")
+    if poses.shape[0] != timestamps.shape[0]:
+        raise ValueError("Scan pose count does not match timestamp count.")
+
+    valid = timestamps > 0
+    return timestamps[valid], poses[valid]
+
+
+def _rigid_transform_matrix(
+    rotation: np.ndarray, translation: np.ndarray, z_offset: float
+) -> np.ndarray:
+    """
+    Assemble the 4x4 that maps the SLAM local frame onto the georeferenced frame.
+
+    The fit solves four numbers - a rotation about the vertical axis, an easting
+    and northing shift, and a height offset - so the matrix is that rotation in its
+    upper-left XY block with the translation in the last column.
+    """
+    transform = np.eye(4, dtype=np.float64)
+    transform[:2, :2] = np.asarray(rotation, dtype=np.float64)
+    transform[0, 3] = float(translation[0])
+    transform[1, 3] = float(translation[1])
+    transform[2, 3] = float(z_offset)
+    return transform
+
+
 def _fit_xy_rigid_transform(
     src_xy: np.ndarray,
     dst_xy: np.ndarray,
@@ -2078,11 +2116,30 @@ def slam_raw_to_gps_anchored_las(
     deskew_method: str,
     anchor_min_motion_m: float,
     anchor_z_mode: str,
+    reflectivity_filter: bool,
+    min_reflectivity: int,
+    map_voxel_size: float,
     emit_event: EventEmitter,
     should_cancel: CancelChecker,
 ) -> Dict[str, Any]:
     """
-    Run SLAM and anchor resulting map to GPS coordinates.
+    Run SLAM, then place the result in GPS coordinates with a single rigid transform.
+
+    The transform has four degrees of freedom - yaw, easting, northing and height -
+    fitted by least squares over the whole trajectory. Because it is rigid, the
+    geometry SLAM produced is carried through untouched: measured on a 165 m chunk,
+    surface thickness stays at the 1.0 cm pure SLAM achieves, where per-node
+    optimisation against 1 m-accurate GPS smears it to 3-6 cm.
+
+    That holds only while SLAM drift over the segment is small compared to GPS
+    error. Over a few hundred metres it is; over kilometres the drift accumulates
+    and a single transform will leave one end of the route misplaced, which is what
+    the pose optimizer backend exists for.
+
+    The cloud is built by replaying the raw scans against the transformed SLAM
+    poses rather than from `SlamEngine.get_point_cloud()`. The engine's rolling map
+    holds only coordinates, so reading it back loses reflectivity, near infrared and
+    capture time, and it prunes older voxels, which silently truncated long routes.
     """
     try:
         from ouster.sdk.mapping import SlamConfig, SlamEngine
@@ -2117,6 +2174,10 @@ def slam_raw_to_gps_anchored_las(
 
     slam_engine = None
     total_scans = 0
+    # One representative pose per scan drives the trajectory fit against GPS; the
+    # full per-column poses are what the raw replay needs to dewarp each frame.
+    column_timestamps: List[np.ndarray] = []
+    column_pose_blocks: List[np.ndarray] = []
     traj_timestamps: List[int] = []
     traj_xyz_local: List[np.ndarray] = []
     osf_writer = None
@@ -2174,6 +2235,13 @@ def slam_raw_to_gps_anchored_las(
                             ts, xyz = _extract_scan_pose_sample(scan)
                             traj_timestamps.append(ts)
                             traj_xyz_local.append(xyz)
+                        except Exception:
+                            pass
+                        try:
+                            col_ts, col_poses = _extract_scan_column_poses(scan)
+                            if col_ts.size:
+                                column_timestamps.append(col_ts)
+                                column_pose_blocks.append(col_poses)
                         except Exception:
                             pass
 
@@ -2283,36 +2351,75 @@ def slam_raw_to_gps_anchored_las(
             ),
         )
 
-        points_local = slam_engine.get_point_cloud()
-        if points_local is None or len(points_local) == 0:
-            raise ValueError("SLAM point cloud is empty.")
+        if not column_pose_blocks:
+            raise ValueError("No SLAM column poses were captured for the raw replay.")
 
-        points_local = np.asarray(points_local, dtype=np.float64)
-        if points_local.ndim != 2 or points_local.shape[1] < 3:
-            raise ValueError("Unexpected SLAM point cloud shape; expected Nx3 points.")
+        # Move the SLAM poses into the georeferenced frame, then let the replay place
+        # the points. Transforming poses rather than points is what keeps the result
+        # rigid: every point inherits the same four-parameter shift, so no relative
+        # geometry can change.
+        transform = _rigid_transform_matrix(rotation, translation, z_offset)
+        pose_ts = np.concatenate(column_timestamps)
+        pose_cols = transform @ np.concatenate(column_pose_blocks, axis=0)
+        order = np.argsort(pose_ts, kind="stable")
+        pose_ts = pose_ts[order]
+        pose_cols = pose_cols[order]
+        unique = np.concatenate([[True], np.diff(pose_ts) > 0])
+        pose_ts = pose_ts[unique]
+        pose_cols = pose_cols[unique]
 
-        # traj_xyz is in the same SLAM-local frame as points_local at this stage.
+        _emit(emit_event, "status", message="Extracting point cloud from raw replay with anchored poses...")
+        map_points, map_attrs, pose_lookup = _build_point_cloud_from_raw_with_poses(
+            raw_paths,
+            pose_timestamps_ns=pose_ts,
+            column_poses=pose_cols,
+            min_range=min_range,
+            max_range=max_range,
+            reflectivity_filter=reflectivity_filter,
+            min_reflectivity=min_reflectivity,
+            map_voxel_size=map_voxel_size,
+            emit_event=emit_event,
+            should_cancel=should_cancel,
+        )
+        if map_points.size == 0:
+            raise ValueError("Anchored point cloud is empty.")
+
+        # The replay covers wherever the raw scans reached, so the truncation this
+        # check was added for cannot happen any more; it stays because a coverage
+        # shortfall would now indicate a pose-lookup problem instead.
+        aligned_traj = np.column_stack([aligned_traj_xy, aligned_traj_z])
         coverage = _check_slam_map_coverage(
-            points_local[:, :2],
-            traj_xyz[:, :2],
+            map_points[:, :2],
+            aligned_traj[:, :2],
             emit_event=emit_event,
             context="slam_gps_anchor/rigid_fit",
         )
-        # Recorded in the QA report because the QA metrics themselves are computed
-        # from the trajectory and cannot see a truncated point cloud.
         qa_extra.update(coverage)
 
-        xy_local = points_local[:, :2]
-        xy_global = (rotation @ xy_local.T).T + translation
-        z_global = points_local[:, 2] + z_offset
-
-        header = _new_las_header(utm_epsg, xy_global[:, 0].min(), xy_global[:, 1].min(), z_global.min())
+        header = _new_las_header(
+            utm_epsg,
+            map_points[:, 0].min(),
+            map_points[:, 1].min(),
+            map_points[:, 2].min(),
+            point_format=8,
+            extra_dims=[("range_m", "f4", "Sensor-to-point range in metres")],
+        )
         las = laspy.LasData(header)
-        las.x = xy_global[:, 0]
-        las.y = xy_global[:, 1]
-        las.z = z_global
+        las.x = map_points[:, 0]
+        las.y = map_points[:, 1]
+        las.z = map_points[:, 2]
+        if map_attrs.shape[0] == map_points.shape[0] and map_attrs.shape[1] >= len(
+            MAP_ATTR_COLUMNS
+        ):
+            las.gps_time = map_attrs[:, 0]
+            las.intensity = np.clip(map_attrs[:, 1], 0, 65535).astype(np.uint16)
+            las.nir = np.clip(map_attrs[:, 2], 0, 65535).astype(np.uint16)
+            las.range_m = map_attrs[:, 3].astype(np.float32)
+            las.user_data = np.clip(np.rint(map_attrs[:, 4]), 0, 255).astype(np.uint8)
         las.write(tmp_output)
         os.replace(tmp_output, output_las)
+
+        trajectory_path = _write_trajectory_csv(output_las, pose_ts, pose_cols)
 
         qa_path, qa_pass = _write_anchor_qa_report(
             output_las,
@@ -2333,7 +2440,7 @@ def slam_raw_to_gps_anchored_las(
             "output_las": output_las,
             "raw_files": len(raw_paths),
             "total_scans": total_scans,
-            "total_points": int(points_local.shape[0]),
+            "total_points": int(map_points.shape[0]),
             "time_mode_used": chosen_time_mode,
             "anchor_method": anchor_method,
             "anchor_rotation_deg": _rotation_deg(rotation),
@@ -2344,6 +2451,12 @@ def slam_raw_to_gps_anchored_las(
             "slam_min_range": float(min_range),
             "slam_max_range": float(max_range),
             "slam_deskew_method": deskew_method,
+            "map_voxel_size": float(map_voxel_size),
+            "reflectivity_filter": bool(reflectivity_filter),
+            "min_reflectivity": int(min_reflectivity),
+            "reflectivity_scans_missing_field": int(pose_lookup["reflectivity_scans_missing_field"]),
+            "near_ir_scans_missing_field": int(pose_lookup["near_ir_scans_missing_field"]),
+            "output_trajectory_csv": trajectory_path,
             "qa_report_path": qa_path,
             "qa_pass": qa_pass,
             "qa_xy_rmse_m": qa_metrics["xy_rmse_m"],
@@ -3046,7 +3159,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="off",
         help=(
             "Enable/disable reflectivity threshold filtering in raw replay point export paths "
-            "(gps_fusion and slam_gps_anchor pose_optimizer map replay)."
+            "(gps_fusion and both slam_gps_anchor backends)."
         ),
     )
     parser.add_argument(
@@ -3160,7 +3273,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--poseopt-map-voxel-size",
         type=float,
         default=0.5,
-        help="Voxel size for downsampling optimized map before LAS export (0 disables).",
+        help=(
+            "Voxel size for downsampling the exported map before LAS export "
+            "(0 disables). Applies to both slam_gps_anchor backends."
+        ),
     )
     return parser
 
@@ -3369,15 +3485,6 @@ def run_from_args(
                 should_cancel=should_cancel,
             )
         else:
-            if args.reflectivity_filter == "on":
-                _emit(
-                    emit_event,
-                    "status",
-                    message=(
-                        "Reflectivity filter is not applied for slam_gps_anchor rigid_fit backend "
-                        "(map points come from SLAM engine map export)."
-                    ),
-                )
             summary = slam_raw_to_gps_anchored_las(
                 raw_paths=raw_paths,
                 gps_df=gps_df,
@@ -3392,6 +3499,9 @@ def run_from_args(
                 deskew_method=args.slam_deskew_method,
                 anchor_min_motion_m=args.anchor_min_motion_m,
                 anchor_z_mode=args.anchor_z_mode,
+                reflectivity_filter=(args.reflectivity_filter == "on"),
+                min_reflectivity=args.min_reflectivity,
+                map_voxel_size=args.poseopt_map_voxel_size,
                 emit_event=emit_event,
                 should_cancel=should_cancel,
             )

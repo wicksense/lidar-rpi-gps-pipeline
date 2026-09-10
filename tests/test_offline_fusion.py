@@ -17,11 +17,13 @@ if str(SRC_DIR) not in sys.path:
 from lidar_rpi_gps_pipeline.jobs.offline_fusion import (
     MAP_ATTR_COLUMNS,
     _CaptureGapTracker,
+    _extract_scan_column_poses,
     _extract_session_id_from_gps_csv_path,
     _filter_raw_paths_by_session,
     _find_metadata_json_candidates,
     _lookup_pose_columns,
     _new_las_header,
+    _rigid_transform_matrix,
     _scan_valid_timestamp_count,
     _trajectory_csv_path,
     _trim_query_to_gps_range,
@@ -451,3 +453,44 @@ def test_map_attr_columns_match_documented_layout() -> None:
         "range_m",
         "beam_row",
     )
+
+
+def test_rigid_transform_matrix_places_without_reshaping() -> None:
+    angle = np.deg2rad(30.0)
+    rotation = np.array(
+        [[math.cos(angle), -math.sin(angle)], [math.sin(angle), math.cos(angle)]]
+    )
+    transform = _rigid_transform_matrix(rotation, np.array([100.0, 200.0]), 5.0)
+
+    assert transform.shape == (4, 4)
+    assert transform[2, 2] == pytest.approx(1.0)
+    assert transform[:, 3].tolist() == pytest.approx([100.0, 200.0, 5.0, 1.0])
+
+    # Applying it to two points must preserve the distance between them, which is
+    # the whole reason this backend exists.
+    pts = np.array([[0.0, 0.0, 0.0, 1.0], [3.0, 4.0, 12.0, 1.0]]).T
+    moved = (transform @ pts).T[:, :3]
+    assert np.linalg.norm(moved[1] - moved[0]) == pytest.approx(13.0)
+
+
+def test_extract_scan_column_poses_drops_invalid_columns() -> None:
+    class _PoseScan:
+        def __init__(self) -> None:
+            self.timestamp = np.array([100, 0, 300], dtype=np.int64)
+            self.pose = np.stack([np.eye(4) * k for k in (1.0, 2.0, 3.0)])
+
+    ts, poses = _extract_scan_column_poses(_PoseScan())
+
+    assert ts.tolist() == [100, 300]
+    assert poses.shape == (2, 4, 4)
+    assert poses[0][0, 0] == pytest.approx(1.0)
+    assert poses[1][0, 0] == pytest.approx(3.0)
+
+
+def test_extract_scan_column_poses_rejects_mismatched_layout() -> None:
+    class _BadScan:
+        timestamp = np.array([1, 2, 3], dtype=np.int64)
+        pose = np.stack([np.eye(4), np.eye(4)])
+
+    with pytest.raises(ValueError, match="does not match"):
+        _extract_scan_column_poses(_BadScan())
