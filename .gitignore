@@ -24,3 +24,5 @@ converted_csv/
 
 # Local sample/test artifacts
 SampleData/
+.Rhistory
+PR_DESCRIPTION.md
