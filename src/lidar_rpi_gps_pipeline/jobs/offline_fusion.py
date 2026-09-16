@@ -1198,21 +1198,34 @@ def _extract_scan_column_poses(scan: Any) -> Tuple[np.ndarray, np.ndarray]:
 
 
 def _rigid_transform_matrix(
-    rotation: np.ndarray, translation: np.ndarray, z_offset: float
+    rotation: np.ndarray, translation: np.ndarray
 ) -> np.ndarray:
     """
     Assemble the 4x4 that maps the SLAM local frame onto the georeferenced frame.
 
-    The fit solves four numbers - a rotation about the vertical axis, an easting
-    and northing shift, and a height offset - so the matrix is that rotation in its
-    upper-left XY block with the translation in the last column.
+    Takes a full 3x3 rotation rather than a yaw alone, because placing a cloud
+    correctly can need a rotation about a horizontal axis as well - see
+    `_fit_vertical_tilt`. Composing two of these stays rigid, which is the whole
+    point of the backend: no relative geometry can change no matter how many are
+    multiplied together.
     """
     transform = np.eye(4, dtype=np.float64)
-    transform[:2, :2] = np.asarray(rotation, dtype=np.float64)
-    transform[0, 3] = float(translation[0])
-    transform[1, 3] = float(translation[1])
-    transform[2, 3] = float(z_offset)
+    transform[:3, :3] = np.asarray(rotation, dtype=np.float64)
+    transform[:3, 3] = np.asarray(translation, dtype=np.float64)
     return transform
+
+
+def _yaw_rotation_3d(rotation_xy: np.ndarray) -> np.ndarray:
+    """Embed a 2x2 horizontal rotation in 3D, leaving the vertical axis alone."""
+    rotation = np.eye(3, dtype=np.float64)
+    rotation[:2, :2] = np.asarray(rotation_xy, dtype=np.float64)
+    return rotation
+
+
+def _apply_transform(transform: np.ndarray, points: np.ndarray) -> np.ndarray:
+    """Apply a 4x4 to an Nx3 array of points."""
+    points = np.asarray(points, dtype=np.float64)
+    return (transform[:3, :3] @ points.T).T + transform[:3, 3]
 
 
 def _fit_xy_rigid_transform(
@@ -1249,6 +1262,141 @@ def _fit_xy_rigid_transform(
         rotation = vh.T @ u.T
     translation = dst_center - (rotation @ src_center)
     return rotation, translation, "rigid_xy"
+
+
+def _fit_vertical_tilt(
+    xy: np.ndarray,
+    height_residual: np.ndarray,
+    *,
+    min_span_m: float,
+    max_tilt_deg: float,
+) -> Tuple[np.ndarray, str, Dict[str, float]]:
+    """
+    Fit the rotation that takes the SLAM frame's vertical onto the local vertical.
+
+    SLAM defines "up" from the IMU at the start of a run, and that direction is off
+    by a fraction of a degree. A yaw-plus-offset placement cannot correct it,
+    because none of its four numbers is a rotation about a horizontal axis, so the
+    error appears as a height residual that grows linearly across the site: on a
+    1031 m route, 0.9 deg of tilt put the two ends of the cloud 10.65 m apart in
+    height while the ground itself moved only 7 m. Over the 165 m chunk the method
+    was first tested on, the same tilt produced 2.6 m of ramp and the height offset
+    absorbed most of it, which is why this went unseen.
+
+    The tilt is fitted from the height residual alone, after the horizontal
+    placement is already fixed, so GNSS altitude noise - always worse than
+    horizontal - cannot pull the easting and northing fit around.
+
+    Returns a rotation, the name of what was fitted, and the fit's diagnostics.
+    """
+    xy = np.asarray(xy, dtype=np.float64)
+    height_residual = np.asarray(height_residual, dtype=np.float64)
+    identity = np.eye(3, dtype=np.float64)
+
+    # A gradient in two directions needs the trajectory to have travelled in two
+    # directions. Down a straight street only the along-track component is
+    # observable, and fitting the cross-track one anyway invents a tilt from noise.
+    span_x = float(xy[:, 0].max() - xy[:, 0].min())
+    span_y = float(xy[:, 1].max() - xy[:, 1].min())
+    if min(span_x, span_y) < min_span_m:
+        return identity, "tilt_skipped_route_too_straight", {
+            "tilt_span_x_m": span_x,
+            "tilt_span_y_m": span_y,
+        }
+
+    centre = xy.mean(axis=0)
+    design = np.column_stack(
+        [np.ones(xy.shape[0]), xy[:, 0] - centre[0], xy[:, 1] - centre[1]]
+    )
+    coefficients, *_ = np.linalg.lstsq(design, height_residual, rcond=None)
+    _constant, slope_x, slope_y = coefficients
+    gradient = float(np.hypot(slope_x, slope_y))
+    tilt_deg = float(np.degrees(np.arctan(gradient)))
+
+    diagnostics = {
+        "tilt_deg": tilt_deg,
+        "tilt_slope_x": float(slope_x),
+        "tilt_slope_y": float(slope_y),
+        "tilt_span_x_m": span_x,
+        "tilt_span_y_m": span_y,
+    }
+
+    # A real IMU misalignment is a fraction of a degree. Anything large is some
+    # other problem - a broken altitude series, a route on a hillside the fit has
+    # mistaken for tilt - and silently rotating the cloud by it would hide that.
+    if tilt_deg > max_tilt_deg:
+        return identity, "tilt_rejected_implausible", diagnostics
+    if gradient == 0.0:
+        return identity, "tilt_zero", diagnostics
+
+    # The fitted plane has normal (-slope_x, -slope_y, 1). Rotate that onto the
+    # vertical: axis is their cross product, angle the one between them. This is a
+    # true rotation, so unlike adding the plane back as a height correction - which
+    # would be a shear - it leaves every distance and angle in the cloud untouched.
+    normal = np.array([-slope_x, -slope_y, 1.0], dtype=np.float64)
+    normal /= np.linalg.norm(normal)
+    vertical = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    axis = np.cross(normal, vertical)
+    axis_norm = float(np.linalg.norm(axis))
+    if axis_norm == 0.0:
+        return identity, "tilt_zero", diagnostics
+    axis /= axis_norm
+    angle = float(np.arccos(np.clip(np.dot(normal, vertical), -1.0, 1.0)))
+
+    cross = np.array(
+        [
+            [0.0, -axis[2], axis[1]],
+            [axis[2], 0.0, -axis[0]],
+            [-axis[1], axis[0], 0.0],
+        ],
+        dtype=np.float64,
+    )
+    rotation = (
+        identity + np.sin(angle) * cross + (1.0 - np.cos(angle)) * (cross @ cross)
+    )
+    return rotation, "tilt_fitted", diagnostics
+
+
+def _level_transform(
+    placed: np.ndarray,
+    gps_z: np.ndarray,
+    *,
+    min_span_m: float,
+    max_tilt_deg: float,
+) -> Tuple[np.ndarray, str, Dict[str, float]]:
+    """
+    The extra transform that levels an already-placed cloud onto GPS heights.
+
+    Takes the placed trajectory and the GPS height at the same instants, and owns
+    the sign convention between them so that no caller has to get it right: the
+    residual `_fit_vertical_tilt` needs is how far the cloud sits *above* truth,
+    and passing it the other way round rotates the cloud the wrong way and doubles
+    the error instead of removing it.
+    """
+    placed = np.asarray(placed, dtype=np.float64)
+    gps_z = np.asarray(gps_z, dtype=np.float64)
+
+    rotation, method, diagnostics = _fit_vertical_tilt(
+        placed[:, :2],
+        placed[:, 2] - gps_z,
+        min_span_m=min_span_m,
+        max_tilt_deg=max_tilt_deg,
+    )
+
+    # Rotate about the trajectory's own centre, so levelling cannot move the cloud
+    # sideways as a side effect.
+    pivot = placed.mean(axis=0)
+    transform = _rigid_transform_matrix(rotation, pivot - rotation @ pivot)
+
+    # Levelling shifts the cloud in height, so the offset is taken again against
+    # the levelled trajectory rather than the tilted one.
+    levelled = _apply_transform(transform, placed)
+    offset = float(np.median(gps_z - levelled[:, 2]))
+    transform = (
+        _rigid_transform_matrix(np.eye(3), np.array([0.0, 0.0, offset])) @ transform
+    )
+    diagnostics["tilt_residual_offset_m"] = offset
+    return transform, method, diagnostics
 
 
 def _rotation_deg(rotation: np.ndarray) -> float:
@@ -2116,6 +2264,8 @@ def slam_raw_to_gps_anchored_las(
     deskew_method: str,
     anchor_min_motion_m: float,
     anchor_z_mode: str,
+    anchor_tilt_min_span_m: float = 50.0,
+    anchor_tilt_max_deg: float = 5.0,
     reflectivity_filter: bool,
     min_reflectivity: int,
     map_voxel_size: float,
@@ -2157,8 +2307,12 @@ def slam_raw_to_gps_anchored_las(
         raise ValueError("SLAM voxel_size cannot be negative.")
     if anchor_min_motion_m < 0:
         raise ValueError("anchor_min_motion_m cannot be negative.")
-    if anchor_z_mode not in {"offset", "none"}:
-        raise ValueError("anchor_z_mode must be one of: offset, none")
+    if anchor_z_mode not in {"offset", "none", "tilt"}:
+        raise ValueError("anchor_z_mode must be one of: offset, none, tilt")
+    if anchor_tilt_min_span_m <= 0:
+        raise ValueError("anchor_tilt_min_span_m must be positive.")
+    if anchor_tilt_max_deg <= 0:
+        raise ValueError("anchor_tilt_max_deg must be positive.")
 
     gps_t_raw = gps_df[gps_time_col].to_numpy(dtype=np.int64)
     gps_e = gps_df["easting"].to_numpy(dtype=np.float64)
@@ -2319,13 +2473,34 @@ def slam_raw_to_gps_anchored_las(
             gps_xy,
             min_motion_m=anchor_min_motion_m,
         )
-        aligned_traj_xy = (rotation @ slam_xy.T).T + translation
-
-        if anchor_z_mode == "offset":
-            z_offset = float(np.median(gps_z_interp - traj_xyz[:, 2]))
-        else:
+        if anchor_z_mode == "none":
             z_offset = 0.0
-        aligned_traj_z = traj_xyz[:, 2] + z_offset
+        else:
+            z_offset = float(np.median(gps_z_interp - traj_xyz[:, 2]))
+
+        # Four-parameter placement first: yaw, easting, northing, height offset.
+        transform = _rigid_transform_matrix(
+            _yaw_rotation_3d(rotation),
+            np.array([translation[0], translation[1], z_offset], dtype=np.float64),
+        )
+
+        tilt_diagnostics: Dict[str, float] = {}
+        tilt_method = "tilt_not_requested"
+        if anchor_z_mode == "tilt":
+            placed = _apply_transform(transform, traj_xyz)
+            levelling, tilt_method, tilt_diagnostics = _level_transform(
+                placed,
+                gps_z_interp,
+                min_span_m=anchor_tilt_min_span_m,
+                max_tilt_deg=anchor_tilt_max_deg,
+            )
+            transform = levelling @ transform
+            z_offset += tilt_diagnostics.get("tilt_residual_offset_m", 0.0)
+            anchor_method = f"{anchor_method}+{tilt_method}"
+
+        aligned_traj = _apply_transform(transform, traj_xyz)
+        aligned_traj_xy = aligned_traj[:, :2]
+        aligned_traj_z = aligned_traj[:, 2]
 
         qa_metrics = _compute_xy_alignment_metrics(gps_xy, aligned_traj_xy)
         z_residual = aligned_traj_z - gps_z_interp
@@ -2339,6 +2514,8 @@ def slam_raw_to_gps_anchored_las(
             "anchor_translation_x": float(translation[0]),
             "anchor_translation_y": float(translation[1]),
             "anchor_z_offset": z_offset,
+            "anchor_z_mode": anchor_z_mode,
+            **tilt_diagnostics,
         }
 
         _emit(
@@ -2356,9 +2533,9 @@ def slam_raw_to_gps_anchored_las(
 
         # Move the SLAM poses into the georeferenced frame, then let the replay place
         # the points. Transforming poses rather than points is what keeps the result
-        # rigid: every point inherits the same four-parameter shift, so no relative
-        # geometry can change.
-        transform = _rigid_transform_matrix(rotation, translation, z_offset)
+        # rigid: every point inherits the same transform, so no relative geometry can
+        # change. `transform` was composed above and already carries the tilt when one
+        # was fitted.
         pose_ts = np.concatenate(column_timestamps)
         pose_cols = transform @ np.concatenate(column_pose_blocks, axis=0)
         order = np.argsort(pose_ts, kind="stable")
@@ -2533,6 +2710,12 @@ def slam_raw_to_gps_anchored_las_pose_optimizer(
         raise ValueError("poseopt_max_iterations must be > 0.")
     if anchor_min_motion_m < 0:
         raise ValueError("anchor_min_motion_m cannot be negative.")
+    if anchor_z_mode == "tilt":
+        # `tilt` is the default because it is what rigid_fit should do. The pose
+        # optimizer already solves height at every node, so there is no single tilt
+        # for it to correct; treat the mode as `offset` rather than refusing to run,
+        # since nobody asked for a tilt here - the default did.
+        anchor_z_mode = "offset"
 
     weights = _parse_xyz_weights(poseopt_constraint_weights)
 
@@ -3236,9 +3419,28 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--anchor-z-mode",
-        choices=["offset", "none"],
-        default="offset",
-        help="How to anchor Z for SLAM+GPS mode.",
+        choices=["offset", "none", "tilt"],
+        default="tilt",
+        help=(
+            "How to anchor Z for SLAM+GPS mode. 'offset' shifts the cloud by a "
+            "constant height; 'tilt' also levels it, correcting the SLAM frame's "
+            "vertical against GPS (rigid_fit only, and still a rigid transform)."
+        ),
+    )
+    parser.add_argument(
+        "--anchor-tilt-min-span-m",
+        type=float,
+        default=50.0,
+        help=(
+            "Minimum trajectory extent in both easting and northing before a tilt "
+            "is fitted. A straight route cannot observe the cross-track component."
+        ),
+    )
+    parser.add_argument(
+        "--anchor-tilt-max-deg",
+        type=float,
+        default=5.0,
+        help="Reject a fitted tilt larger than this rather than applying it.",
     )
     parser.add_argument(
         "--anchor-backend",
@@ -3499,6 +3701,8 @@ def run_from_args(
                 deskew_method=args.slam_deskew_method,
                 anchor_min_motion_m=args.anchor_min_motion_m,
                 anchor_z_mode=args.anchor_z_mode,
+                anchor_tilt_min_span_m=args.anchor_tilt_min_span_m,
+                anchor_tilt_max_deg=args.anchor_tilt_max_deg,
                 reflectivity_filter=(args.reflectivity_filter == "on"),
                 min_reflectivity=args.min_reflectivity,
                 map_voxel_size=args.poseopt_map_voxel_size,

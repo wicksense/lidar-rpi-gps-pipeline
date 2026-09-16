@@ -23,7 +23,11 @@ from lidar_rpi_gps_pipeline.jobs.offline_fusion import (
     _find_metadata_json_candidates,
     _lookup_pose_columns,
     _new_las_header,
+    _apply_transform,
+    _fit_vertical_tilt,
+    _level_transform,
     _rigid_transform_matrix,
+    _yaw_rotation_3d,
     _scan_valid_timestamp_count,
     _trajectory_csv_path,
     _trim_query_to_gps_range,
@@ -460,7 +464,9 @@ def test_rigid_transform_matrix_places_without_reshaping() -> None:
     rotation = np.array(
         [[math.cos(angle), -math.sin(angle)], [math.sin(angle), math.cos(angle)]]
     )
-    transform = _rigid_transform_matrix(rotation, np.array([100.0, 200.0]), 5.0)
+    transform = _rigid_transform_matrix(
+        _yaw_rotation_3d(rotation), np.array([100.0, 200.0, 5.0])
+    )
 
     assert transform.shape == (4, 4)
     assert transform[2, 2] == pytest.approx(1.0)
@@ -471,6 +477,136 @@ def test_rigid_transform_matrix_places_without_reshaping() -> None:
     pts = np.array([[0.0, 0.0, 0.0, 1.0], [3.0, 4.0, 12.0, 1.0]]).T
     moved = (transform @ pts).T[:, :3]
     assert np.linalg.norm(moved[1] - moved[0]) == pytest.approx(13.0)
+
+
+def _l_shaped_track(n: int = 400) -> np.ndarray:
+    """An L, so a tilt is observable in both easting and northing."""
+    leg = n // 2
+    north = np.column_stack([np.zeros(leg), np.linspace(0.0, 350.0, leg)])
+    east = np.column_stack([np.linspace(0.0, 700.0, leg), np.full(leg, 350.0)])
+    return np.vstack([north, east])
+
+
+def test_fit_vertical_tilt_recovers_a_known_tilt() -> None:
+    xy = _l_shaped_track()
+    # A plane tilted by a known gradient, which is what an IMU misalignment leaves
+    # behind in the height residual.
+    slope_x, slope_y = 0.012, -0.009
+    residual = 3.0 + slope_x * (xy[:, 0] - xy[:, 0].mean()) + slope_y * (
+        xy[:, 1] - xy[:, 1].mean()
+    )
+
+    rotation, method, info = _fit_vertical_tilt(
+        xy, residual, min_span_m=50.0, max_tilt_deg=5.0
+    )
+
+    assert method == "tilt_fitted"
+    assert info["tilt_deg"] == pytest.approx(
+        math.degrees(math.atan(math.hypot(slope_x, slope_y))), abs=1e-6
+    )
+    # It must be a rotation: orthonormal, right-handed, distance preserving.
+    assert np.allclose(rotation @ rotation.T, np.eye(3), atol=1e-12)
+    assert np.linalg.det(rotation) == pytest.approx(1.0)
+
+    # Applying it to the tilted surface levels it.
+    points = np.column_stack([xy[:, 0], xy[:, 1], residual])
+    levelled = (rotation @ points.T).T
+    spread = levelled[:, 2].max() - levelled[:, 2].min()
+    assert spread < 0.02
+
+
+def test_fit_vertical_tilt_preserves_distances() -> None:
+    xy = _l_shaped_track()
+    residual = 0.015 * (xy[:, 0] - xy[:, 0].mean())
+    rotation, method, _info = _fit_vertical_tilt(
+        xy, residual, min_span_m=50.0, max_tilt_deg=5.0
+    )
+    assert method == "tilt_fitted"
+
+    pair = np.array([[0.0, 0.0, 0.0], [3.0, 4.0, 12.0]])
+    moved = (rotation @ pair.T).T
+    assert np.linalg.norm(moved[1] - moved[0]) == pytest.approx(13.0)
+
+
+def test_fit_vertical_tilt_skips_a_straight_route() -> None:
+    # Down one street only the along-track gradient is observable; fitting the
+    # cross-track one would invent a tilt out of noise.
+    xy = np.column_stack([np.linspace(0.0, 800.0, 300), np.zeros(300)])
+    residual = 0.01 * xy[:, 0]
+
+    rotation, method, info = _fit_vertical_tilt(
+        xy, residual, min_span_m=50.0, max_tilt_deg=5.0
+    )
+
+    assert method == "tilt_skipped_route_too_straight"
+    assert np.allclose(rotation, np.eye(3))
+    assert info["tilt_span_y_m"] == pytest.approx(0.0)
+
+
+def test_fit_vertical_tilt_rejects_an_implausible_tilt() -> None:
+    xy = _l_shaped_track()
+    # 30 degrees is a broken altitude series or a hillside, not an IMU offset.
+    residual = math.tan(math.radians(30.0)) * (xy[:, 0] - xy[:, 0].mean())
+
+    rotation, method, info = _fit_vertical_tilt(
+        xy, residual, min_span_m=50.0, max_tilt_deg=5.0
+    )
+
+    assert method == "tilt_rejected_implausible"
+    assert np.allclose(rotation, np.eye(3))
+    assert info["tilt_deg"] == pytest.approx(30.0, abs=1e-6)
+
+
+def test_level_transform_removes_the_tilt_rather_than_doubling_it() -> None:
+    # The sign between "cloud height" and "GPS height" has one wrong answer that
+    # still produces a perfectly valid rotation, applied the wrong way: the ramp
+    # comes out twice as large instead of gone. Asserting the residual shrinks is
+    # what separates the two; asserting a tilt was fitted is not.
+    xy = _l_shaped_track()
+    gps_z = 200.0 + 0.004 * xy[:, 1]
+    slope_x, slope_y = -0.0114, -0.0112
+    placed = np.column_stack(
+        [
+            xy[:, 0],
+            xy[:, 1],
+            gps_z
+            + 1.5
+            + slope_x * (xy[:, 0] - xy[:, 0].mean())
+            + slope_y * (xy[:, 1] - xy[:, 1].mean()),
+        ]
+    )
+
+    before = float(np.sqrt(np.mean((placed[:, 2] - gps_z) ** 2)))
+    transform, method, info = _level_transform(
+        placed, gps_z, min_span_m=50.0, max_tilt_deg=5.0
+    )
+    levelled = _apply_transform(transform, placed)
+    after = float(np.sqrt(np.mean((levelled[:, 2] - gps_z) ** 2)))
+
+    assert method == "tilt_fitted"
+    assert info["tilt_deg"] == pytest.approx(0.914, abs=0.01)
+    assert after < 0.05
+    assert after < before / 10.0
+
+
+def test_level_transform_keeps_the_cloud_where_it_was_horizontally() -> None:
+    xy = _l_shaped_track()
+    gps_z = np.full(xy.shape[0], 200.0)
+    placed = np.column_stack(
+        [xy[:, 0], xy[:, 1], gps_z + 0.012 * (xy[:, 0] - xy[:, 0].mean())]
+    )
+
+    transform, _method, _info = _level_transform(
+        placed, gps_z, min_span_m=50.0, max_tilt_deg=5.0
+    )
+    levelled = _apply_transform(transform, placed)
+
+    # Levelling is a rotation about the trajectory centre, so the horizontal
+    # placement the XY fit already settled must survive it.
+    horizontal_shift = np.linalg.norm(
+        levelled[:, :2].mean(axis=0) - placed[:, :2].mean(axis=0)
+    )
+    assert horizontal_shift < 0.01
 
 
 def test_extract_scan_column_poses_drops_invalid_columns() -> None:

@@ -7,6 +7,10 @@ the PTP timing path with DGPS-quality GPS:
   dropouts. Source of the parameter values below.
 - **2026-08-26**, downtown San Antonio: 13 chunks, 370 s, 1692 m, with four capture
   dropouts. Source of the capture-gap findings and of the output-field work.
+  **The raw capture for this session no longer exists**, so every figure below that
+  came from it is a record, not something that can be re-measured. The short-route
+  regression baseline has moved to 2026-07-21 chunk 1 - see
+  [Regression baseline](#regression-baseline).
 
 This file is the current operating guidance. `HANDOFF.md` describes an earlier
 hardware configuration and an earlier CLI and should not be used for parameter
@@ -33,7 +37,7 @@ python3 offline_fuse_lidar_gps.py \
   --anchor-backend rigid_fit \
   --slam-voxel-size 0.25 \
   --slam-min-range 2.5 \
-  --poseopt-map-voxel-size 0.05 \
+  --poseopt-map-voxel-size 0.1 \
   --gps-time-column pi_time_ns \
   --utm-epsg 32614 \
   --lidar-raw /path/to/gap_free_stretch \
@@ -98,8 +102,8 @@ points by 2.3, not by 8.
 
 ## Placing the cloud without distorting it
 
-Anchoring a SLAM cloud to GPS is a trade, and until 2026-09-10 only one side of it
-was being measured.
+Anchoring a SLAM cloud to GPS is a trade, and both sides of it have to be
+measured.
 
 - **QA residual** says how closely the trajectory follows GPS. Denser and stronger
   constraints always improve it.
@@ -169,6 +173,84 @@ each independently anchored piece brings its own ~0.9 m GPS error. Where two of
 them meet, a wall can appear twice a metre apart, which downstream classification
 reads as a real object. A uniform offset across the whole cloud is harmless by
 comparison - classification works on local shape and height above ground.
+
+## Regression baseline
+
+Changes to the anchoring code are checked against a short single chunk before
+anything is run over a full route, because a short chunk finishes in minutes and
+most defects show up in the QA numbers rather than in the cloud.
+
+The baseline was one 29 s / 165 m chunk of the 2026-08-26 session until that
+capture was deleted. It is now **2026-07-21 `chunk0000-1`**, which is close enough
+that the two are interchangeable for this purpose:
+
+| | 2026-08-26 chunk0000-5 (gone) | 2026-07-21 chunk0000-1 |
+|---|---|---|
+| Length | 165 m | ~170 m |
+| `rigid_fit` QA median | 0.88 m | 0.884 m |
+| `rigid_fit` Z RMSE | 0.93 m | 1.117 m |
+
+Run it with the production settings and `--poseopt-map-voxel-size 0.5`: the QA
+numbers are computed from the trajectory before any export happens, so the export
+voxel cannot change them and a coarse one makes the check fast.
+
+**What this baseline cannot check.** The first 350 m of the 2026-07-21 route is a
+straight northward street, so a single chunk of it never turns. Anything whose
+behaviour depends on the route covering two directions - the vertical tilt fit
+below is the example - will take its own straight-route path here and has to be
+validated on the full L-shaped route instead. A baseline that passes is evidence of
+no harm, not evidence that a new correction works.
+
+**A short baseline cannot stand alone, because some errors scale with route
+length.** The vertical tilt is the worked example: it is 2.6 m of height ramp over
+165 m and 10.65 m over 1031 m, so a short chunk reports a healthy figure for a
+defect that makes a full route unusable. Any change to anchoring has to clear a
+route of **delivery length** before it is believed, not just the short baseline.
+The short one exists to fail fast, not to sign anything off.
+
+## Levelling the cloud: the vertical tilt
+
+SLAM takes "up" from the IMU at the start of a run, and that direction carries a
+small fixed error. A `rigid_fit` placement solves four numbers - yaw, easting,
+northing, a height offset - and **none of them is a rotation about a horizontal
+axis**, so nothing in it can correct that error. It appears instead as a height
+residual that grows linearly across the site.
+
+Measured on 2026-07-21 chunks 1-6, 1031 m:
+
+| | Four parameters | |
+|---|---|---|
+| Z residual at the start of the route | -6.84 m | |
+| Z residual at the end | +3.82 m | |
+| Span | **10.65 m** | over ground that itself moved only 7.00 m |
+| Z RMSE | 3.58 m | |
+| Fitted tilt | **0.915 deg** | |
+| Z RMSE after removing that tilt | **0.911 m** | |
+
+Over the 165 m chunk the method was first measured on, the same tilt produces
+2.6 m of ramp and the height offset absorbs most of it, which is why it went
+unseen: the defect scales with route length and the original test route was too
+short to show it.
+
+`--anchor-z-mode tilt` fits it. The correction is applied as a **rotation**, not as
+a height correction shaped like the fitted plane - adding the plane back would be a
+shear, which changes distances; a rotation cannot. The result is still exactly as
+rigid as before, which is the whole reason to use this backend.
+
+Two things it deliberately refuses to do:
+
+- **A straight route gets no tilt.** Down one street only the along-track gradient
+  is observable and the cross-track one would be fitted out of noise, so the fit is
+  skipped unless the trajectory spans `--anchor-tilt-min-span-m` (default 50 m) in
+  both easting and northing.
+- **An implausible tilt is rejected, not applied.** A real IMU misalignment is a
+  fraction of a degree. Past `--anchor-tilt-max-deg` (default 5) the likely causes
+  are a broken altitude series or a route on a hillside that the fit has mistaken
+  for tilt, and silently rotating the cloud would hide either.
+
+`tilt` is the default. `pose_optimizer` quietly falls back to `offset` under it,
+because that backend already solves height at every node and has no single tilt to
+correct.
 
 ## Capture gaps break SLAM, and no amount of tuning fixes it
 
@@ -282,48 +364,22 @@ minutes.
 
 ## Acceptance checks
 
-The QA report alone is not sufficient. On this session three of four configurations
-passed QA while only one produced a usable cloud. Run all three checks:
+These live in `VALIDATION.md`, with the thresholds, the reasoning behind the two
+that are easy to misread, and the scripts that measure them. Do not keep a second
+copy here: one of them has already drifted from the other.
 
-1. **QA report** - `xy_median_m` and `xy_p95_m` against the thresholds in the
-   report. Necessary but not sufficient.
-2. **Coverage** - sample positions along the GPS track and confirm each has points
-   nearby. `slam_map` and `rigid_fit` can return a cloud covering only the last
-   part of the route while QA still reports pass; the QA report now also carries
-   `map_to_trajectory_span_ratio` for this.
-3. **Height distribution** - fraction of points more than 10 m below or 30 m above
-   local ground. Under 1% is healthy; the accepted run here was 0.004%. A
-   distorted-pose run reached 19%.
-4. **Surface thickness** - the spread perpendicular to locally flat surfaces. This
-   is the check that caught anchoring distortion; none of the other three would
-   have. Under 2 cm is what good SLAM produces on this rig. Measure it with PDAL:
+The short version, because it decides whether a run was worth doing: the QA report
+is necessary and not sufficient. It compares the **trajectory** against GPS and
+never inspects the exported points, so it cannot see a truncated cloud or one whose
+poses were twisted. For `pose_optimizer` it is also partly self-reporting, since
+the optimiser minimises the very residual QA measures - raising constraint weights
+always improves the score whether or not the map improves. Measured: the
+configuration scoring best on QA, 0.28 m, produced the worst cloud
+in the comparison at 5.9 cm surface thickness, against 0.9 cm for the configuration
+scoring 0.88 m.
 
-   ```
-   filters.eigenvalues (knn 20) -> sqrt(Eigenvalue0)
-   filters.covariancefeatures (knn 20) -> keep the top quartile of Planarity
-   ```
-
-   The square root of the smallest eigenvalue is the out-of-plane spread of a
-   point's neighbourhood, so it does not care how the cloud is oriented - which
-   matters because `slam_map` writes its output in the SLAM local frame where the
-   road is not horizontal. Restricting to planar neighbourhoods keeps tree crowns,
-   where thickness is meaningless, out of the statistic.
-
-Only the point cloud itself can settle map quality. Load it and look for doubled
-walls, stepped ground, or concentric rings, all of which QA is blind to.
-
-### QA does not inspect the point cloud
-
-QA compares the *trajectory* against GPS. It never looks at the exported points, so
-it cannot see a truncated cloud or one whose poses were twisted by over-weighted
-constraints. Treat a passing QA as "the trajectory is where GPS says it should be",
-nothing more. It is also partly self-reporting for the `pose_optimizer` backend,
-which minimises the very residual QA measures - raising the constraint weights
-always improves the score, whether or not the map improves. That is now measured
-rather than suspected: the configuration scoring best on QA, 0.28 m, produced the
-worst cloud in the comparison at 5.9 cm surface thickness, against 0.9 cm for the
-configuration scoring 0.88 m. See
-[Placing the cloud without distorting it](#placing-the-cloud-without-distorting-it).
+Only the cloud itself settles map quality. Load it and look for doubled walls,
+stepped ground, or concentric rings. QA is blind to all three.
 
 ## Defects found
 
