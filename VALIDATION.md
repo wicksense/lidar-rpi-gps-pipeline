@@ -25,8 +25,12 @@ the optimiser minimises the very residual QA measures, so raising constraint
 weights always improves the score whether or not the map improves.
 
 Measured on one 165 m chunk of the 2026-08-26 session, holding everything else
-fixed. That capture has since been deleted, so this table is a record rather
-than something that can be re-measured:
+fixed, with GPS stamped by `pi_time_ns` (the 0.3 s-late clock; see
+[TUNING.md](TUNING.md#gps-time-use-the-fix-epoch-not-the-read-time)). The
+same pattern was re-measured on the full 2026-07-21 route on 2026-10-16 with the
+correct clock - `pose_optimizer` `1,1,1` at 0.06 m QA median and 4.26 cm thickness,
+`rigid_fit` at 0.35 m and 1.43 cm - in
+[TUNING.md](TUNING.md#re-measured-2026-10-16-with-the-correct-gps-time):
 
 | Configuration | Surface thickness | QA median | Verdict |
 |---|---|---|---|
@@ -49,23 +53,39 @@ Run all four. A run is accepted only if all four pass.
 
 From the `_qa.json` written beside the LAS.
 
-| Metric | Threshold | This deliverable |
-|---|---|---|
-| `xy_median_m` | below 2.0 m, and **not far below 0.3 m** | 1.492 m |
-| `xy_p95_m` | below 2.5 m | 2.324 m |
-| `z_rmse_m` | below 1.5 m for `rigid_fit` | 0.924 m |
+Thresholds revised 2026-10-16, after the GPS time column was corrected. The first
+figure column is the 2026-09-13 deliverable, made with the 0.3 s-late `pi_time_ns`
+clock, which would now fail; the second is its corrected successor.
 
-The 2.0 m figure comes from the reference, not from the cloud. The reference is a
-1 Hz non-RTK GNSS series accurate to about a metre, so the threshold is set at
-roughly twice that. **This check measures absolute registration and varies with
-route geometry**; it is listed separately from the internal-geometry checks for
-that reason, and a run can be excellent on one and poor on the other.
+| Metric | Threshold | 2026-09-13 deliverable | 2026-10-15 run C |
+|---|---|---|---|
+| `xy_median_m` | below 0.6 m | 1.492 m | 0.349 m |
+| `xy_p95_m` | below 1.2 m | 2.324 m | 0.904 m |
+| `xy_max_m` | below 3 m | 27.38 m | 1.58 m |
+| `z_rmse_m` | below 1.5 m for `rigid_fit` | 0.924 m | 0.925 m |
+| `extra.gps_time_offset_best_s` | within ±0.1 s | not recorded | -0.04 s |
 
-The lower bound is the unusual part and it is deliberate. GPS on this rig is
-accurate to roughly a metre. A trajectory that matches it to 0.28 m is not more
-accurate than GPS; it is **fitting GPS noise**, and the cost of doing so is written
-into the shape of the cloud. A median well under 0.3 m is a reason to check surface
-thickness before believing the run, not a reason to celebrate.
+The median and p95 thresholds are set at roughly 1.5x what the corrected full route
+reaches; single chunks reach 0.11-0.26 m. Before the correction they were 2.0 m and
+2.5 m, set at twice a GPS error of "about a metre" that was mostly the clock lag.
+**This check measures agreement with GPS, not absolute registration**: against the
+independent 3DEP survey the corrected cloud still needs about 0.8 m of horizontal
+shift, and its height is several metres out (see the 3DEP note under check 3).
+
+`xy_max_m` is new and exists to catch a pose spike: one transient excursion leaves the
+median untouched and sends the maximum to tens of metres. `rigid_fit` repairs spikes
+since 2026-10-15, so a large maximum on that backend now means something it did not
+recognise.
+
+`gps_time_offset_best_s` is the time shift at which the trajectory fits GPS best,
+written by `rigid_fit`. Anything far from zero means the two clocks disagree and the
+whole placement is off by speed x offset.
+
+For `pose_optimizer` the median carries a lower warning as well as an upper one. It
+minimises the residual QA measures, so a median far below `rigid_fit`'s on the same
+route - 0.06 m against 0.35 m on 2026-07-21 - means it is **fitting GPS's own errors**,
+and the cost is written into the shape of the cloud. Check surface thickness before
+believing such a run.
 
 `z_rmse_m` behaves differently under `rigid_fit` depending on the anchoring mode,
 and the threshold assumes `--anchor-z-mode tilt`. With the four-parameter placement
@@ -79,7 +99,10 @@ ramp. See
 against the route length, and prefer `tilt` on anything long enough to turn a
 corner. Around 0.9 m is what remains once the tilt is removed, and it is acceptable
 for classification work, which uses height above local ground. Comparison against an
-external elevation product needs separate handling.
+external elevation product needs separate handling: `z_rmse_m` is measured against
+GPS altitude, which 3DEP shows to be several metres low and drifting, and the
+corrected cloud's road surface sits 4.08 m below 3DEP bare earth. See
+[TUNING.md](TUNING.md#absolute-height-is-only-as-good-as-gps-altitude-which-is-off-by-metres).
 
 ### 2. Coverage
 
@@ -309,11 +332,12 @@ with GPS rather than SLAM settling. **Run this check on `rigid_fit` output only.
 
 Every threshold in this file was set by measuring a specific capture. When that
 capture is gone the number stays in the document but stops being checkable, and
-nobody reading it later can tell the difference. That has already happened once:
-the 2026-08-26 downtown session was the source of the capture-gap rulings, the
+nobody reading it later can tell the difference. That nearly happened once: the
+2026-08-26 downtown session was the source of the capture-gap rulings, the
 anchoring comparison and the original regression baseline, and its raw capture was
-deleted. Those figures are now a record rather than something that can be
-re-measured, and the regression baseline had to move to 2026-07-21 chunk 1.
+believed deleted, so the regression baseline moved to 2026-07-21 chunk 1. Complete
+originals were later found on the Pi and copied to `Data\20260826\Pi_original\`,
+so those figures can be re-measured after all.
 
 So:
 
@@ -338,9 +362,9 @@ So:
 
 | | |
 |---|---|
-| Short-route regression | 2026-07-21 `chunk0000-1` (~170 m) - **keep indefinitely** |
+| Short-route regression | 2026-07-21 `chunk0000-1` (120 m) - **keep indefinitely** |
 | Full-route deliverable | 2026-07-21 `chunk0000-1` through `-6` (1031 m) - **keep indefinitely** |
-| 2026-08-26 downtown | deleted; its figures are records only |
+| 2026-08-26 downtown | originals recovered to `Data\20260826\Pi_original\` |
 
 ## Delivery checklist
 
@@ -373,3 +397,9 @@ A run is not delivered until all of these are true.
 | CRS | EPSG:32614 |
 | Points delivered | 31,576,695 |
 | Processing time | ~60 min |
+
+This deliverable was made with the 0.3 s-late `pi_time_ns` clock and carries the
+unrepaired pose spike, so it fails the revised QA thresholds above. Its corrected
+successor, identical in shape and better placed, is run C in
+`Data\20260721\Processed\tests_20261015_gps_timing\C_c1to6_rigidfit_tilt_newcode_v010\`;
+it has not been promoted to the deliverable.

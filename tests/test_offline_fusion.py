@@ -18,11 +18,15 @@ from lidar_rpi_gps_pipeline.jobs.offline_fusion import (
     MAP_ATTR_COLUMNS,
     _CaptureGapTracker,
     _extract_scan_column_poses,
+    _estimate_gps_time_offset,
     _extract_session_id_from_gps_csv_path,
+    _find_transient_pose_spikes,
+    _repair_pose_spikes,
     _filter_raw_paths_by_session,
     _find_metadata_json_candidates,
     _lookup_pose_columns,
     _new_las_header,
+    _scan_column_validity,
     _apply_transform,
     _fit_vertical_tilt,
     _level_transform,
@@ -267,11 +271,22 @@ def test_expand_raw_lidar_inputs_glob_sorts_split_chunks_chronologically(tmp_pat
 
 
 class _FakeScan:
-    def __init__(self, timestamps: list[int]) -> None:
+    def __init__(
+        self,
+        timestamps: list[int],
+        frame_id: int | None = None,
+        status: list[int] | None = None,
+    ) -> None:
         self.timestamp = timestamps
         self.fields = []
         self.h = 1
         self.w = len(timestamps)
+        # Only set when the test needs them, so the attribute-absent fallbacks
+        # stay covered by the tests that pass timestamps alone.
+        if frame_id is not None:
+            self.frame_id = frame_id
+        if status is not None:
+            self.status = status
 
     def field(self, _name: str) -> None:
         raise KeyError
@@ -287,11 +302,11 @@ def test_updated_has_any_valid_timestamps_ignores_empty_scans() -> None:
     assert _updated_has_any_valid_timestamps([_FakeScan([0, 0])]) is False
 
 
-def test_preferred_gps_time_column_from_manifest_prefers_pi_time_for_ptp_architecture() -> None:
+def test_preferred_gps_time_column_from_manifest_prefers_fix_epoch_for_ptp_architecture() -> None:
     manifest = {
         "timing_architecture": "gps_pps_to_pi__chrony_to_pi_clock__ptp_to_ouster",
     }
-    assert preferred_gps_time_column_from_manifest(manifest) == "pi_time_ns"
+    assert preferred_gps_time_column_from_manifest(manifest) == "gps_epoch_ns"
 
 
 def test_lookup_pose_columns_marks_large_drift_as_outlier_instead_of_raising() -> None:
@@ -370,6 +385,99 @@ def test_capture_gap_tracker_ignores_scans_without_valid_timestamps() -> None:
     assert tracker.observe(_FakeScan([0, 0])) is None
     assert tracker.observe(_FakeScan([1_100_000_000])) is None
     assert tracker.summary()["count"] == 0
+
+
+def test_scan_column_validity_prefers_the_status_field() -> None:
+    # A column can hold a timestamp while the sensor still marks it invalid, so
+    # status wins where it is available.
+    assert _scan_column_validity(_FakeScan([1, 2, 3, 4], status=[1, 1, 0, 0])) == (2, 4)
+    # With no status field, a zeroed timestamp is the signal instead.
+    assert _scan_column_validity(_FakeScan([1, 0, 3, 0])) == (2, 4)
+
+
+def test_capture_gap_tracker_flags_scans_missing_columns() -> None:
+    tracker = _CaptureGapTracker(threshold_s=0.5)
+    tracker.start_file("/data/raw_lidar_chunk0000.pcap")
+
+    tracker.observe(_FakeScan([1_000_000_000, 1_000_050_000, 1_000_100_000], frame_id=10))
+    # Two of this frame's three columns never arrived.
+    tracker.observe(_FakeScan([1_000_150_000, 0, 0], frame_id=11))
+    tracker.observe(_FakeScan([1_000_200_000, 1_000_250_000, 1_000_300_000], frame_id=12))
+
+    summary = tracker.summary()
+    assert summary["count"] == 0
+    assert summary["scans_seen"] == 3
+    assert summary["incomplete_scan_count"] == 1
+    assert summary["missing_columns"] == 2
+
+    entry = summary["incomplete_scans"][0]
+    assert entry["frame_id"] == 11
+    assert entry["valid_columns"] == 1
+    assert entry["total_columns"] == 3
+    assert entry["missing_columns"] == 2
+    assert entry["at_file_boundary"] is False
+
+
+def test_capture_gap_tracker_sees_dropout_that_stays_under_the_time_threshold() -> None:
+    """
+    The 2026-07-21 defect: 408 packets were lost in a 0.32 s hole. The hole sat
+    below CAPTURE_GAP_THRESHOLD_S, nothing was reported, and the merged trajectory
+    came out 28 % longer than the GPS track. Column counts have to catch it.
+    """
+    tracker = _CaptureGapTracker(threshold_s=0.5)
+    tracker.start_file("/data/raw_lidar_chunk0000-1.pcap")
+
+    tracker.observe(_FakeScan([1_000_000_000, 1_000_050_000], frame_id=764))
+    # The SDK emits zeroed scans for frames whose packets were all lost.
+    tracker.observe(_FakeScan([0, 0], frame_id=765))
+    tracker.observe(_FakeScan([0, 0], frame_id=766))
+    tracker.observe(_FakeScan([1_320_000_000, 1_320_050_000], frame_id=767))
+
+    summary = tracker.summary()
+    # 0.32 s is under the threshold, so the time check stays silent ...
+    assert summary["count"] == 0
+    # ... but the missing columns are counted exactly.
+    assert summary["incomplete_scan_count"] == 2
+    assert summary["missing_columns"] == 4
+    assert [s["frame_id"] for s in summary["incomplete_scans"]] == [765, 766]
+
+
+def test_capture_gap_tracker_labels_chunk_boundary_scans() -> None:
+    tracker = _CaptureGapTracker(threshold_s=0.5)
+
+    tracker.start_file("/data/chunk0000.pcap")
+    tracker.observe(_FakeScan([1_000_000_000, 1_000_050_000], frame_id=1))
+    # Last scan of the file: the rotation cut this frame in half.
+    tracker.observe(_FakeScan([1_000_100_000, 0], frame_id=2))
+
+    tracker.start_file("/data/chunk0000-1.pcap")
+    # First scan of the next file carries the other half.
+    tracker.observe(_FakeScan([0, 1_000_200_000], frame_id=3))
+    tracker.observe(_FakeScan([1_000_250_000, 1_000_300_000], frame_id=4))
+
+    summary = tracker.summary()
+    assert summary["incomplete_scan_count"] == 2
+    assert [s["at_file_boundary"] for s in summary["incomplete_scans"]] == [True, True]
+    assert [s["file"] for s in summary["incomplete_scans"]] == [
+        "chunk0000.pcap",
+        "chunk0000-1.pcap",
+    ]
+
+
+def test_capture_gap_tracker_stays_quiet_on_complete_scans() -> None:
+    tracker = _CaptureGapTracker(threshold_s=0.5)
+    tracker.start_file("/data/chunk0000.pcap")
+
+    for index in range(5):
+        base = 1_000_000_000 + index * 50_000
+        tracker.observe(_FakeScan([base, base + 25_000], frame_id=index))
+
+    summary = tracker.summary()
+    assert summary["scans_seen"] == 5
+    assert summary["incomplete_scan_count"] == 0
+    assert summary["missing_columns"] == 0
+    assert summary["incomplete_scans"] == []
+    assert summary["incomplete_scans_truncated"] is False
 
 
 def test_find_metadata_json_candidates_skips_empty_sidecar_and_uses_sibling(
@@ -630,3 +738,81 @@ def test_extract_scan_column_poses_rejects_mismatched_layout() -> None:
 
     with pytest.raises(ValueError, match="does not match"):
         _extract_scan_column_poses(_BadScan())
+
+
+def _straight_drive(n: int, rate_hz: float, speed_mps: float) -> tuple[np.ndarray, np.ndarray]:
+    t = (1_784_671_600 * 10**9 + np.arange(n) * (1e9 / rate_hz)).astype(np.int64)
+    xyz = np.zeros((n, 3))
+    xyz[:, 0] = speed_mps * (t - t[0]) / 1e9
+    return t, xyz
+
+
+def test_find_transient_pose_spikes_finds_an_out_and_back_excursion() -> None:
+    t, xyz = _straight_drive(2000, 1000.0, 6.0)
+    xyz[700:740] = [-20.0, -18.0, -1.5]  # falls back to a far-away pose for 40 ms
+
+    windows, steps = _find_transient_pose_spikes(t, xyz)
+
+    assert windows == [(700, 740)]
+    assert steps == []
+
+
+def test_find_transient_pose_spikes_ignores_honest_motion_across_a_capture_gap() -> None:
+    t, xyz = _straight_drive(2000, 1000.0, 6.0)
+    # 0.35 s of missing poses: consecutive samples 2.1 m apart, but at 6 m/s.
+    t = np.concatenate([t[:1000], t[1350:]])
+    xyz = np.concatenate([xyz[:1000], xyz[1350:]])
+
+    windows, steps = _find_transient_pose_spikes(t, xyz)
+
+    assert windows == []
+    assert steps == []
+
+
+def test_find_transient_pose_spikes_reports_a_jump_that_never_returns() -> None:
+    t, xyz = _straight_drive(4000, 1000.0, 6.0)
+    xyz[1500:, 1] += 25.0
+
+    windows, steps = _find_transient_pose_spikes(t, xyz)
+
+    assert windows == []
+    assert steps == [1500]
+
+
+def test_repair_pose_spikes_interpolates_translation_and_rotation() -> None:
+    t = np.array([0, 10, 20, 30, 40], dtype=np.int64)
+    poses = np.repeat(np.eye(4)[np.newaxis], 5, axis=0)
+    poses[:, 0, 3] = [0.0, 99.0, 99.0, 99.0, 4.0]
+    theta = math.radians(10.0)
+    poses[4, :3, :3] = _yaw_rotation_3d(
+        np.array([[math.cos(theta), -math.sin(theta)], [math.sin(theta), math.cos(theta)]])
+    )
+
+    repaired = _repair_pose_spikes(t, poses, [(1, 4)])
+
+    assert np.allclose(repaired[1:4, 0, 3], [1.0, 2.0, 3.0])
+    mid_yaw = math.degrees(math.atan2(repaired[2, 1, 0], repaired[2, 0, 0]))
+    assert mid_yaw == pytest.approx(5.0, abs=1e-6)
+    assert np.allclose(repaired[[0, 4]], poses[[0, 4]])
+
+
+def test_estimate_gps_time_offset_recovers_a_known_lag() -> None:
+    # An L-shaped drive with changing speed, so a lag cannot be absorbed by the fit.
+    slam_t = (np.arange(0, 120, 0.05) * 1e9).astype(np.int64)
+    s = slam_t / 1e9
+    speed = 4.0 + 3.0 * np.sin(s / 7.0)
+    dist = np.cumsum(speed) * 0.05
+    leg = dist < 300
+    x = np.where(leg, dist, 300.0)
+    y = np.where(leg, 0.0, dist - 300.0)
+    slam_xy = np.column_stack([x, y])
+    gps_t = (np.arange(1, 119) * 1e9).astype(np.int64)
+    gps_e = np.interp(gps_t, slam_t, x) + 500_000.0
+    gps_n = np.interp(gps_t, slam_t, y) + 3_000_000.0
+    lagged = gps_t + int(0.3 * 1e9)  # stamped 0.3 s late, like pi_time_ns
+
+    result = _estimate_gps_time_offset(slam_t, slam_xy, lagged, gps_e, gps_n)
+
+    assert result["gps_time_offset_best_s"] == pytest.approx(-0.3, abs=0.03)
+    assert result["gps_time_offset_median_at_best_m"] < 0.1
+    assert result["gps_time_offset_median_at_zero_m"] > 0.5

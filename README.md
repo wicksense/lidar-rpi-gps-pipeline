@@ -31,7 +31,11 @@ The PTP path is useful when you want the Pi to be the central timing authority i
 
 That gives the offline pipeline a clean shared time basis, and for these sessions the preferred offline time column is:
 
-- `--gps-time-column pi_time_ns`
+- `--gps-time-column gps_epoch_ns` (what `auto` picks)
+
+`pi_time_ns` is when the Pi finished reading a fix over I2C, about 0.3 s after the
+fix was taken; using it misplaces every fix by roughly 2 m at urban speeds. See
+`TUNING.md`.
 
 ### Wiring the GPS to the Pi for the PTP path
 
@@ -352,8 +356,8 @@ Other GPS input modes are still available when they match your hardware:
 - `gpsd`: use only if you have separately installed and configured `gpsd`
 
 Recommended offline guidance for this architecture:
-- prefer `--gps-time-column pi_time_ns`
-- keep `gps_epoch_ns` for QA and UTC traceability
+- use `--gps-time-column gps_epoch_ns` (the default `auto` picks it)
+- keep `pi_time_ns` only for diagnosing read latency
 
 ### Web UI for road use
 
@@ -576,15 +580,15 @@ For PTP-based sessions, start with:
 python3 offline_fuse_lidar_gps.py \
   --manifest-json /path/to/capture_manifest.json \
   --processing-mode slam_gps_anchor \
-  --gps-time-column pi_time_ns \
   --output-dir /path/to/output
 ```
 
-Why `pi_time_ns` is preferred here:
+Why `gps_epoch_ns` (the `auto` choice) and not `pi_time_ns`:
 
-- the GPS rows are timestamped by the Pi clock
-- the Ouster is supposed to lock to that same Pi-driven clock via PTP
-- so `pi_time_ns` is the cleanest shared time basis for offline alignment
+- the Pi clock follows GPS PPS through chrony, so both it and the Ouster's PTP time are UTC
+- `gps_epoch_ns` is the instant the receiver computed the position
+- `pi_time_ns` is when the Pi got round to reading it, about 0.3 s later on this rig,
+  which on 2026-07-21 inflated the median placement error from 0.34 m to 1.49 m
 
 ### Choosing chunk duration
 
@@ -780,7 +784,7 @@ These options apply to `--processing-mode gps_fusion` and `--processing-mode sla
 
 Guidance:
 - for the original GPS logging path, `auto` is usually the right choice
-- for `pi_capture_ptp.py` sessions, prefer `--gps-time-column pi_time_ns`
+- for `pi_capture_ptp.py` sessions, use `auto` or `gps_epoch_ns`; never `pi_time_ns`, which lags the fix by about 0.3 s
 
 ## SLAM Options
 

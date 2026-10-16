@@ -72,6 +72,37 @@ def _format_unix_utc(seconds: float) -> str:
     return datetime.datetime.utcfromtimestamp(float(seconds)).strftime("%H:%M:%S.%f")[:12]
 
 
+# Marks a frame the batcher has already shown whole, so that a zeroed placeholder
+# emitted for it afterwards is not mistaken for a lost frame.
+_FRAME_SEEN_COMPLETE = object()
+
+
+def _scan_column_validity(scan: Any) -> Optional[Tuple[int, int]]:
+    """
+    Return `(valid_columns, total_columns)` for one scan, or None if neither
+    field can be read.
+
+    `status` is the sensor's own per-column validity flag and is the primary
+    source. The timestamp column is the fallback: a column whose UDP packet never
+    arrived is left zeroed, so counting non-zero timestamps measures the same
+    thing for this purpose.
+    """
+    try:
+        status = np.asarray(scan.status).astype(np.int64)
+        if status.size:
+            return int(np.count_nonzero(status & 1)), int(status.size)
+    except Exception:
+        pass
+
+    try:
+        timestamps = np.asarray(scan.timestamp, dtype=np.int64)
+    except Exception:
+        return None
+    if timestamps.size == 0:
+        return None
+    return int(np.count_nonzero(timestamps > 0)), int(timestamps.size)
+
+
 class _CaptureGapTracker:
     """
     Detect breaks in the LiDAR stream as scans are fed to SLAM.
@@ -85,16 +116,147 @@ class _CaptureGapTracker:
 
     Timestamps come from the sensor clock, so a gap here means packets were lost or
     the sensor stopped sending, not that files were supplied out of order.
+
+    Incomplete scans are the second defect, and the time check above is blind to
+    them. When UDP packets are dropped at capture time the affected frame still
+    arrives, just with fewer columns than the sensor emitted, and its surviving
+    columns still carry timestamps -- so the stream reads as continuous. On the
+    2026-07-21 session a 0.32 s hole (408 packets lost, six frames gone outright)
+    stayed under `CAPTURE_GAP_THRESHOLD_S`, was never reported, and left the merged
+    trajectory 28 % longer than the GPS track it was built against. Column counts
+    are exact and need no threshold, so they are taken for every scan.
     """
+
+    # Listing every incomplete scan would bloat the QA report on a badly damaged
+    # session. Counts and totals stay exact; only the per-scan detail is capped.
+    MAX_INCOMPLETE_DETAIL = 100
+
+    # After a dropout the SDK's scan batcher emits the same frame more than once:
+    # first the fragment it holds, then fuller versions as late packets are placed,
+    # and zeroed placeholders for frames that never arrived at all. Counting each
+    # emission separately would multiply one damaged frame into a dozen. Damaged
+    # frames are therefore held briefly and merged by id, keeping the most complete
+    # view of each. The window is small because the repeats are always adjacent,
+    # and because frame ids are 16-bit: a map kept for the whole session would
+    # eventually merge unrelated frames after a wrap.
+    RECENT_FRAME_WINDOW = 256
 
     def __init__(self, threshold_s: float = CAPTURE_GAP_THRESHOLD_S) -> None:
         self.threshold_s = float(threshold_s)
         self.gaps: List[Dict[str, float]] = []
+        self.incomplete: List[Dict[str, Any]] = []
+        self.incomplete_count = 0
+        self.missing_columns = 0
+        self.scans_seen = 0
         self._last_ns: Optional[int] = None
+        self._file: Optional[str] = None
+        self._scan_in_file = 0
+        self._scans_per_file: Dict[str, int] = {}
+        self._detail_truncated = False
+        # Values are either a damaged-frame entry or the _FRAME_SEEN_COMPLETE mark.
+        self._pending: Dict[Any, Any] = {}
+
+    def start_file(self, path: str) -> None:
+        """
+        Note which raw file the scans that follow came from.
+
+        A frame that straddles a chunk boundary is split across two files and shows
+        up as incomplete in each. That is how the capture was rotated rather than a
+        dropout in flight, so `summary` labels those entries separately; knowing the
+        file and the position within it is what makes the distinction possible.
+        """
+        self._file = os.path.basename(path)
+        self._scan_in_file = 0
+
+    def _record(self, entry: Dict[str, Any]) -> None:
+        self.incomplete_count += 1
+        self.missing_columns += entry["missing_columns"]
+        if len(self.incomplete) >= self.MAX_INCOMPLETE_DETAIL:
+            self._detail_truncated = True
+            return
+        self.incomplete.append(entry)
+
+    def _release_oldest(self) -> None:
+        entry = self._pending.pop(next(iter(self._pending)))
+        if entry is not _FRAME_SEEN_COMPLETE:
+            self._record(entry)
+
+    def _evict(self) -> None:
+        while len(self._pending) > self.RECENT_FRAME_WINDOW:
+            self._release_oldest()
+
+    def _flush_pending(self) -> None:
+        while self._pending:
+            self._release_oldest()
+
+    def _note_incomplete(self, scan: Any) -> None:
+        validity = _scan_column_validity(scan)
+        if validity is None:
+            return
+        valid, total = validity
+        if total <= 0:
+            return
+
+        frame_id = getattr(scan, "frame_id", None)
+        try:
+            frame_id = None if frame_id is None else int(frame_id)
+        except Exception:
+            frame_id = None
+        # Without a frame id there is nothing to merge on, so each scan stands
+        # alone and the scan index keeps the keys distinct.
+        key = (self._file, frame_id, None if frame_id is not None else self._scan_in_file)
+
+        if valid >= total:
+            # The frame is intact. It may already be held as damaged, from an
+            # earlier partial emission, or the placeholder may still be coming --
+            # the batcher does both. Recording the verdict covers either order.
+            self._pending[key] = _FRAME_SEEN_COMPLETE
+            self._evict()
+            return
+
+        held = self._pending.get(key)
+        if held is _FRAME_SEEN_COMPLETE:
+            return
+        if held is not None:
+            held["last_scan_index_in_file"] = self._scan_in_file
+            if valid > held["valid_columns"]:
+                held["valid_columns"] = valid
+                held["missing_columns"] = total - valid
+            return
+
+        unix_s: Optional[float] = None
+        try:
+            timestamps = np.asarray(scan.timestamp, dtype=np.int64)
+            positive = timestamps[timestamps > 0]
+            if positive.size:
+                unix_s = float(positive.min()) / 1e9
+        except Exception:
+            unix_s = None
+
+        self._pending[key] = {
+            "file": self._file,
+            "scan_index_in_file": self._scan_in_file,
+            "last_scan_index_in_file": self._scan_in_file,
+            "frame_id": frame_id,
+            "valid_columns": valid,
+            "total_columns": total,
+            "missing_columns": total - valid,
+            "unix_s": unix_s,
+        }
+        self._evict()
 
     def observe(self, scan: Any) -> Optional[Dict[str, float]]:
         if scan is None:
             return None
+
+        self.scans_seen += 1
+        self._scan_in_file += 1
+        if self._file is not None:
+            self._scans_per_file[self._file] = self._scan_in_file
+        # Before the timestamp check below, which returns early on a scan the SDK
+        # zeroed out -- exactly the scans a dropout produces.
+        self._note_incomplete(scan)
+
         try:
             timestamps = np.asarray(scan.timestamp, dtype=np.int64)
         except Exception:
@@ -119,11 +281,33 @@ class _CaptureGapTracker:
         return gap
 
     def summary(self) -> Dict[str, Any]:
+        # Damaged frames still inside the merge window have not been counted yet.
+        # Flushing empties the window, so calling this twice is safe.
+        self._flush_pending()
+
+        incomplete: List[Dict[str, Any]] = []
+        for entry in self.incomplete:
+            item = dict(entry)
+            scans_in_file = self._scans_per_file.get(item["file"])
+            item["at_file_boundary"] = bool(
+                item["scan_index_in_file"] == 1
+                or (
+                    scans_in_file is not None
+                    and item["last_scan_index_in_file"] == scans_in_file
+                )
+            )
+            incomplete.append(item)
+
         return {
             "threshold_s": self.threshold_s,
             "count": len(self.gaps),
             "total_s": float(sum(g["gap_s"] for g in self.gaps)),
             "gaps": self.gaps,
+            "scans_seen": self.scans_seen,
+            "incomplete_scan_count": self.incomplete_count,
+            "missing_columns": self.missing_columns,
+            "incomplete_scans": incomplete,
+            "incomplete_scans_truncated": self._detail_truncated,
         }
 
 
@@ -179,17 +363,20 @@ def choose_time_mode(
 
 def preferred_gps_time_column_from_manifest(manifest: Optional[Dict[str, Any]]) -> Optional[str]:
     """
-    Prefer `pi_time_ns` for Pi-clock/PTP capture manifests.
+    Prefer `gps_epoch_ns` for Pi-clock/PTP capture manifests.
 
-    In the PTP pipeline, the LiDAR timestamps should align to the Pi's clock
-    domain, so `pi_time_ns` is the safest automatic default when the manifest
-    explicitly identifies that architecture.
+    In the PTP pipeline the Pi clock is disciplined to GPS PPS, so LiDAR
+    timestamps and the receiver's fix epoch are both UTC. `gps_epoch_ns` is the
+    instant the position is valid for. `pi_time_ns` is when the Pi finished
+    reading it over I2C, about 0.3 s later on this rig, which places every fix
+    roughly 2 m behind the vehicle at urban speeds. It is not truncated: the
+    receiver fixes on whole seconds at 1 Hz, and the bridge keeps any fraction.
     """
     if not isinstance(manifest, dict):
         return None
     timing_architecture = str(manifest.get("timing_architecture") or "")
     if timing_architecture == "gps_pps_to_pi__chrony_to_pi_clock__ptp_to_ouster":
-        return "pi_time_ns"
+        return "gps_epoch_ns"
     return None
 
 
@@ -1262,6 +1449,199 @@ def _fit_xy_rigid_transform(
         rotation = vh.T @ u.T
     translation = dst_center - (rotation @ src_center)
     return rotation, translation, "rigid_xy"
+
+
+POSE_SPIKE_MIN_JUMP_M = 2.0
+POSE_SPIKE_MAX_SPEED_MPS = 40.0
+POSE_SPIKE_MAX_DURATION_S = 2.0
+
+
+def _find_transient_pose_spikes(
+    timestamps_ns: np.ndarray,
+    xyz: np.ndarray,
+    *,
+    min_jump_m: float = POSE_SPIKE_MIN_JUMP_M,
+    max_speed_mps: float = POSE_SPIKE_MAX_SPEED_MPS,
+    max_duration_s: float = POSE_SPIKE_MAX_DURATION_S,
+) -> Tuple[List[Tuple[int, int]], List[int]]:
+    """
+    Find poses that leave the trajectory and come back.
+
+    Observed on 2026-07-21 right after a 0.35 s capture dropout: for about 40 ms
+    the SLAM column poses fell back to the run's starting pose, 27 m away, then
+    resumed where the vehicle actually was. Points replayed through those poses
+    land as a displaced ghost at plausible heights, which no height check sees.
+
+    A jump has to be both large and impossibly fast. Large alone would flag the
+    honest step across a capture gap, where 0.35 s at 6 m/s moves 2 m between
+    consecutive samples; fast alone is meaningless at the column rate, where
+    millimetre jitter over 50 microseconds reads as tens of metres per second.
+
+    Returns `(windows, steps)`. Each window is a half-open index range `[a, b)` of
+    bad samples bracketed by good ones. `steps` lists jumps that never came back
+    within `max_duration_s`: a step change in the solution, reported but not
+    repaired, because interpolating across it would invent a trajectory.
+    """
+    t = np.asarray(timestamps_ns, dtype=np.int64)
+    xyz = np.asarray(xyz, dtype=np.float64)
+    if t.size < 3:
+        return [], []
+    step = np.linalg.norm(np.diff(xyz, axis=0), axis=1)
+    dt = np.diff(t).astype(np.float64) / 1e9
+    with np.errstate(divide="ignore", invalid="ignore"):
+        speed = np.where(dt > 0, step / dt, np.inf)
+    jumps = np.flatnonzero((step > min_jump_m) & (speed > max_speed_mps))
+
+    windows: List[Tuple[int, int]] = []
+    steps: List[int] = []
+    k = 0
+    while k < jumps.size:
+        out = int(jumps[k]) + 1  # first bad sample
+        anchor = out - 1
+        returned_at = None
+        for later in jumps[k + 1 :]:
+            back = int(later) + 1
+            span_s = (t[back] - t[anchor]) / 1e9
+            if span_s > max_duration_s:
+                break
+            reach = min_jump_m + max_speed_mps * span_s
+            if np.linalg.norm(xyz[back] - xyz[anchor]) <= reach:
+                returned_at = back
+                break
+        if returned_at is None:
+            steps.append(out)
+            k += 1
+            continue
+        windows.append((out, returned_at))
+        k = int(np.searchsorted(jumps, returned_at - 1, side="right"))
+    return windows, steps
+
+
+def _rotation_to_quaternion(rotation: np.ndarray) -> np.ndarray:
+    """Unit quaternion (w, x, y, z) of a 3x3 rotation."""
+    m = np.asarray(rotation, dtype=np.float64)
+    trace = np.trace(m)
+    if trace > 0:
+        s = 2.0 * np.sqrt(trace + 1.0)
+        q = [0.25 * s, (m[2, 1] - m[1, 2]) / s, (m[0, 2] - m[2, 0]) / s, (m[1, 0] - m[0, 1]) / s]
+    elif m[0, 0] > m[1, 1] and m[0, 0] > m[2, 2]:
+        s = 2.0 * np.sqrt(1.0 + m[0, 0] - m[1, 1] - m[2, 2])
+        q = [(m[2, 1] - m[1, 2]) / s, 0.25 * s, (m[0, 1] + m[1, 0]) / s, (m[0, 2] + m[2, 0]) / s]
+    elif m[1, 1] > m[2, 2]:
+        s = 2.0 * np.sqrt(1.0 + m[1, 1] - m[0, 0] - m[2, 2])
+        q = [(m[0, 2] - m[2, 0]) / s, (m[0, 1] + m[1, 0]) / s, 0.25 * s, (m[1, 2] + m[2, 1]) / s]
+    else:
+        s = 2.0 * np.sqrt(1.0 + m[2, 2] - m[0, 0] - m[1, 1])
+        q = [(m[1, 0] - m[0, 1]) / s, (m[0, 2] + m[2, 0]) / s, (m[1, 2] + m[2, 1]) / s, 0.25 * s]
+    q = np.asarray(q, dtype=np.float64)
+    return q / np.linalg.norm(q)
+
+
+def _quaternion_to_rotation(q: np.ndarray) -> np.ndarray:
+    w, x, y, z = np.asarray(q, dtype=np.float64) / np.linalg.norm(q)
+    return np.array(
+        [
+            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+        ]
+    )
+
+
+def _slerp(q0: np.ndarray, q1: np.ndarray, u: float) -> np.ndarray:
+    dot = float(np.dot(q0, q1))
+    if dot < 0:
+        q1, dot = -q1, -dot
+    if dot > 0.9995:
+        q = q0 + u * (q1 - q0)
+        return q / np.linalg.norm(q)
+    theta = np.arccos(dot)
+    return (np.sin((1 - u) * theta) * q0 + np.sin(u * theta) * q1) / np.sin(theta)
+
+
+def _repair_pose_spikes(
+    timestamps_ns: np.ndarray,
+    poses: np.ndarray,
+    windows: List[Tuple[int, int]],
+) -> np.ndarray:
+    """
+    Replace each spike window with poses interpolated between its two good
+    neighbours: linear in translation, slerp in rotation. The points measured
+    during a spike are genuine, only their poses are wrong, so they are kept
+    and re-placed rather than deleted.
+    """
+    repaired = np.array(poses, dtype=np.float64, copy=True)
+    t = np.asarray(timestamps_ns, dtype=np.int64)
+    for a, b in windows:
+        before, after = a - 1, b
+        q0 = _rotation_to_quaternion(repaired[before, :3, :3])
+        q1 = _rotation_to_quaternion(repaired[after, :3, :3])
+        p0 = repaired[before, :3, 3].copy()
+        p1 = repaired[after, :3, 3].copy()
+        span = float(t[after] - t[before])
+        for i in range(a, b):
+            u = float(t[i] - t[before]) / span if span > 0 else 0.5
+            repaired[i, :3, :3] = _quaternion_to_rotation(_slerp(q0, q1, u))
+            repaired[i, :3, 3] = p0 + u * (p1 - p0)
+    return repaired
+
+
+def _estimate_gps_time_offset(
+    slam_t_ns: np.ndarray,
+    slam_xy: np.ndarray,
+    gps_t_ns: np.ndarray,
+    gps_e: np.ndarray,
+    gps_n: np.ndarray,
+    *,
+    search_s: float = 0.6,
+    step_s: float = 0.02,
+) -> Dict[str, Any]:
+    """
+    Find the GPS time shift that lets a rigid fit match the trajectory best.
+
+    A rigid fit cannot bend to absorb a timing error, so a lag between the two
+    clocks shows up directly as residual that grows with speed. Sweeping a shift
+    and refitting finds it. On a healthy capture the minimum sits near zero; on
+    2026-07-21 with `pi_time_ns` it sat at -0.31 s, the I2C read latency, and
+    removing it took the median residual from 1.49 m to 0.33 m.
+
+    Only meaningful for `rigid_fit`: an optimiser that bends the trajectory onto
+    GPS absorbs the lag into its shape instead of leaving it in the residual.
+    """
+    slam_t = np.asarray(slam_t_ns, dtype=np.int64)
+    gps_t = np.asarray(gps_t_ns, dtype=np.int64)
+    offsets = np.arange(-search_s, search_s + step_s / 2, step_s)
+    medians = []
+    for off in offsets:
+        shifted = gps_t + int(round(off * 1e9))
+        inside = (slam_t >= shifted[0]) & (slam_t <= shifted[-1])
+        if inside.sum() < 10:
+            medians.append(float("nan"))
+            continue
+        ref = np.column_stack(
+            [np.interp(slam_t[inside], shifted, gps_e), np.interp(slam_t[inside], shifted, gps_n)]
+        )
+        rot, trans, _ = _fit_xy_rigid_transform(slam_xy[inside], ref, min_motion_m=0.0)
+        resid = ref - (slam_xy[inside] @ rot.T + trans)
+        medians.append(float(np.median(np.linalg.norm(resid, axis=1))))
+    medians_arr = np.asarray(medians)
+    if not np.isfinite(medians_arr).any():
+        return {"gps_time_offset_best_s": None}
+    best = int(np.nanargmin(medians_arr))
+    best_s = float(offsets[best])
+    # Parabolic refinement through the minimum and its neighbours.
+    if 0 < best < len(offsets) - 1 and np.all(np.isfinite(medians_arr[best - 1 : best + 2])):
+        y0, y1, y2 = medians_arr[best - 1 : best + 2]
+        denom = y0 - 2 * y1 + y2
+        if denom > 0:
+            best_s += 0.5 * step_s * (y0 - y2) / denom
+    zero = int(np.argmin(np.abs(offsets)))
+    return {
+        "gps_time_offset_best_s": best_s,
+        "gps_time_offset_median_at_best_m": float(medians_arr[best]),
+        "gps_time_offset_median_at_zero_m": float(medians_arr[zero]),
+        "gps_time_offset_search_s": float(search_s),
+    }
 
 
 def _fit_vertical_tilt(
@@ -2450,8 +2830,57 @@ def slam_raw_to_gps_anchored_las(
                 message="OSF stores local SLAM poses for rigid_fit backend (LAS is GPS-anchored output).",
             )
 
+        if not column_pose_blocks:
+            raise ValueError("No SLAM column poses were captured for the raw replay.")
+
+        pose_ts = np.concatenate(column_timestamps)
+        pose_local = np.concatenate(column_pose_blocks, axis=0)
+        order = np.argsort(pose_ts, kind="stable")
+        pose_ts = pose_ts[order]
+        pose_local = pose_local[order]
+        unique = np.concatenate([[True], np.diff(pose_ts) > 0])
+        pose_ts = pose_ts[unique]
+        pose_local = pose_local[unique]
+
+        spike_windows, spike_steps = _find_transient_pose_spikes(pose_ts, pose_local[:, :3, 3])
+        spike_records = []
+        for a, b in spike_windows:
+            jump = float(np.linalg.norm(pose_local[a:b, :3, 3] - pose_local[a - 1, :3, 3], axis=1).max())
+            spike_records.append(
+                {
+                    "start_unix_s": float(pose_ts[a]) / 1e9,
+                    "end_unix_s": float(pose_ts[b - 1]) / 1e9,
+                    "duration_s": float(pose_ts[b] - pose_ts[a - 1]) / 1e9,
+                    "max_jump_m": jump,
+                    "column_poses": int(b - a),
+                }
+            )
+            _log_and_emit(
+                emit_event,
+                "WARNING: transient pose spike at "
+                f"{_format_unix_utc(float(pose_ts[a]) / 1e9)}, {b - a} column poses up to "
+                f"{jump:.1f} m off; replaced by interpolation between its neighbours.",
+            )
+        for idx in spike_steps:
+            _log_and_emit(
+                emit_event,
+                "WARNING: pose step at "
+                f"{_format_unix_utc(float(pose_ts[idx]) / 1e9)} that does not return within "
+                f"{POSE_SPIKE_MAX_DURATION_S:.0f} s; left as is. Inspect the cloud there.",
+            )
+        if spike_windows:
+            pose_local = _repair_pose_spikes(pose_ts, pose_local, spike_windows)
+
         traj_t = np.asarray(traj_timestamps, dtype=np.int64)
         traj_xyz = np.asarray(traj_xyz_local, dtype=np.float64)
+        if spike_windows:
+            # The per-scan samples the fit uses come from the same poses; a sample
+            # inside a spike is a 27 m outlier in the fit, so drop it.
+            keep = np.ones(traj_t.size, dtype=bool)
+            for a, b in spike_windows:
+                keep &= ~((traj_t > pose_ts[a - 1]) & (traj_t < pose_ts[b]))
+            traj_t = traj_t[keep]
+            traj_xyz = traj_xyz[keep]
 
         slam_t, gps_t, chosen_time_mode = choose_time_mode(traj_t, gps_t_raw, time_mode)
         slam_t, in_range = _trim_query_to_gps_range(
@@ -2516,7 +2945,33 @@ def slam_raw_to_gps_anchored_las(
             "anchor_z_offset": z_offset,
             "anchor_z_mode": anchor_z_mode,
             **tilt_diagnostics,
+            "pose_spikes_repaired": spike_records,
+            "pose_steps_unrepaired": len(spike_steps),
         }
+
+        time_offset = _estimate_gps_time_offset(slam_t, slam_xy, gps_t, gps_e, gps_n)
+        qa_extra.update(time_offset)
+        best_offset = time_offset.get("gps_time_offset_best_s")
+        if best_offset is not None:
+            message = (
+                f"GPS time offset check: residual is smallest at {best_offset:+.2f} s "
+                f"({time_offset['gps_time_offset_median_at_best_m']:.2f} m median, against "
+                f"{time_offset['gps_time_offset_median_at_zero_m']:.2f} m at 0 s)"
+            )
+            if time_offset["gps_time_offset_median_at_best_m"] > 2.0:
+                # No shift makes the two agree, so the trajectory itself is wrong -
+                # a diverged SLAM run, seen with --slam-deskew-method none - and the
+                # location of the minimum means nothing.
+                message = (
+                    "WARNING: " + message + ". No time shift brings the trajectory onto "
+                    "GPS; suspect the SLAM trajectory, not the clocks."
+                )
+            elif abs(best_offset) > 0.1:
+                message = (
+                    "WARNING: " + message + ". The GPS and LiDAR clocks disagree; check "
+                    "--gps-time-column before trusting the placement."
+                )
+            _log_and_emit(emit_event, message)
 
         _emit(
             emit_event,
@@ -2528,22 +2983,12 @@ def slam_raw_to_gps_anchored_las(
             ),
         )
 
-        if not column_pose_blocks:
-            raise ValueError("No SLAM column poses were captured for the raw replay.")
-
         # Move the SLAM poses into the georeferenced frame, then let the replay place
         # the points. Transforming poses rather than points is what keeps the result
         # rigid: every point inherits the same transform, so no relative geometry can
         # change. `transform` was composed above and already carries the tilt when one
         # was fitted.
-        pose_ts = np.concatenate(column_timestamps)
-        pose_cols = transform @ np.concatenate(column_pose_blocks, axis=0)
-        order = np.argsort(pose_ts, kind="stable")
-        pose_ts = pose_ts[order]
-        pose_cols = pose_cols[order]
-        unique = np.concatenate([[True], np.diff(pose_ts) > 0])
-        pose_ts = pose_ts[unique]
-        pose_cols = pose_cols[unique]
+        pose_cols = transform @ pose_local
 
         _emit(emit_event, "status", message="Extracting point cloud from raw replay with anchored poses...")
         map_points, map_attrs, pose_lookup = _build_point_cloud_from_raw_with_poses(
@@ -2757,6 +3202,7 @@ def slam_raw_to_gps_anchored_las_pose_optimizer(
                 path=raw_path,
             )
             log(f"Processing raw LiDAR for SLAM+GPS pose optimization: {raw_path}")
+            gap_tracker.start_file(raw_path)
 
             source = None
             try:
@@ -2845,6 +3291,40 @@ def slam_raw_to_gps_anchored_las_pose_optimizer(
             )
             log(f"WARNING: {summary_message}")
             _emit(emit_event, "status", message=summary_message)
+
+        if capture_gaps["incomplete_scan_count"] > 0:
+            details = capture_gaps["incomplete_scans"]
+            at_boundary = sum(1 for item in details if item["at_file_boundary"])
+            worst = min(
+                details,
+                key=lambda item: item["valid_columns"] / max(item["total_columns"], 1),
+                default=None,
+            )
+            incomplete_message = (
+                f"{capture_gaps['incomplete_scan_count']} frame(s) arrived "
+                f"incomplete, {capture_gaps['missing_columns']} columns missing in "
+                "total. That means UDP packets were lost during capture. The gap "
+                "check above cannot see this on its own, because the columns that "
+                "did arrive still carry timestamps and keep the stream looking "
+                "continuous."
+            )
+            if at_boundary:
+                incomplete_message += (
+                    f" {at_boundary} of them are the first or last scan of a chunk "
+                    "file, where a frame split across the rotation is expected."
+                )
+            if worst is not None:
+                incomplete_message += (
+                    f" Worst: frame {worst['frame_id']} with "
+                    f"{worst['valid_columns']}/{worst['total_columns']} columns"
+                )
+                if worst["unix_s"] is not None:
+                    incomplete_message += (
+                        f" at {_format_unix_utc(worst['unix_s'])} UTC"
+                    )
+                incomplete_message += f" in {worst['file']}."
+            log(f"WARNING: {incomplete_message}")
+            _emit(emit_event, "status", message=incomplete_message)
 
         if skipped_osf_updates > 0:
             _emit(

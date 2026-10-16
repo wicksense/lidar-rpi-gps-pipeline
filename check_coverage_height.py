@@ -171,7 +171,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--gps-csv", required=True, type=Path, help="Capture GPS CSV with easting/northing."
     )
-    parser.add_argument("--gps-time-column", default="pi_time_ns")
+    parser.add_argument("--gps-time-column", default="gps_epoch_ns")
     parser.add_argument(
         "--track-step-m", type=float, default=10.0, help="Spacing of coverage samples."
     )

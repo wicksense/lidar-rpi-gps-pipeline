@@ -3,14 +3,22 @@
 Findings from processing full vehicle-mounted sessions, both OS-1-128 at 1024x20 on
 the PTP timing path with DGPS-quality GPS:
 
-- **2026-07-21**, San Antonio residential streets: 6 chunks, 176 s, 957 m, no
-  dropouts. Source of the parameter values below.
+- **2026-07-21**, San Antonio residential streets: chunks 1-6, 176 s, 1035 m, one
+  0.35 s dropout in chunk 1 (408 packets, 22:07:14.80-15.15 UTC; the cause of the
+  pose spike - see [Pose spikes](#pose-spikes-after-a-dropout)). Source of the
+  parameter values below.
 - **2026-08-26**, downtown San Antonio: 13 chunks, 370 s, 1692 m, with four capture
-  dropouts. Source of the capture-gap findings and of the output-field work.
-  **The raw capture for this session no longer exists**, so every figure below that
-  came from it is a record, not something that can be re-measured. The short-route
-  regression baseline has moved to 2026-07-21 chunk 1 - see
-  [Regression baseline](#regression-baseline).
+  dropouts. Source of the capture-gap findings and of the output-field work. The
+  raw capture was believed deleted when most of this file was written; complete
+  originals were later recovered to `Data\20260826\Pi_original\`, so its figures
+  can be re-measured. The short-route regression baseline stays on 2026-07-21
+  chunk 1 - see [Regression baseline](#regression-baseline).
+
+**Every figure in this file dated before 2026-10-15 was measured with GPS fixes
+stamped by `pi_time_ns`, which lags the fix by 0.3 s.** That inflated every
+placement error and every "GPS noise" argument built on it. Figures re-measured
+with `gps_epoch_ns` are marked as such; the rest are records of the old setting.
+See [GPS time](#gps-time-use-the-fix-epoch-not-the-read-time).
 
 This file is the current operating guidance. `HANDOFF.md` describes an earlier
 hardware configuration and an earlier CLI and should not be used for parameter
@@ -38,7 +46,6 @@ python3 offline_fuse_lidar_gps.py \
   --slam-voxel-size 0.25 \
   --slam-min-range 2.5 \
   --poseopt-map-voxel-size 0.1 \
-  --gps-time-column pi_time_ns \
   --utm-epsg 32614 \
   --lidar-raw /path/to/gap_free_stretch \
   --gps-csv /path/to/raw_gps_<session>.csv \
@@ -47,19 +54,21 @@ python3 offline_fuse_lidar_gps.py \
 
 `rigid_fit` replaced `pose_optimizer` as the recommendation on 2026-09-10. See
 [Placing the cloud without distorting it](#placing-the-cloud-without-distorting-it)
-for the measurements behind that; in short, per-node optimisation against
-metre-accurate GPS smears surfaces by a factor of six for an accuracy gain that is
-inside GPS's own noise. Keep `pose_optimizer` for routes long enough that SLAM
-drift exceeds GPS error, and use the settings in that section.
+for the measurements behind that; in short, per-node optimisation against GPS
+makes surfaces three times thicker on the 1 km delivery route for a placement gain
+that an independent survey cannot confirm (re-measured 2026-10-16 with the correct
+GPS time). Keep `pose_optimizer` for routes long enough that SLAM drift exceeds GPS
+error, and use the settings in that section.
 
 | Flag | Repo default | Use | Why |
 |---|---|---|---|
-| `--anchor-backend` | `pose_optimizer` | `rigid_fit` | Places the cloud without reshaping it. Same surface quality as pure SLAM, positioning inside GPS's own error. Only switch back for routes where SLAM drift exceeds GPS error. |
+| `--anchor-backend` | `pose_optimizer` | `rigid_fit` | Places the cloud without reshaping it. Same surface quality as pure SLAM. Re-checked 2026-10-16 with the correct GPS time: `pose_optimizer` scores better on QA but is no better against an independent survey and makes surfaces three times thicker (4.26 cm against 1.43 cm). Only switch back for routes where SLAM drift exceeds GPS error. |
 | `--poseopt-constraint-weights` | `0.01,0.01,0.001` | `0.3,0.3,0.1` *(pose_optimizer only)* | The default is 1000x weaker than the SDK's internal trajectory weight (10). On the 957 m 2026-07-21 session that left GPS effectively ignored, at 13.53 m median error. On a 165 m chunk the same default passes at 0.69 m, because SLAM barely drifts over that distance - so the defect is route-length dependent, not absolute. Its real failure is vertical: a Z weight of 0.001 leaves height unanchored, measured at 3.83 m RMSE. Balanced `1,1,1` anchors well but smears surfaces sixfold; `0.3,0.3,0.1` is the best compromise found. |
 | `--slam-voxel-size` | `0.0` (auto) | `0.25` | Auto-estimation chose 1.64 m here, above the 0.8-1.5 m the SDK itself documents for outdoor use. That coarse registration map is what produced smeared surfaces and concentric ring artefacts. Pure-SLAM runs at 0.25 m reached 1.9-2.1 cm surface thickness on all four chunks tested. |
 | `--slam-min-range` | `1.0` | `2.5` | Returns from the vehicle body sit at 1.1-2.0 m on this rig (identified by their range being constant across frames, std 2.8 cm, while real scene returns at 2.0-2.5 m vary by over 1 m). The 1.0 m default removes essentially nothing. 2.5 m clears the body with margin at a cost of 1.3% of points. |
 | `--poseopt-map-voxel-size` | `0.5` | `0.1` | Output thinning only; it does not affect accuracy. At 0.5 m the cloud is too sparse to even measure surface thickness, and the beam pattern on the ground survives thinning as visible rings. 0.1 m is 25x denser and still tractable (~52 M points, 1.5 GB for this session). |
-| `--gps-time-column` | `auto` | `pi_time_ns` | Required whenever `--lidar-raw` is used without a manifest. `gps_epoch_ns` comes from NMEA and is truncated to whole seconds, which at 5 m/s is up to 5 m of along-track error, and `auto` prefers it. With `--manifest-json` the manifest's `timing_architecture` field makes `auto` pick `pi_time_ns` on its own. |
+| `--gps-time-column` | `auto` | `auto` (= `gps_epoch_ns`) | The receiver's fix epoch. Until 2026-10-15 this row recommended `pi_time_ns`, on the belief that `gps_epoch_ns` was truncated to whole seconds; it is not, and `pi_time_ns` lags the fix by 0.3 s. See [GPS time](#gps-time-use-the-fix-epoch-not-the-read-time). |
+| `--slam-deskew-method` | `auto` | `auto` | Resolves to the SDK's IMU deskew (`InertialIntegrationImuDeskewMethod` in the log). Measured on 2026-07-21 chunk 4, the one with a 131 deg turn, at a 0.1 m export voxel: IMU 1.49 cm surface thickness, `constant_velocity` 3.54 cm, `none` diverged (17.5 m QA median). If the log shows it fell back to constant velocity, expect surfaces about twice as thick. |
 
 `--slam-min-range 2.5` was re-measured on the 2026-08-26 rig and still holds. Taking
 300 frames from a moving chunk and looking for pixels that return something almost
@@ -108,8 +117,55 @@ measured.
 - **QA residual** says how closely the trajectory follows GPS. Denser and stronger
   constraints always improve it.
 - **Surface thickness** says how sharp the cloud is. Denser and stronger constraints
-  always make it worse, because GPS is accurate to about a metre and every
-  constraint writes a share of that noise into the shape of the trajectory.
+  always make it worse, because every constraint writes a share of GPS's error into
+  the shape of the trajectory.
+
+### Re-measured 2026-10-16 with the correct GPS time
+
+The argument below was first made with `pi_time_ns`, which made GPS look accurate
+to about a metre when most of that metre was the 0.3 s timing lag. So it was
+re-measured on the full delivery route, 2026-07-21 chunks 1-6, with
+`gps_epoch_ns`, 10 m constraint spacing, `--poseopt-map-voxel-size 0.1`, everything
+else as recommended. The 3DEP rows are independent of GPS; see
+[Absolute height](#absolute-height-is-only-as-good-as-gps-altitude-which-is-off-by-metres)
+for the reference.
+
+| | `rigid_fit` | `pose_optimizer` `0.3,0.3,0.1` | `pose_optimizer` `1,1,1` |
+|---|---|---|---|
+| QA median / p95 | 0.35 / 0.90 m | 0.13 / 0.85 m | **0.06 / 0.68 m** |
+| QA max | **1.58 m** | 20.6 m | 26.3 m |
+| Z RMSE against GPS | 0.93 m | 1.54 m | 0.06 m |
+| Surface thickness p50, 0.1 m voxel | **1.43 cm** | 4.26 cm | 4.26 cm |
+| SLAM / GPS path length | **+0.34 %** | +5.6 % | +6.7 % |
+| Constraints (expected ~104) | - | 111 | 111 |
+| 3DEP: shift to match building outlines | 0.81 m | 0.61 m | 0.82 m |
+| 3DEP: ICP horizontal shift | 1.33 m | 0.88 m | 1.00 m |
+| 3DEP: road minus bare earth, median / MAD | -4.08 / 0.62 m | -4.55 / 0.34 m | -4.55 / 0.35 m |
+| 3DEP: sensor height above ground, range of 100 m bins | -1.05 to -4.68 m | +0.98 to -3.40 m | -1.27 to -3.33 m |
+
+**`rigid_fit` stays the recommendation.** Against the independent survey the three
+sit within each other's measurement error horizontally - the wall method resolves
+about 0.5 m - so the optimiser's 3-6x better QA score buys no placement that can be
+demonstrated. What it does buy is a cloud three times thicker, 4.26 cm against
+1.43 cm, which is the property classification depends on. The two weightings
+thicken the cloud equally on this route; the earlier finding that lower weights
+smear less came from a 165 m chunk with `pi_time_ns` and does not hold here.
+
+Two things the optimiser does better, both worth knowing:
+
+- **Its height follows the ground more closely.** The road-minus-3DEP spread is
+  0.34 m against 0.62 m, and the sensor-height bins wander over about 2 m instead of
+  3.6 m. Constraining height at every node pulls out part of SLAM's own vertical
+  drift, even towards a GPS altitude that is itself off - the drift it removes is
+  larger than the GPS error it adds at that scale. A rigid fit cannot do this.
+- Nothing else. The large QA maxima and path lengths are the unrepaired pose spike:
+  spike repair is wired into `rigid_fit` only.
+
+`1,1,1` matching GPS altitude to 0.06 m while sitting 4.5 m below 3DEP ground is the
+clearest example yet of why QA cannot be read alone: it is fitting GPS exactly,
+GPS's errors included.
+
+### The original comparison, 2026-08-26, `pi_time_ns`
 
 Measured on one 29 s / 165 m chunk of the 2026-08-26 session, everything else
 fixed at `--slam-voxel-size 0.25`, `--slam-min-range 2.5`,
@@ -180,15 +236,22 @@ Changes to the anchoring code are checked against a short single chunk before
 anything is run over a full route, because a short chunk finishes in minutes and
 most defects show up in the QA numbers rather than in the cloud.
 
-The baseline was one 29 s / 165 m chunk of the 2026-08-26 session until that
-capture was deleted. It is now **2026-07-21 `chunk0000-1`**, which is close enough
-that the two are interchangeable for this purpose:
+The baseline was one 29 s / 165 m chunk of the 2026-08-26 session while that
+capture was thought lost. It is now **2026-07-21 `chunk0000-1`**. Expected values,
+measured 2026-10-15 with `gps_epoch_ns` and pose-spike repair:
 
-| | 2026-08-26 chunk0000-5 (gone) | 2026-07-21 chunk0000-1 |
-|---|---|---|
-| Length | 165 m | ~170 m |
-| `rigid_fit` QA median | 0.88 m | 0.884 m |
-| `rigid_fit` Z RMSE | 0.93 m | 1.117 m |
+| | 2026-07-21 chunk0000-1 |
+|---|---|
+| Length, GPS / SLAM | 120.17 m / 120.21 m |
+| `rigid_fit` QA median | 0.26 m |
+| `rigid_fit` QA p95 / max | 0.73 m / 0.96 m |
+| `rigid_fit` Z RMSE | 1.12 m (tilt is skipped: the chunk is straight) |
+| Time offset check | best at -0.01 s |
+| Pose spikes repaired | 1, at 22:07:15.155 UTC, 832 column poses, 27.6 m |
+
+The figures this table replaced - 0.884 m median, "~170 m" length - came from
+`pi_time_ns` and from a trajectory still carrying the 27 m spike; the spike's out
+and back alone added 55 m, which is why the length was misread as 170 m.
 
 Run it with the production settings and `--poseopt-map-voxel-size 0.5`: the QA
 numbers are computed from the trajectory before any export happens, so the export
@@ -251,6 +314,33 @@ Two things it deliberately refuses to do:
 `tilt` is the default. `pose_optimizer` quietly falls back to `offset` under it,
 because that backend already solves height at every node and has no single tilt to
 correct.
+
+## Absolute height is only as good as GPS altitude, which is off by metres
+
+Everything above judges height against GPS altitude, the same series the fit uses.
+Checked on 2026-10-15 against an independent survey, USGS 3DEP "TX Central B2 2017"
+airborne lidar (tested 0.03 m vertical RMSE; files and datum conversion in
+`Data\USGS_3DEP_TX_Central_B2_2017\`), the height is the weak axis by far:
+
+- **GPS altitude is biased low and wanders.** The roof antenna should read about
+  2 m above the 3DEP ground under it. It reads 0.4 to 3.3 m *below*, and the offset
+  drifts by 3.7 m over the eight-minute session. A geoid-model difference would be a
+  constant, so this is the receiver's vertical solution, not a datum mismatch.
+- **The tilt is real.** With `offset`, sensor height above 3DEP ground runs from
+  -7.2 m to +1.7 m along the 1089 m route, 8.9 m/km. With `tilt` the trend falls to
+  -1.9 m/km. So the 0.92 deg correction is doing the right thing.
+- **What remains is waviness and an offset.** After `tilt`, sensor height above
+  ground still varies between -1.2 and -4.6 m in 100 m bins, and the whole cloud
+  sits about 4 m low: our road surface is 4.09 m below 3DEP bare earth (median of
+  15,717 one-metre cells, MAD 0.62 m). A rigid transform can only add a plane, so
+  the waviness is SLAM's own vertical drift; the offset is GPS altitude.
+
+None of this touches height above local ground, which is what classification uses,
+and none of it changes with `--gps-time-column`. It does mean **absolute heights from
+this pipeline are good to a few metres, not to the 0.9 m `z_rmse_m` suggests** -
+that figure measures agreement with a GPS altitude that is itself several metres
+out. Anything compared against an external elevation product needs a vertical
+reference other than GPS.
 
 ## Capture gaps break SLAM, and no amount of tuning fixes it
 
@@ -316,6 +406,67 @@ summary, and recorded under `extra.capture_gaps` in the QA report. The threshold
 Gaps are packet loss at capture time, not a transfer problem: the timestamps come
 from the sensor clock. They are invisible in file sizes and in anything that only
 checks that a pcap parses.
+
+### Pose spikes after a dropout
+
+A gap short enough for SLAM to survive can still leave a mark. 2026-07-21 chunk 1
+lost 408 packets between 22:07:14.80 and 22:07:15.15 UTC - six whole frames plus
+two partial ones, about 0.35 s. For the next 41 ms, 832 column poses, the SLAM
+output fell back to the run's **starting pose**, 27.6 m behind the vehicle, and
+then resumed where the vehicle actually was. Every point measured in those 41 ms
+was replayed through the wrong pose and landed as a displaced ghost at plausible
+heights. It is the "transient pose spike at t = 7.4 s" earlier deliverables
+documented as unexplained.
+
+`rigid_fit` now finds such excursions and repairs them before the replay
+(`_find_transient_pose_spikes`, `_repair_pose_spikes`). A jump counts only if it is
+both large (over 2 m between consecutive poses) and impossibly fast (over 40 m/s),
+and only if the trajectory comes back within 2 s; the poses inside are replaced by
+interpolation between the good poses either side, linear in position and slerp in
+rotation. The points are kept, because they are genuine measurements with wrong
+poses. A jump that never comes back is reported as a pose step and left alone.
+Each repair is logged and listed under `extra.pose_spikes_repaired` in the QA
+report.
+
+On the 1-6 route: QA maximum 27.7 m to 1.58 m, SLAM path length 1093.3 m to
+1038.3 m against GPS's 1034.9 m (+0.34 %). For the points recorded in the window,
+the distance from the true sensor position (interpolated from outside the window)
+now matches each point's measured range to a median 0.01 m, against 8.2 m before,
+when 58 % were more than 5 m out. Surface thickness and every other check unchanged.
+
+## GPS time: use the fix epoch, not the read time
+
+The GPS CSV carries two timestamps per fix:
+
+- `gps_epoch_ns` - the instant the receiver computed the position, from the NMEA
+  sentence. At 1 Hz the receiver fixes on whole GPS seconds, which is why the values
+  look truncated; they are not. `ublox_i2c_chrony_bridge.py` keeps any fractional
+  seconds the sentence carries.
+- `pi_time_ns` - when the Pi finished reading that sentence over I2C.
+
+The second lags the first by 0.31 s on average (0.11-0.36 s) on 2026-07-21 and by
+0.25-0.28 s on both 2026-08-26 sessions. At the route's 6-9 m/s that puts each fix
+about 2 m behind where the vehicle was. Because the Pi clock follows GPS PPS through
+chrony, the LiDAR's PTP time and `gps_epoch_ns` are both UTC, so `gps_epoch_ns` is
+the one that matches.
+
+Measured on 2026-07-21 chunks 1-6, `rigid_fit`, everything else fixed:
+
+| GPS time column | QA median | QA p95 | Surface thickness (0.1 m voxel) |
+|---|---|---|---|
+| `pi_time_ns` (recommended here until 2026-10-15) | 1.49 m | 2.32 m | 1.42 cm |
+| `gps_epoch_ns` | **0.34 m** | **0.91 m** | 1.41 cm |
+
+A sweep confirms it from the data alone: refitting the same trajectory with the GPS
+times shifted in 0.05 s steps puts the minimum residual at 0 to -0.05 s from
+`gps_epoch_ns`. On single chunks the improvement is larger - chunk 4, 0.11 m median.
+Independently of GPS, aligning against 3DEP building outlines needs a 1.42 m shift
+for the `pi_time_ns` cloud and 0.81 m for the `gps_epoch_ns` one.
+
+`rigid_fit` now runs that sweep on every run and records the best shift in the QA
+report as `gps_time_offset_best_s`, warning if it is more than 0.1 s from zero, or
+if no shift gets the residual below 2 m, which points to a broken trajectory
+rather than a clock.
 
 ## What the exported LAS carries
 
@@ -445,6 +596,27 @@ Fixed on 2026-09-10:
   set, with thickness unchanged at 0.9 cm and QA unchanged at 0.88 m.
   `--reflectivity-filter` and `--poseopt-map-voxel-size` now apply to this backend
   too.
+
+Fixed on 2026-10-15:
+
+- **The GPS fixes were stamped with the time the Pi read them, not the time they
+  were taken.** `pi_time_ns` lags by 0.3 s, and both this file and the manifest
+  preference in the code chose it. The manifest preference and `auto` now pick
+  `gps_epoch_ns`, as do the defaults of `check_coverage_height.py`,
+  `crop_convergence.py` and `plot_session_mode_stability.py`. See
+  [GPS time](#gps-time-use-the-fix-epoch-not-the-read-time).
+- **Pose spikes after a dropout were left in the cloud.** `rigid_fit` now repairs
+  them. See [Pose spikes](#pose-spikes-after-a-dropout).
+- **Nothing checked the two clocks against each other.** `rigid_fit` now records
+  the best-fitting GPS time shift in the QA report.
+
+Not fixed in the pipeline:
+
+- **`pose_optimizer` does not repair pose spikes**: it takes its column poses from
+  the optimiser rather than from the SLAM scans, and the repair has only been wired
+  into `rigid_fit`.
+- **Absolute height follows GPS altitude**, which 3DEP shows to be several metres
+  out. See [Absolute height](#absolute-height-is-only-as-good-as-gps-altitude-which-is-off-by-metres).
 
 Reported but not fixed, because the fix is a design decision:
 

@@ -280,7 +280,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--gps-time-column",
-        default="pi_time_ns",
+        default="gps_epoch_ns",
         help="GPS timestamp column; must be the clock the run was processed against.",
     )
     parser.add_argument("--output", type=Path, help="Defaults to <las root>_cropped.las.")

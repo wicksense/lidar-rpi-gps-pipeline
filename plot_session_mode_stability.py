@@ -174,8 +174,8 @@ def _load_session_motion(
 
     gps_df, time_col = offline_fusion.load_gps_for_interpolation(
         str(raw_gps_path),
-        "pi_time_ns",
-        preferred_auto_columns=["pi_time_ns"],
+        "gps_epoch_ns",
+        preferred_auto_columns=["gps_epoch_ns"],
         apply_outlier_filter=True,
         gps_outlier_max_speed_mps=max_speed_mps,
     )
