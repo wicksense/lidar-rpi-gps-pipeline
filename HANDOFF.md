@@ -11,8 +11,8 @@ new machine.
 > - The rig now runs `1024x20` (20 Hz) with `TIME_FROM_PTP_1588`, not `1024x10`
 >   with `TIME_FROM_SYNC_PULSE_IN` + `INPUT_NMEA_UART` as section 1 says. Section 9
 >   is stale for the same reason.
-> - Section 9 recommends `pi_time_ns`; `TUNING.md` explains when that is required
->   and when `gps_epoch_ns` is preferable, and the CLI help is authoritative.
+> - Section 9 recommends `pi_time_ns`. That is wrong: it lags the GPS fix by about
+>   0.3 s. Use `gps_epoch_ns`, which `auto` picks; `TUNING.md` has the measurements.
 > - The flag list in section 12 is missing `--lidar-session-filter`,
 >   `--reflectivity-filter`, `--min-reflectivity`, `--gps-outlier-filter`,
 >   `--gps-outlier-max-speed-mps` and `--poseopt-map-voxel-size`.

@@ -27,6 +27,29 @@ choices.
 Read "[What transfers and what does not](#what-transfers-and-what-does-not)" before
 reusing the numbers on a different route.
 
+## What was wrong with the early clouds, and what fixed it
+
+The August 2026 clouds were blurred and misplaced. None of it was a fault in the SLAM
+algorithm itself (the Ouster SDK's KISS-ICP backend, unmodified); it came from the
+settings around it and from how the result was put onto GPS. In the order the fixes were
+made:
+
+| Problem | Cause | Fix | Effect | Section |
+|---|---|---|---|---|
+| Thick surfaces, rings on the ground | Auto-estimated SLAM voxel came out at 1.64 m, coarser than the SDK's own outdoor guidance | `--slam-voxel-size 0.25` | Pure-SLAM surface thickness 1.9-2.1 cm on all four chunks tested | flag table |
+| Vehicle body in the cloud | Body returns at 1.1-2.0 m; the 1.0 m default removed almost none | `--slam-min-range 2.5` | Body gone, 1.3 % of points lost | flag table |
+| Placement bent the cloud | `pose_optimizer` pulls the trajectory onto GPS every 10 m, writing GPS error into the shape | `--anchor-backend rigid_fit` (2026-09-10) | 5.9 cm to 0.9 cm thickness on a 2026-08-26 chunk; re-measured 2026-10-16 as 4.26 cm against 1.43 cm on the 1 km route | [Placing the cloud](#placing-the-cloud-without-distorting-it) |
+| Cloud tilted | SLAM's initial "up" off by under 1 deg, 10.65 m of height ramp over 1 km | `--anchor-z-mode tilt` (2026-09-16) | Ramp removed; confirmed level against 3DEP | [Levelling](#levelling-the-cloud-the-vertical-tilt) |
+| Placement 1-2 m off | GPS fixes stamped when the Pi read them, 0.31 s late | `gps_epoch_ns` (2026-10-15) | QA median 1.49 m to 0.35 m, p95 2.32 m to 0.90 m | [GPS time](#gps-time-use-the-fix-epoch-not-the-read-time) |
+| 26 m ghost of part of a street | 41 ms of bad poses after a capture dropout | Automatic spike repair (2026-10-15) | QA max 27.4 m to 1.6 m; path length +5.8 % to +0.34 % | [Pose spikes](#pose-spikes-after-a-dropout) |
+| SLAM broken by capture gaps | Pi's microSD card stalls and drops packets | Capture onto a USB SSD (2026-10-09) | 0 packets lost in a desk test; not yet confirmed in the field | [Capture gaps](#capture-gaps-break-slam-and-no-amount-of-tuning-fixes-it) |
+
+Where it stands, both 1 km routes, 0.1 m export voxel: surface thickness 1.43 cm
+(2026-07-21) and 0.93 cm (2026-08-26 downtown); 0.54 cm on the residential route without
+thinning. What remains is absolute position, which follows GPS: 0.8-2.4 m horizontally and
+4-8 m low against USGS 3DEP. See
+[Absolute height](#absolute-height-is-only-as-good-as-gps-altitude-which-is-off-by-metres).
+
 ## Environment
 
 The processing code requires the **ouster-sdk 0.16.x** mapping API. See
