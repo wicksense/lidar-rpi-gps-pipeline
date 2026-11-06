@@ -664,7 +664,8 @@ python3 offline_fuse_lidar_gps.py \
 Useful anchoring parameters:
 - `--anchor-min-motion-m` (default `5.0`)
 - `--anchor-z-mode` (`offset` or `none`)
-- `--anchor-backend` (`pose_optimizer` recommended, `rigid_fit` optional simpler method)
+- `--anchor-backend` (`pose_optimizer` recommended, `rigid_fit` optional simpler method; `TUNING.md` now recommends `rigid_fit`)
+- `--loop-closure` / `--no-loop-closure` (`rigid_fit` only, default on, needs `map-closures`; see `TUNING.md`)
 - `--gps-outlier-filter` (`on`/`off`, default `on`)
 - `--gps-outlier-max-speed-mps` (default `30.0`)
 - `--reflectivity-filter` (`on`/`off`, default `off`)

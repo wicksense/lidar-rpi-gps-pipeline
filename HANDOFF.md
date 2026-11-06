@@ -19,6 +19,9 @@ new machine.
 > - The line numbers in section 6 no longer match the source.
 > - Section 8 predates point format 8, the near-infrared and range fields and the
 >   trajectory CSV; see "What the exported LAS carries" in `TUNING.md`.
+> - Section 5 predates loop closure, which `rigid_fit` now runs by default and which
+>   needs `map-closures`; see "Removing drift where a route revisits itself" in
+>   `TUNING.md`.
 >
 > **The repo defaults are known to produce unusable output.** Start from the
 > recommended invocation in `TUNING.md`, not from the defaults.

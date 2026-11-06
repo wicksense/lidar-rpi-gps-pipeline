@@ -13,6 +13,9 @@ the PTP timing path with DGPS-quality GPS:
   originals were later recovered to `Data\20260826\Pi_original\`, so its figures
   can be re-measured. The short-route regression baseline stays on 2026-07-21
   chunk 1 - see [Regression baseline](#regression-baseline).
+- **2026-10-28**, seven block recordings in San Antonio, 44 min in all, 0 of 3,381,248
+  lidar packets lost. Source of the loop-closure findings - see
+  [Removing drift where a route revisits itself](#removing-drift-where-a-route-revisits-itself).
 
 **Every figure in this file dated before 2026-10-15 was measured with GPS fixes
 stamped by `pi_time_ns`, which lags the fix by 0.3 s.** That inflated every
@@ -42,13 +45,18 @@ made:
 | Cloud tilted | SLAM's initial "up" off by under 1 deg, 10.65 m of height ramp over 1 km | `--anchor-z-mode tilt` (2026-09-16) | Ramp removed; confirmed level against 3DEP | [Levelling](#levelling-the-cloud-the-vertical-tilt) |
 | Placement 1-2 m off | GPS fixes stamped when the Pi read them, 0.31 s late | `gps_epoch_ns` (2026-10-15) | QA median 1.49 m to 0.35 m, p95 2.32 m to 0.90 m | [GPS time](#gps-time-use-the-fix-epoch-not-the-read-time) |
 | 26 m ghost of part of a street | 41 ms of bad poses after a capture dropout | Automatic spike repair (2026-10-15) | QA max 27.4 m to 1.6 m; path length +5.8 % to +0.34 % | [Pose spikes](#pose-spikes-after-a-dropout) |
-| SLAM broken by capture gaps | Pi's microSD card stalls and drops packets | Capture onto a USB SSD (2026-10-09) | 0 packets lost in a desk test; not yet confirmed in the field | [Capture gaps](#capture-gaps-break-slam-and-no-amount-of-tuning-fixes-it) |
+| SLAM broken by capture gaps | Pi's microSD card stalls and drops packets | Capture onto a USB SSD (2026-10-09) | 0 packets lost in a desk test, and 0 of 3,381,248 over the seven field recordings of 2026-10-28 | [Capture gaps](#capture-gaps-break-slam-and-no-amount-of-tuning-fixes-it) |
+| A street driven twice appears twice | SLAM drifts with distance, 20 m by the second pass on a 14-minute recording; a rigid fit cannot bend the route back | Lidar-only loop closure, on by default (2026-11-01) | Passes at most 0.36 m apart on that recording, where they were about 20 m | [Loop closure](#removing-drift-where-a-route-revisits-itself) |
 
 Where it stands, both 1 km routes, 0.1 m export voxel: surface thickness 1.43 cm
 (2026-07-21) and 0.93 cm (2026-08-26 downtown); 0.54 cm on the residential route without
 thinning. What remains is absolute position, which follows GPS: 0.8-2.4 m horizontally and
 4-8 m low against USGS 3DEP. See
 [Absolute height](#absolute-height-is-only-as-good-as-gps-altitude-which-is-off-by-metres).
+The 2026-10-28 recordings are longer and do less well on the acceptance thresholds: see
+[where they stand](#where-the-2026-10-28-clouds-stand). Placed by GPS, they sit 1.3-3.4 m off
+3DEP horizontally and are left tilted by GPS altitude's error, by up to 1.9 deg. Six of the
+seven were then placed on 3DEP, by scripts not yet in the pipeline.
 
 ## Environment
 
@@ -59,6 +67,10 @@ On 0.15.0 every SLAM-based mode fails at runtime on missing APIs
 (`SlamEngine.get_point_cloud`, `AbsolutePoseConstraint`,
 `PoseOptimizer.initialize_trajectory_alignment`) while `gps_fusion` still runs, so
 a wrong SDK version looks like broken code rather than a broken environment.
+
+Loop closure also needs `map-closures`, which has to be installed separately with
+`--no-deps`; the reason and the command are in `requirements-offline.txt`. Without it a
+run stops at the start and says so, rather than after SLAM has run for an hour.
 
 ## Recommended invocation
 
@@ -92,6 +104,8 @@ error, and use the settings in that section.
 | `--poseopt-map-voxel-size` | `0.5` | `0.1` | Output thinning only; it does not affect accuracy. At 0.5 m the cloud is too sparse to even measure surface thickness, and the beam pattern on the ground survives thinning as visible rings. 0.1 m is 25x denser and still tractable (~52 M points, 1.5 GB for this session). |
 | `--gps-time-column` | `auto` | `auto` (= `gps_epoch_ns`) | The receiver's fix epoch. Until 2026-10-15 this row recommended `pi_time_ns`, on the belief that `gps_epoch_ns` was truncated to whole seconds; it is not, and `pi_time_ns` lags the fix by 0.3 s. See [GPS time](#gps-time-use-the-fix-epoch-not-the-read-time). |
 | `--slam-deskew-method` | `auto` | `auto` | Resolves to the SDK's IMU deskew (`InertialIntegrationImuDeskewMethod` in the log). Measured on 2026-07-21 chunk 4, the one with a 131 deg turn, at a 0.1 m export voxel: IMU 1.49 cm surface thickness, `constant_velocity` 3.54 cm, `none` diverged (17.5 m QA median). If the log shows it fell back to constant velocity, expect surfaces about twice as thick. |
+| `--loop-closure` | on | on | `rigid_fit` only. Nothing to decide per session: a route with no revisit comes out as it would without it. See [Loop closure](#removing-drift-where-a-route-revisits-itself). |
+| `--loop-rotation-weight` | `100` | `100` | How strongly the solve keeps SLAM's rotation between key frames. 10 put 2.4x as much twist into the 14-minute recording and left surfaces thicker (3.83 cm against 3.56 cm). Past 100 the stretch grows quickly: 0.26 mm/m at 100, 4.18 mm/m at 1000. Chosen on one recording. |
 
 `--slam-min-range 2.5` was re-measured on the 2026-08-26 rig and still holds. Taking
 300 frames from a moving chunk and looking for pixels that return something almost
@@ -253,6 +267,210 @@ them meet, a wall can appear twice a metre apart, which downstream classificatio
 reads as a real object. A uniform offset across the whole cloud is harmless by
 comparison - classification works on local shape and height above ground.
 
+## Removing drift where a route revisits itself
+
+A rigid fit moves the whole route as one piece, so it cannot bring two passes of the same
+street together once SLAM has drifted between them. Measured on 2026-10-28: SLAM's drift
+by the second pass reached about 20 m on the 14-minute recording, 3.7 m on the 5-minute
+`101705`, and 0.34-0.71 m on the others that revisit. Loop closure measures that drift from
+the lidar and removes it before the rigid fit.
+
+**GPS plays no part in it.** GPS has its own error and is unstable, and once SLAM has
+drifted, neither SLAM's nor GPS's position says reliably that two passes are on the same
+street. GPS is used only at the end, to place the finished cloud.
+
+### What a run does
+
+1. SLAM runs as usual. Every 4th scan is kept, thinned, for what follows.
+2. **Find revisits.** MapClosures (Gupta et al., "Effectively Detecting Loop Closures using
+   Point Cloud Density Maps", ICRA 2024; `map-closures` 2.2.0, MIT licence) compares a 50 m
+   local map started every 10 m of path. Closures can miss a short overlap, so key frames
+   within 10 m on SLAM's poses, at least 50 m apart along the path, are also tried.
+3. **Measure each revisit.** Point-to-plane ICP between submaps of the two visits, from 18
+   starts, because one start can settle 1 m off. A pair is accepted at fitness of at least
+   0.3 and an error of at most 0.15 m; a rejected pair is ignored and logged.
+4. **Solve.** The SDK's pose graph is solved with SLAM's odometry and the accepted pairs.
+   Distance on the corrected poses can then find further revisits, up to 3 rounds.
+5. **Apply as a correction.** At each key frame, the change from SLAM's pose to the solved
+   pose is interpolated onto SLAM's own column poses. Taking the solver's column poses
+   instead thickened surfaces by a fifth, because it replaces SLAM's per-column motion.
+6. `rigid_fit` then places the corrected route on GPS, and the raw scans are replayed.
+
+A run costs more with it: 36 minutes to about 5 and a half hours depending on length and on
+what else was running, and 15-30 GB of memory on the longer recordings.
+
+### Traps found
+
+These cost the most time and neither shows up as an error:
+
+- **`PoseOptimizer` silently ignores a constraint on the last key frame.** The solve moves
+  nothing and reports no failure; the second-last key frame works and so does the first.
+  So the last key frame is never paired. This affected routes ending where they began.
+- **A pose spike can create a false revisit.** A spike's out-and-back added 55 m to the
+  distance along the path, so on 2026-07-21 chunk 1, a straight street, key frames 0.05 s
+  apart counted as 50 m apart and bent the route by up to 3 m. Steps over 10 m between key
+  frames now do not count as distance. The regression baseline is what caught this.
+- **MapClosures depends on where a map starts.** Moving the start by 5-30 m changed 101705
+  from 4 closures to 2-3 and 7-10 pairs. That is why the local maps overlap.
+- **Do not run loop closure on an exported LAS** (`scripts/loop_closure.py`). It does not
+  work reliably; the pipeline's version works on SLAM's scans.
+
+### Results on 2026-10-28
+
+0.1 m export voxel, thickness p50 of all planar surfaces. Pairs are accepted / tried.
+
+| Session | Pairs | SLAM's drift at revisits | Thickness without / with | QA median / p95 / max with |
+|---|---|---|---|---|
+| `101153` | 1 / 1 | 0.34 m | 1.18 / 1.13 cm | 0.84 / 1.40 / 1.62 m |
+| `101705` | 9 / 9 | up to 3.7 m | 1.51 / 1.60 cm | 1.09 / 3.49 / 4.48 m |
+| `102349` | 38 / 39 | about 20 m | 2.93 / 3.54 cm | 2.45 / 3.75 / 4.19 m |
+| `103912` | 1 / 1 | 0.36 m | 1.89 / 1.82 cm | 1.59 / 4.60 / 4.83 m |
+| `104427` | 1 / 1 | 0.71 m | 2.18 / 2.23 cm | 0.60 / 1.68 / 2.02 m |
+| `105117` | 0 | none found | 1.90 cm, no change | 0.53 / 1.15 / 1.33 m |
+| `105703` | 0 | none found | 1.08 cm, no change | 2.25 / 9.97 / 20.11 m |
+
+On `102349`, the only recording with a large drift, passes that were about 20 m apart end
+at most 0.36 m apart. The two with no revisit match a run without loop closure to within
+3 mm at the QA median, which is the evidence that it leaves such routes alone.
+
+What this has not shown:
+
+- **Why surfaces are thicker with it,** `102349` 3.54 cm against 2.93 cm and `101705` 1.60
+  against 1.51 cm. Unknown. On both, the version whose revisits were started from GPS had the
+  same excess, so it does not come from how the revisits are found.
+- **That the correction is accurate, as opposed to consistent.** The pass overlay and the
+  residuals reuse the scans that were fitted. Only `101153` and `104427` were checked on
+  key frames left out of the fit (within 2.3 cm).
+- **That its thresholds hold on other routes.** No false pair remains on these seven
+  recordings or the baseline, but the acceptance limits were set on this data. Look at
+  a new route's `loop_*` figures and, where it has revisits, at the cloud.
+
+SLAM does not repeat exactly between runs: 1 key frame out of about 1660 and median 2.4 mm,
+at most 9.6 cm, on `102349`. Small differences between two runs are not evidence of anything.
+
+### Reading a run
+
+In `extra` of the QA report: `loop_map_closures`, `loop_pairs_found`,
+`loop_constraints_added`, `loop_constraints_failed`, `loop_drift_median_m`,
+`loop_drift_max_m`, `loop_key_frame_shift_max_m` and `loop_solved_residual_max_m`. The last
+should be small; a large shift with a large residual means the constraints disagree.
+`--loop-debug-dir` keeps each pair's submaps for inspection.
+
+### Where the 2026-10-28 clouds stand
+
+The QA report's own `pass` is true on all seven, but it only applies its loose limits, 5 m
+median and 10 m p95. Against the four checks in `VALIDATION.md` only `105117` passes
+everything. These are the figures outside a threshold, with the threshold in the header:
+
+| Session | Median < 0.6 m | p95 < 1.2 m | Max < 3 m | Z RMSE < 1.5 m | Time offset within 0.1 s | Thickness <= 2 cm |
+|---|---|---|---|---|---|---|
+| `101153` | 0.84 | 1.40 | | | | |
+| `101705` | 1.09 | 3.49 | 4.48 | | | |
+| `102349` | 2.45 | 3.75 | 4.19 | 2.31 | -0.34 | 3.54 |
+| `103912` | 1.59 | 4.60 | 4.83 | 3.88 | -0.26 | |
+| `104427` | 0.60, on the limit | 1.68 | | | | 2.23 |
+| `105117` | | | | | | |
+| `105703` | 2.25 | 9.97 | 20.11 | 2.52 | 0.26 | |
+
+Coverage and height distribution pass on all seven (100 %, at most 0.70 % out of band).
+`VALIDATION.md` treats a breach as a reason to look, and its limits were set on one route
+with good GPS. The horizontal and height figures measure agreement with GPS, whose error
+on these routes has not been measured; for `105703` the evidence that its 20 m is GPS's
+error is in that cloud's README. Why three sessions show a best time offset of about 0.3 s
+has not been investigated. Fitted tilts are 1.35-4.32 deg, far above the "fraction of a
+degree" under [Levelling](#levelling-the-cloud-the-vertical-tilt) and close to the 5 deg
+limit; why SLAM's "up" is that far off is not explained.
+
+**Checked against 3DEP on 2026-11-01** (TX Central B2 2017, class 2 ground, 2.5 m radius).
+The sensor is bolted to the vehicle, so its height above ground should be constant. A plane
+in (x, y) was fitted to that height along the trajectory, and likewise to GPS altitude above
+the same ground. "Left" is the standard deviation after removing the plane.
+
+| Session | Cloud: plane | Cloud: left | GPS: plane | GPS: left | Z RMSE against GPS | Road minus 3DEP ground | Wall shift, whole route |
+|---|---|---|---|---|---|---|---|
+| `101153` | 1.20 deg | 0.12 m | 1.20 deg | 0.40 m | 0.36 m | -4.69 m | 3.41 m |
+| `101705` | 0.25 deg | 0.41 m | 0.28 deg | 1.13 m | 1.04 m | -3.85 m | 2.98 m |
+| `102349` | 0.81 deg | 0.51 m | 0.80 deg | 2.28 m | 2.31 m | -3.16 m | 2.28 m |
+| `103912` | 1.88 deg | 0.33 m | 2.02 deg | 3.66 m | 3.88 m | +4.02 m | 1.80 m |
+| `104427` | 1.02 deg | 0.12 m | 1.07 deg | 1.24 m | 1.19 m | +0.12 m | 1.30 m |
+| `105117` | 0.29 deg | 0.20 m | 0.26 deg | 1.38 m | 1.19 m | -1.33 m | 2.61 m |
+| `105703` | 0.17 deg | 2.25 m | 0.26 deg | 1.42 m | 2.52 m | -2.59 m | 2.33 m |
+
+What this shows:
+
+- **On six of the seven, SLAM's height is better than GPS's.** Once one plane is removed the
+  cloud follows 3DEP ground to 0.12-0.51 m, GPS to 0.40-3.66 m. `105703` is the exception:
+  2.25 m against 1.42 m, cause not established.
+- **The tilt left in the cloud is GPS altitude's.** The cloud's plane matches GPS's on every
+  session, as expected when the tilt is fitted to GPS. So the fit passes on any tilt in GPS's
+  own error, which is why heights wander by up to 8.8 m along `103912`. A linear trend
+  along the path misses this on a block loop, because the route comes back.
+- **`z_rmse_m` is mostly GPS altitude's own noise.** On six of the seven it is within about
+  0.2 m of GPS's scatter about the same plane. It says little about the cloud.
+- **The height offset differs by session,** from -4.69 m to +4.02 m at the road, so these
+  clouds do not meet in height where they adjoin.
+- **The horizontal offset is 1.3-3.4 m and has a pattern.** Easting -1.1 to -2.6 m on all
+  seven, northing mostly positive. Not explained. The wall method resolves about 0.5 m and
+  carries an eaves bias; translation-only ICP gives 1.4-2.4 m. 2026-07-21 reached 0.81 m.
+
+3DEP was flown in 2017, so ground rebuilt since then is wrong in it. Files: `checks\` of each
+cloud; the plane fits are `G:\Lidar\Data\20261028\Processed\height_source_1028.json`.
+
+**Placed on 3DEP on 2026-11-01.** One rigid transform per cloud after `rigid_fit`: a plane
+through road minus 3DEP ground removes tilt and height, and a shift onto building footprint
+edges sets the horizontal position. On areas left out of the fit, road minus 3DEP drops to
+0.12-0.78 m on six sessions (from 1.33-4.61 m). Horizontal is about 1 m and not proved.
+`105703` is not fixed: it leans 1.3-2.7 deg across the route in every 300 m window, so the
+lean turns with the route and one rigid transform cannot remove it. Walls, which use neither
+3DEP nor GPS, and the road against 3DEP agree on this; why SLAM leans is not established:
+constant-velocity deskew, dropping the stationary first chunk and a 0.5 m SLAM voxel each
+left it at 1.56-1.79 deg (1.72 before), and constant velocity thickened surfaces to 4.11 cm.
+The accelerometer shows the same lean as the walls, and the cloud bends with distance at about
+3.4 deg/km; `105703` is the only route ending far from its start. Levelling on the accelerometer,
+tested on finished clouds, took its sensor height above 3DEP from a std of 2.24 m to 0.08 m and
+added 0.25-0.50 cm of thickness on all seven: `G:\Lidar\Data\20261028\Processed\imu_gravity_check\README.md`. A
+whole-route tilt check averages this away on a route that turns, so check per window. The
+scripts are not in the pipeline yet. Details:
+`G:\Lidar\Data\20261028\Processed\3dep_align_trial\README.md`.
+
+The clouds and which to use are listed in `G:\Lidar\Data\20261028\README.md`. They come from
+successive versions of the code: `101705`, `102349`, `103912` from the version before the
+last two trap fixes, `101153` and `104427` with the last-key-frame fix, `105117` and
+`105703` from before loop closure was added (rerun with it, they found no revisits). The
+last fix only changes routes with a pose spike or a key-frame step over 10 m, and none of
+these has one.
+
+## After fusion: placing, aligning, and streets covered twice
+
+Since 2026-11-05 every fused cloud (`rigid_fit`, `--gravity-level`) goes through four more
+steps. GPS only gives a first position; the position delivered comes from airborne lidar.
+
+```bash
+python3 place_on_airborne.py --las <fused.las> --trajectory <fused>_trajectory.csv \
+  --tiles <StratMap 2021 tiles> --epoch 2026.82 --output-dir placed/      # one per drive
+python3 align_drives.py --las placed/*.las --output-dir aligned_raw/      # all drives together
+python3 flag_overlap.py --las aligned_raw/*.las --output-dir aligned/
+python3 check_drives.py --las aligned/*.las --placement-dir placed/ --output-dir checks/
+```
+
+- **Placement** (`jobs/airborne_placement.py`): one rigid shift per drive onto StratMap 2021
+  ground and building edges. Height on held-out tiles 0.03-0.13 m on 2026-10-28.
+- **Alignment** (`jobs/drive_alignment.py`): where drives share streets, an east/north shift
+  every 50 m along each route, solved over all drives together. Squares that contradict the
+  rest are weighted down (`--robust-m 0.3`). Weighting all squares alike left 101705 and
+  102349, which meet only at a bare junction, 1.1-1.6 m apart; with it, 0.40 m. Median over
+  all held-out squares 0.13 m. The squares measured at the overpass junction of 104427 and
+  105703 stay 1.5-2 m apart and are set aside.
+- **Streets covered twice** (`jobs/overlap_flags.py`). Within one drive (it comes back) and
+  between drives alike: in every 2 m square, the pass that saw it from closest (smallest mean
+  `range_m`) is kept, and every other pass's points there get the LAS overlap flag. A pass is
+  one drive's points in the square with no time gap over 60 s. Nothing is deleted.
+  Classification skips flagged points, so each place is classified from one copy and a tree is
+  not counted twice. Where the kept pass changes from one drive to another, a tree on the seam
+  can be split between two files: when totalling trees, merge trees of different drives
+  closer than 1 m. Never remove overlap before alignment; the overlap is what aligns the drives.
+- **Checks**: limits in `VALIDATION.md`.
+
 ## Regression baseline
 
 Changes to the anchoring code are checked against a short single chunk before
@@ -271,6 +489,7 @@ measured 2026-10-15 with `gps_epoch_ns` and pose-spike repair:
 | `rigid_fit` Z RMSE | 1.12 m (tilt is skipped: the chunk is straight) |
 | Time offset check | best at -0.01 s |
 | Pose spikes repaired | 1, at 22:07:15.155 UTC, 832 column poses, 27.6 m |
+| Loop closure pairs | 0 (added 2026-11-01); a straight street has no revisit, so any pair here is false |
 
 The figures this table replaced - 0.884 m median, "~170 m" length - came from
 `pi_time_ns` and from a trajectory still carrying the 27 m spike; the spike's out
@@ -632,6 +851,12 @@ Fixed on 2026-10-15:
   them. See [Pose spikes](#pose-spikes-after-a-dropout).
 - **Nothing checked the two clocks against each other.** `rigid_fit` now records
   the best-fitting GPS time shift in the QA report.
+
+Fixed on 2026-11-01:
+
+- **Streets driven twice appeared twice.** Added lidar-only loop closure, including the
+  fixes for the last-key-frame and pose-spike traps. See
+  [Loop closure](#removing-drift-where-a-route-revisits-itself).
 
 Not fixed in the pipeline:
 

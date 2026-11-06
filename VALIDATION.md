@@ -12,7 +12,10 @@ and read
 "[What transfers and what does not](TUNING.md#what-transfers-and-what-does-not)"
 before applying them to a different route.
 
-The figures below are from the 2026-07-21 chunks 1-6 deliverable of 2026-09-13.
+The figures below are from the 2026-07-21 chunks 1-6 deliverable of 2026-09-13. How
+the seven clouds of 2026-10-28 stand against them is in
+[TUNING.md](TUNING.md#where-the-2026-10-28-clouds-stand); only one passes all four. The
+`pass` in the QA report is not this check: it applies only 5 m median and 10 m p95.
 
 ---
 
@@ -44,6 +47,40 @@ Neither number alone separates a usable run from an unusable one, which is why t
 checks below are run as a set and reported as a set.
 
 ---
+
+## Acceptance for placed and aligned clouds (since 2026-11-05)
+
+Clouds placed on airborne lidar and aligned across drives (see
+[TUNING.md](TUNING.md#after-fusion-placing-aligning-and-streets-covered-twice)) are judged by
+the table below. The limits are set for tree counting, tree positions and canopy, not for
+engineering survey, and are deliberately loose. `check_drives.py` reports the drive and
+between-drive rows; `check_coverage_height.py` the first two.
+
+| Check | Limit | 2026-10-28, seven drives |
+|---|---|---|
+| Coverage: GPS track with points within 10 m | 100 % | 100 % on all |
+| Points more than 10 m below or 30 m above local ground | below 1 % | at most 0.7 % |
+| Ground thickness, p50 at 0.1 m export voxel | below 3 cm | 0.8-1.9 cm |
+| Height against airborne lidar, held-out tiles | within 0.3 m | 0.03-0.13 m |
+| One drive's repeat passes: height / horizontal | within 0.1 m / 0.5 m | 102349: 0.05 / 0.30 m |
+| Between drives, fixed things, median | within 0.5 m | 0.08-0.40 m where judged |
+| QA residual against GPS, median (gross errors only) | below 3 m | 0.54-2.44 m |
+
+Why these:
+
+- **Height, 0.3 m.** USGS QL1/QL2 airborne lidar is specified at 10 cm RMSE vertical on open
+  ground, so the reference itself carries about 10 cm; 0.3 m is three times that.
+- **Between drives, 0.5 m.** Street trees stand metres apart. Two copies of a trunk within half
+  a metre are still recognised as one tree; at 1 m they can separate and be counted twice.
+- **QA against GPS, only for gross errors.** GPS on these routes is off by 1-2 m and more, and
+  the delivered position no longer comes from it. The check still catches a wrong clock or a
+  pose spike. Its earlier limits (0.6 m median, 1.2 m p95) stay with the four checks below.
+- **Wall thickness is not judged.** Where a street is covered twice the copies sit a few
+  decimetres apart and walls thicken; this does not affect trees.
+- A pair of drives with fewer than 3 squares of clear fixed things is not judged, nor are the
+  squares of the 104427/105703 overpass junction.
+
+The four checks below remain how a single fused cloud is judged before placement.
 
 ## The four checks
 
@@ -183,8 +220,9 @@ anything else measuring these clouds has to do the same.
 ## Reference item: constraint count
 
 Not a pass/fail check, but the cheapest way to catch a run that is about to waste
-an hour. Applies to `pose_optimizer` only; `rigid_fit` adds no constraints and
-reports none.
+an hour. Applies to `pose_optimizer` only; `rigid_fit` adds no GPS constraints and
+reports none. Its loop-closure constraints are lidar-only and are read separately:
+see [Reading a run](TUNING.md#reading-a-run).
 
 Expected constraints ≈ route length ÷ `--poseopt-constraints-every-m`. A count far
 above that means constraints are being generated per sample rather than per
@@ -382,6 +420,8 @@ A run is not delivered until all of these are true.
 - [ ] The processing command retained verbatim, including the backend and both
       voxel sizes.
 - [ ] Input-side gap scan recorded, including gaps that were judged survivable.
+- [ ] For placed and aligned clouds: overlap flags set (`flag_overlap.py`) and
+      `overlap_flags.json`, `drive_alignment.json` and `CHECKS.md` kept with the clouds.
 
 ## Deliverable record
 
