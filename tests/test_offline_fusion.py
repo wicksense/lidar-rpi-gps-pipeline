@@ -20,7 +20,11 @@ from lidar_rpi_gps_pipeline.jobs.offline_fusion import (
     _extract_scan_column_poses,
     _estimate_gps_time_offset,
     _extract_session_id_from_gps_csv_path,
+    _find_loop_pairs,
+    _find_nearby_pairs,
     _find_transient_pose_spikes,
+    _local_map_spans,
+    _path_along,
     _repair_pose_spikes,
     _filter_raw_paths_by_session,
     _find_metadata_json_candidates,
@@ -29,8 +33,12 @@ from lidar_rpi_gps_pipeline.jobs.offline_fusion import (
     _scan_column_validity,
     _apply_transform,
     _fit_vertical_tilt,
+    _gravity_place_warp,
+    _level_poses_on_gravity,
     _level_transform,
+    _tie_gravity_corrections,
     _rigid_transform_matrix,
+    _rotvec_to_matrix,
     _yaw_rotation_3d,
     _scan_valid_timestamp_count,
     _trajectory_csv_path,
@@ -816,3 +824,259 @@ def test_estimate_gps_time_offset_recovers_a_known_lag() -> None:
     assert result["gps_time_offset_best_s"] == pytest.approx(-0.3, abs=0.03)
     assert result["gps_time_offset_median_at_best_m"] < 0.1
     assert result["gps_time_offset_median_at_zero_m"] > 0.5
+
+
+def _straight_poses(xs: np.ndarray, y: float = 0.0) -> np.ndarray:
+    poses = np.broadcast_to(np.eye(4), (xs.size, 4, 4)).copy()
+    poses[:, 0, 3] = xs
+    poses[:, 1, 3] = y
+    return poses
+
+
+def test_local_map_spans_cover_the_route_end_to_end() -> None:
+    spans = _local_map_spans(_straight_poses(np.arange(0.0, 121.0)), 50.0, 10.0)
+
+    assert spans[0] == (0, 50)
+    assert spans[1] == (10, 60)
+    assert spans[-1][1] == 120
+    assert all(b[0] - a[0] == 10 for a, b in zip(spans, spans[1:]))
+
+
+def test_find_loop_pairs_uses_the_closure_when_slam_has_drifted() -> None:
+    # Out along x, then along a parallel leg that SLAM believes is 30 m to the side,
+    # which is the same street: only the closure knows that.
+    first = _straight_poses(np.arange(0.0, 100.0))
+    link = _straight_poses(np.full(100, 100.0), 0.0)
+    link[:, 1, 3] = np.arange(100.0)
+    second = _straight_poses(np.arange(0.0, 100.0), 30.0)
+    poses = np.concatenate([first, link, second])
+    spans = [(0, 100), (100, 200), (200, 300)]
+    # Earlier map frame to later map frame: the later anchor is really at the earlier one.
+    closures = [(0, 2, np.eye(4))]
+
+    pairs = _find_loop_pairs(poses, spans, closures, radius_m=10.0, min_separation_m=50.0, every_m=10.0)
+
+    assert len(pairs) == 10
+    for j, i, distance, guess in pairs:
+        assert j == i - 200
+        assert distance == pytest.approx(0.0, abs=1e-9)
+        assert guess == pytest.approx(np.eye(4), abs=1e-9)
+
+
+def test_find_loop_pairs_ignores_a_vehicle_standing_still() -> None:
+    poses = _straight_poses(np.zeros(100))
+    pairs = _find_loop_pairs(
+        poses, [(0, 50), (50, 99)], [(0, 1, np.eye(4))], radius_m=10.0, min_separation_m=50.0, every_m=10.0
+    )
+
+    assert pairs == []
+
+
+def test_a_pose_spike_does_not_make_a_revisit() -> None:
+    # A straight 100 m with one key frame thrown 27 m sideways: no revisit, though the
+    # spike alone adds 54 m to the distance travelled.
+    poses = _straight_poses(np.arange(0.0, 100.0))
+    poses[50, 1, 3] = 27.0
+    along = _path_along(poses[:, :2, 3])
+
+    assert along[-1] == pytest.approx(97.0)
+    assert _find_nearby_pairs(poses, along, [], radius_m=5.0, min_separation_m=50.0, every_m=10.0) == []
+
+
+def test_pairs_never_use_the_last_key_frame() -> None:
+    # A route that ends where it began: out along x, back 20 m to the side, then across to
+    # the start. The SDK's optimiser silently ignores a constraint on the last key frame.
+    out = _straight_poses(np.arange(0.0, 100.0))
+    back = _straight_poses(np.arange(100.0, 0.0, -1.0), 20.0)
+    across = _straight_poses(np.zeros(20))
+    across[:, 1, 3] = np.arange(19.0, -1.0, -1.0)
+    poses = np.concatenate([out, back, across])
+    last = poses.shape[0] - 1
+    along = np.arange(poses.shape[0], dtype=np.float64)
+
+    nearby = _find_nearby_pairs(poses, along, [], radius_m=3.0, min_separation_m=50.0, every_m=1.0)
+    closed = _find_loop_pairs(
+        poses, [(0, 50), (170, 220)], [(0, 1, np.linalg.inv(poses[0]) @ poses[170])],
+        radius_m=3.0, min_separation_m=50.0, every_m=1.0,
+    )
+
+    assert last - 1 in [i for _, i, _, _ in nearby]
+    assert last not in [i for _, i, _, _ in nearby]
+    assert last not in [i for _, i, _, _ in closed]
+
+
+def test_find_nearby_pairs_finds_a_return_and_skips_what_is_taken() -> None:
+    # A 400 m out-and-back along x: the return passes the outward leg again.
+    xs = np.concatenate([np.arange(0.0, 200.0), np.arange(200.0, 0.0, -1.0)])
+    poses = _straight_poses(xs)
+    along = np.arange(xs.size, dtype=np.float64)
+
+    pairs = _find_nearby_pairs(poses, along, [], radius_m=2.0, min_separation_m=50.0, every_m=10.0)
+    assert pairs
+    assert all(along[i] - along[j] >= 50.0 for j, i, _, _ in pairs)
+    assert all(d <= 2.0 for _, _, d, _ in pairs)
+
+    taken = [i for _, i, _, _ in pairs]
+    assert _find_nearby_pairs(poses, along, taken, radius_m=2.0, min_separation_m=50.0, every_m=10.0) == []
+
+
+def _bent_straight_road(duration_s: float = 200.0, speed: float = 7.0, bend_deg_per_km: float = 3.4):
+    """A level straight drive, as SLAM would report it with up bending by distance, and its accelerometer."""
+    t = np.arange(0.0, duration_s, 0.05)
+    bend = np.radians(bend_deg_per_km) * (speed * t) / 1000.0
+    rv = np.column_stack([np.zeros_like(bend), -bend, np.zeros_like(bend)])
+    rotation = _rotvec_to_matrix(rv)
+    poses = np.tile(np.eye(4), (t.size, 1, 1))
+    poses[:, :3, :3] = rotation
+    steps = (rotation[:-1] @ np.array([speed * 0.05, 0.0, 0.0]))
+    poses[1:, :3, 3] = np.cumsum(steps, axis=0)
+    ts = (t * 1e9).astype(np.int64) + 1_000_000_000
+    # A level road: true up is vertical, seen in the sensor's axes through the true attitude, which is identity.
+    accel = np.tile(np.array([0.0, 0.0, 9.81]), (t.size, 1))
+    return ts, poses, accel
+
+
+def test_gravity_levelling_flattens_a_bend_and_keeps_distances() -> None:
+    ts, poses, accel = _bent_straight_road()
+    before = poses[:, 2, 3]
+    assert abs(before).max() > 2.0
+
+    levelled, info = _level_poses_on_gravity(ts, poses, ts, accel, sensor_offset_deg=(0.0, 0.0))
+
+    # The window averages the bend, so the middle of the route is the fair place to judge it.
+    middle = levelled[ts.size // 4 : 3 * ts.size // 4, 2, 3]
+    assert np.ptp(middle) < 0.1 * np.ptp(before)
+    step_before = np.linalg.norm(np.diff(poses[:, :3, 3], axis=0), axis=1)
+    step_after = np.linalg.norm(np.diff(levelled[:, :3, 3], axis=0), axis=1)
+    np.testing.assert_allclose(step_after, step_before, atol=1e-9)
+    assert info["gravity_correction_max_deg"] > 1.0
+    np.testing.assert_allclose(levelled[0, :3, 3], poses[0, :3, 3])
+
+
+def test_gravity_levelling_leaves_a_level_route_alone() -> None:
+    ts, poses, accel = _bent_straight_road(bend_deg_per_km=0.0)
+
+    levelled, info = _level_poses_on_gravity(ts, poses, ts, accel, sensor_offset_deg=(0.0, 0.0))
+
+    np.testing.assert_allclose(levelled, poses, atol=1e-6)
+    assert info["gravity_correction_max_deg"] < 1e-6
+
+
+def test_gravity_levelling_removes_the_sensor_offset() -> None:
+    ts, poses, accel = _bent_straight_road(bend_deg_per_km=0.0)
+    accel[:, 0] += np.radians(0.2) * 9.81
+
+    levelled, _ = _level_poses_on_gravity(ts, poses, ts, accel, sensor_offset_deg=(0.2, 0.0))
+
+    np.testing.assert_allclose(levelled, poses, atol=1e-6)
+
+
+def test_gravity_place_warp_keeps_a_surface_together_where_a_correction_by_time_splits_it() -> None:
+    ts, poses, accel = _bent_straight_road(bend_deg_per_km=30.0)
+    levelled, _ = _level_poses_on_gravity(ts, poses, ts, accel, sensor_offset_deg=(0.0, 0.0))
+    # One point of the SLAM map, seen nine times over 8 s.
+    patch = poses[ts.size // 2, :3, 3] + np.array([15.0, 0.0, -2.0])
+    times = ts[ts.size // 2] / 1e9 + np.linspace(-4.0, 4.0, 9)
+    points = np.tile(patch, (times.size, 1))
+
+    warp, stations = _gravity_place_warp(ts, poses, levelled)
+    moved = warp(points, times)
+    assert stations > 100
+    assert np.ptp(moved, axis=0).max() < 1e-9
+
+    index = np.searchsorted(ts, (times * 1e9).astype(np.int64))
+    correction = levelled[index, :3, :3] @ np.transpose(poses[index, :3, :3], (0, 2, 1))
+    by_time = (correction @ (points - poses[index, :3, 3])[:, :, None])[:, :, 0] + levelled[index, :3, 3]
+    assert np.ptp(by_time[:, 2]) > 0.02
+
+
+def test_gravity_place_warp_leaves_a_level_route_alone() -> None:
+    ts, poses, accel = _bent_straight_road(bend_deg_per_km=0.0)
+    levelled, _ = _level_poses_on_gravity(ts, poses, ts, accel, sensor_offset_deg=(0.0, 0.0))
+    points = np.array([[100.0, 8.0, -2.0], [300.0, -20.0, 5.0]])
+
+    warp, _ = _gravity_place_warp(ts, poses, levelled)
+
+    np.testing.assert_allclose(warp(points, np.array([1014.0, 1043.0])), points, atol=1e-5)
+
+
+def test_gravity_place_warp_keeps_two_passes_apart() -> None:
+    """A second pass of the same place holds its own correction, so it must not borrow the first's."""
+    ts, poses, _ = _bent_straight_road(duration_s=400.0, bend_deg_per_km=0.0)
+    half = ts.size // 2
+    # Out and back along x: the same places at two times far apart.
+    poses[half:, :3, 3] = poses[half - 1 :: -1, :3, 3][: ts.size - half]
+    levelled = poses.copy()
+    levelled[half:, 2, 3] += 3.0
+    point = poses[half // 2, :3, 3] + np.array([0.0, 5.0, 0.0])
+
+    warp, _ = _gravity_place_warp(ts, poses, levelled)
+
+    first = warp(point[None], np.array([ts[half // 2] / 1e9]))
+    second = warp(point[None], np.array([ts[half + half // 2] / 1e9]))
+    np.testing.assert_allclose(first, point[None], atol=1e-6)
+    np.testing.assert_allclose(second - point, [[0.0, 0.0, 3.0]], atol=1e-6)
+
+
+def _out_and_back(duration_s: float = 200.0, length_m: float = 700.0):
+    """A level road driven out and back, with the accelerometer wrong by 0.2 deg on the way back."""
+    t = np.arange(0.0, duration_s + 1e-9, 0.05)
+    half = t.size // 2
+    w = 2 * np.pi / duration_s
+    poses = np.tile(np.eye(4), (t.size, 1, 1))
+    poses[:, 0, 3] = length_m * (1 - np.cos(w * t)) / 2
+    ts = (t * 1e9).astype(np.int64) + 1_000_000_000
+    # The sensor feels the vehicle's acceleration as well as gravity.
+    accel = np.column_stack([length_m * w**2 / 2 * np.cos(w * t), np.zeros(t.size), np.full(t.size, 9.81)])
+    accel[half:, 0] += np.radians(0.2) * 9.81
+    # Every 10 s on the way out, the moment the way back passes the same place.
+    ties = [(int(ts[k]), int(ts[2 * half - k])) for k in range(200, half - 1, 200)]
+    return ts, poses, accel, ties, half
+
+
+def test_gravity_ties_keep_two_visits_of_a_place_together() -> None:
+    ts, poses, accel, ties, half = _out_and_back()
+
+    def gap(levelled: np.ndarray) -> float:
+        return max(abs(levelled[2 * half - first_k, 2, 3] - levelled[first_k, 2, 3]) for first_k in range(200, half - 200, 200))
+
+    alone, _ = _level_poses_on_gravity(ts, poses, ts, accel, sensor_offset_deg=(0.0, 0.0))
+    tied, info = _level_poses_on_gravity(ts, poses, ts, accel, sensor_offset_deg=(0.0, 0.0), ties_ns=ties)
+
+    assert gap(alone) > 0.5
+    assert gap(tied) < 0.1 * gap(alone)
+    assert info["gravity_ties"] == len(ties)
+    assert info["gravity_tie_moved_max_m"] < 0.1
+
+
+def test_gravity_ties_hold_as_well_with_corrections_of_several_degrees() -> None:
+    # 1 km out and back, climbing and turning, with 0.2 deg more correction on the way
+    # back. A common 7 deg correction should leave the visits as close as none does.
+    n = 400
+    steps = np.zeros((n - 1, 3))
+    steps[: n // 2] = [3.0, 4.0, 0.3]
+    steps[n // 2 :] = [-3.0, -4.0, -0.3]
+
+    def moved(base_deg: float) -> np.ndarray:
+        rv = np.zeros((n, 3))
+        rv[:, :2] = np.radians(base_deg) * np.array([0.6, 0.8])
+        rv[n // 2 :, 0] += np.radians(0.2)
+        return _tie_gravity_corrections(rv, steps, [(k, n - 1 - k) for k in range(20, n // 2 - 1, 20)])[1]
+
+    np.testing.assert_allclose(moved(7.0), moved(0.0), atol=0.005)
+
+
+def test_gravity_ties_change_nothing_where_the_accelerometer_already_agrees() -> None:
+    ts, poses, accel, ties, half = _out_and_back()
+    accel[half:, 0] -= np.radians(0.2) * 9.81
+
+    tied, _ = _level_poses_on_gravity(ts, poses, ts, accel, sensor_offset_deg=(0.0, 0.0), ties_ns=ties)
+
+    # The road is level, so the path should stay flat; the window's edges leave a few cm over 700 m.
+    assert np.abs(tied[:, 2, 3]).max() < 0.05
+
+
+def test_gravity_levelling_rejects_imu_outside_the_route() -> None:
+    ts, poses, accel = _bent_straight_road()
+    with pytest.raises(ValueError, match="IMU"):
+        _level_poses_on_gravity(ts, poses, ts + 10_000_000_000_000, accel)

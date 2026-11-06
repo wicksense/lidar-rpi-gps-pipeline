@@ -20,6 +20,17 @@ laspy==2.7.0
 numpy==1.26.4
 pandas==3.0.5
 pyproj==3.7.2
+scipy==1.17.1
+
+# Needed by map-closures, which loop closure uses to recognise revisits. Install
+# that one separately, with no dependencies:
+#   python -m pip install --no-deps map-closures==2.2.0
+# Its declared dependencies cannot be met here: its command line needs click>=8.2.1
+# and ouster-sdk needs click<8.2. The library itself runs with what is listed here,
+# numpy 1.26.4 included, though it declares numpy>=2.1.
+pydantic==2.13.5
+pydantic-settings==2.14.2
+typing-extensions
 
 # Optional: desktop GUI (offline_gui.py)
 # PySide6==6.11.1

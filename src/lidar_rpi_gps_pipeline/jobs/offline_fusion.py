@@ -13,7 +13,7 @@ import shutil
 import tempfile
 import time
 from io import StringIO
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import laspy
 import numpy as np
@@ -1455,6 +1455,21 @@ POSE_SPIKE_MIN_JUMP_M = 2.0
 POSE_SPIKE_MAX_SPEED_MPS = 40.0
 POSE_SPIKE_MAX_DURATION_S = 2.0
 
+GRAVITY_WINDOW_S = 40.0
+GRAVITY_STATION_SPACING_M = 0.25
+GRAVITY_STATION_REACH_S = 60.0
+GRAVITY_GRID_S = 1.0
+# How firmly the corrections hold to the accelerometer, to each other from one grid time
+# to the next, and to loop closure's revisits (`_tie_gravity_corrections`).
+GRAVITY_TIE_PRIOR_RAD = 1e-3
+GRAVITY_TIE_SMOOTH_RAD = 5e-4
+GRAVITY_TIE_ROTATION_RAD = 2e-4
+GRAVITY_TIE_POSITION_M = 0.02
+GRAVITY_TIE_ITERATIONS = 4
+# Median over the seven sessions of 2026-10-28; individual sessions measured -0.27 to -0.08
+# and -0.15 to +0.13. Fixed to the sensor, so it needs measuring again on another unit.
+GRAVITY_SENSOR_OFFSET_DEG = (-0.12, -0.13)
+
 
 def _find_transient_pose_spikes(
     timestamps_ns: np.ndarray,
@@ -1584,6 +1599,311 @@ def _repair_pose_spikes(
             repaired[i, :3, :3] = _quaternion_to_rotation(_slerp(q0, q1, u))
             repaired[i, :3, 3] = p0 + u * (p1 - p0)
     return repaired
+
+
+def _read_imu_accel(raw_paths: List[str]) -> Tuple[np.ndarray, np.ndarray]:
+    """Accelerometer samples from the pcaps, m/s^2 in the sensor's axes, sorted by time in ns."""
+    from ouster.sdk.core import ImuPacket
+    from ouster.sdk.pcap import PcapPacketSource
+
+    times: List[int] = []
+    accel: List[np.ndarray] = []
+    for raw_path in raw_paths:
+        if not raw_path.lower().endswith(".pcap"):
+            raise ValueError(f"Gravity levelling reads IMU packets from a pcap, got {raw_path}")
+        meta = _find_metadata_json_candidates(raw_path)
+        if not meta:
+            raise ValueError(f"No sensor metadata found for {raw_path}")
+        for _, packet in PcapPacketSource(raw_path, meta=[meta[0]]):
+            if isinstance(packet, ImuPacket):
+                times.append(packet.host_timestamp)
+                accel.append(np.asarray(packet.accel()).reshape(-1, 3).mean(axis=0))
+    if not times:
+        raise ValueError("Gravity levelling found no IMU packets in the raw lidar files.")
+    t = np.asarray(times, dtype=np.int64)
+    order = np.argsort(t, kind="stable")
+    return t[order], np.asarray(accel, dtype=np.float64)[order]
+
+
+def _rotvec_to_matrix(rv: np.ndarray) -> np.ndarray:
+    """Rodrigues' formula for an (N, 3) array of rotation vectors."""
+    angle = np.linalg.norm(rv, axis=1)
+    k = rv / np.maximum(angle, 1e-12)[:, None]
+    K = np.zeros((rv.shape[0], 3, 3))
+    K[:, 0, 1], K[:, 0, 2] = -k[:, 2], k[:, 1]
+    K[:, 1, 0], K[:, 1, 2] = k[:, 2], -k[:, 0]
+    K[:, 2, 0], K[:, 2, 1] = -k[:, 1], k[:, 0]
+    return (
+        np.eye(3)
+        + np.sin(angle)[:, None, None] * K
+        + (1 - np.cos(angle))[:, None, None] * (K @ K)
+    )
+
+
+def _tie_gravity_corrections(
+    rv: np.ndarray,
+    steps: np.ndarray,
+    ties: Sequence[Tuple[int, int]],
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Corrections close to the accelerometer's that keep loop closure's revisits together.
+
+    `rv` holds the correction (a rotation vector with no vertical part) per grid time,
+    `steps` the path between consecutive grid times, and each tie two grid indices the
+    loop closure registered as the same place. Levelling each moment on its own lets
+    two visits of a place get different corrections, which on 2026-10-28 102349 pulled
+    passes that loop closure had joined 0.31 m apart in height. A revisit stays as loop
+    closure left it when both visits take the same correction and the corrections
+    between them, applied to the path between them, add up to no change of where the
+    second visit is relative to the first. In small angles both are linear, so the
+    corrections are the least-squares answer to those two conditions, staying near the
+    accelerometer's and changing smoothly.
+
+    The corrections reach 4-7 deg, and over a kilometre between visits the part of a
+    rotation the linear form leaves out is worth 0.1-0.3 m, so the position condition
+    is solved again a few times, each time about the previous answer with the exact
+    rotations (Gauss-Newton).
+
+    Returns the corrections and, per tie, how far the second visit moves relative to
+    the first in metres.
+    """
+    from scipy.sparse import csr_matrix
+    from scipy.sparse.linalg import spsolve
+
+    n = rv.shape[0]
+    pairs = sorted({tuple(sorted((int(f), int(s)))) for f, s in ties if int(f) != int(s)})
+
+    def moved_by(x: np.ndarray) -> List[np.ndarray]:
+        """Per tie, C_first^T (sum of C_k step_k) - sum of step_k, with exact rotations."""
+        out = []
+        for first, second in pairs:
+            # Each step turns by the correction halfway along it, as the levelled path is rebuilt.
+            middle = (x[first:second] + x[first + 1 : second + 1]) / 2
+            rotated = (_rotvec_to_matrix(middle) @ steps[first:second, :, None])[:, :, 0]
+            out.append(_rotvec_to_matrix(x[first : first + 1])[0].T @ rotated.sum(axis=0) - steps[first:second].sum(axis=0))
+        return out
+
+    tied = rv
+    for _ in range(GRAVITY_TIE_ITERATIONS):
+        tied = _solve_tied_corrections(rv, steps, pairs, tied, moved_by(tied), csr_matrix, spsolve)
+    moved = [float(np.linalg.norm(m)) for m in moved_by(tied)]
+    return tied, np.asarray(moved)
+
+
+def _solve_tied_corrections(rv, steps, pairs, about, moved_about, csr_matrix, spsolve) -> np.ndarray:
+    """One linear solve of `_tie_gravity_corrections`, its position condition taken about `about`."""
+    n = rv.shape[0]
+    rows: List[int] = []
+    cols: List[int] = []
+    vals: List[float] = []
+    rhs: List[float] = []
+
+    def add(entries: Sequence[Tuple[int, float]], value: float, weight: float) -> None:
+        r = len(rhs)
+        for c, v in entries:
+            rows.append(r)
+            cols.append(c)
+            vals.append(v * weight)
+        rhs.append(value * weight)
+
+    # Unknowns: x component of every correction, then y.
+    for k in range(n):
+        for axis in (0, 1):
+            add([(axis * n + k, 1.0)], rv[k, axis], 1.0 / GRAVITY_TIE_PRIOR_RAD)
+    for k in range(n - 1):
+        for axis in (0, 1):
+            add([(axis * n + k + 1, 1.0), (axis * n + k, -1.0)], 0.0, 1.0 / GRAVITY_TIE_SMOOTH_RAD)
+    for (first, second), moved in zip(pairs, moved_about):
+        for axis in (0, 1):
+            add([(axis * n + second, 1.0), (axis * n + first, -1.0)], 0.0, 1.0 / GRAVITY_TIE_ROTATION_RAD)
+        # (rv_k - rv_first) x step_k, summed: with rv = (a, b, 0) and step = (dx, dy, dz),
+        # rv x step = (b dz, -a dz, a dy - b dx). Its value at `about` stands for `moved`
+        # there, so the condition is linear(x) = linear(about) - moved.
+        d = steps[first:second]
+        total = d.sum(axis=0)
+        ks = np.arange(first, second)
+        for component in range(3):
+            if component == 0:
+                a_part, b_part = np.zeros(len(ks)), d[:, 2]
+                a_first, b_first = 0.0, total[2]
+            elif component == 1:
+                a_part, b_part = -d[:, 2], np.zeros(len(ks))
+                a_first, b_first = -total[2], 0.0
+            else:
+                a_part, b_part = d[:, 1], -d[:, 0]
+                a_first, b_first = total[1], -total[0]
+            entries = [(int(k), float(v)) for k, v in zip(ks, a_part) if v != 0.0]
+            entries += [(n + int(k), float(v)) for k, v in zip(ks, b_part) if v != 0.0]
+            entries += [(first, -a_first), (n + first, -b_first)]
+            linear_about = (
+                a_part @ about[ks, 0] + b_part @ about[ks, 1] - a_first * about[first, 0] - b_first * about[first, 1]
+            )
+            add(entries, linear_about - float(moved[component]), 1.0 / GRAVITY_TIE_POSITION_M)
+
+    A = csr_matrix((vals, (rows, cols)), shape=(len(rhs), 2 * n))
+    b = np.asarray(rhs)
+    x = spsolve((A.T @ A).tocsc(), A.T @ b)
+    return np.column_stack([x[:n], x[n:], np.zeros(n)])
+
+
+def _level_poses_on_gravity(
+    pose_ts: np.ndarray,
+    pose_local: np.ndarray,
+    imu_ts: np.ndarray,
+    imu_accel: np.ndarray,
+    *,
+    sensor_offset_deg: Tuple[float, float] = GRAVITY_SENSOR_OFFSET_DEG,
+    window_s: float = GRAVITY_WINDOW_S,
+    ties_ns: Sequence[Tuple[int, int]] = (),
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """
+    Keep the trajectory's "up" on the accelerometer's along the whole route.
+
+    SLAM's up bends with distance, about 3.4 deg/km on 2026-10-28, and a single rigid
+    transform cannot remove that. Over a time window the accelerometer's mean is
+    gravity plus the vehicle's mean acceleration, and the second is known from the
+    trajectory, so what is left says where up is. The correction at each moment is the
+    small rotation taking that up to vertical; each step of the path is rotated by it
+    and the path is rebuilt, so distances along the path do not change.
+
+    `ties_ns` are pairs of times, in the clock of `pose_ts`, that loop closure registered
+    as the same place; the corrections are then solved so those stay together
+    (`_tie_gravity_corrections`).
+
+    Heading is untouched, since gravity says nothing about it.
+    """
+    t0 = pose_ts[0]
+    t = (pose_ts - t0).astype(np.float64) / 1e9
+    imu_t = (imu_ts - t0).astype(np.float64) / 1e9
+    inside = (imu_t >= t[0]) & (imu_t <= t[-1])
+    imu_t, accel = imu_t[inside], imu_accel[inside].copy()
+    if imu_t.size == 0:
+        raise ValueError("No IMU samples fall within the SLAM trajectory's time span.")
+
+    accel[:, :2] -= np.radians(sensor_offset_deg) * np.median(accel[:, 2])
+    nearest = np.clip(np.searchsorted(t, imu_t), 0, t.size - 1)
+    force_map = (pose_local[nearest, :3, :3] @ accel[:, :, None])[:, :, 0]
+    position = pose_local[:, :3, 3]
+
+    def position_at(q: np.ndarray) -> np.ndarray:
+        return np.column_stack([np.interp(q, t, position[:, i]) for i in range(3)])
+
+    def velocity_at(q: np.ndarray, half_width_s: float = 1.0) -> np.ndarray:
+        a, b = np.minimum(q + half_width_s, t[-1]), np.maximum(q - half_width_s, t[0])
+        return (position_at(a) - position_at(b)) / np.maximum(a - b, 1e-3)[:, None]
+
+    grid = np.arange(t[0], t[-1] + GRAVITY_GRID_S, GRAVITY_GRID_S)
+    start = np.maximum(grid - window_s / 2, t[0])
+    end = np.minimum(grid + window_s / 2, t[-1])
+    i0, i1 = np.searchsorted(imu_t, start), np.searchsorted(imu_t, end)
+    has_samples = i1 > i0
+    if not has_samples.any():
+        raise ValueError("No time window holds any IMU samples.")
+    cumulative = np.vstack([np.zeros(3), np.cumsum(force_map, axis=0)])
+    mean_force = (cumulative[i1] - cumulative[i0]) / np.maximum(i1 - i0, 1)[:, None]
+    span = np.maximum(end - start, 1e-3)[:, None]
+    up = mean_force - (velocity_at(end) - velocity_at(start)) / span
+    up /= np.linalg.norm(up, axis=1)[:, None]
+    angle = np.arctan2(np.hypot(up[:, 0], up[:, 1]), up[:, 2])
+    axis = np.column_stack([up[:, 1], -up[:, 0], np.zeros(up.shape[0])])
+    rv = axis * (angle / np.maximum(np.linalg.norm(axis, axis=1), 1e-12))[:, None]
+    for i in range(3):
+        # A window with no samples, which only a long capture gap can leave, follows its neighbours.
+        rv[:, i] = np.interp(grid, grid[has_samples], rv[has_samples, i])
+
+    tie_diagnostics: Dict[str, Any] = {"gravity_ties": 0}
+    if len(ties_ns):
+        tie_t = (np.asarray(ties_ns, dtype=np.int64) - t0).astype(np.float64) / 1e9
+        ties = np.clip(np.rint((tie_t - grid[0]) / GRAVITY_GRID_S), 0, grid.size - 1).astype(int)
+        untied = rv
+        rv, moved = _tie_gravity_corrections(rv, np.diff(position_at(grid), axis=0), [tuple(p) for p in ties])
+        tie_diagnostics = {
+            "gravity_ties": int(len(ties)),
+            "gravity_tie_moved_max_m": float(moved.max()),
+            "gravity_tie_change_from_accelerometer_max_deg": float(
+                np.degrees(np.linalg.norm(rv - untied, axis=1).max())
+            ),
+        }
+
+    def rotvec_at(q: np.ndarray) -> np.ndarray:
+        return np.column_stack([np.interp(q, grid, rv[:, i]) for i in range(3)])
+
+    levelled = np.array(pose_local, dtype=np.float64, copy=True)
+    block = 1_000_000
+    new_position = position[0].copy()
+    for s in range(0, t.size, block):
+        e = min(s + block, t.size)
+        correction = _rotvec_to_matrix(rotvec_at(t[s:e]))
+        levelled[s:e, :3, :3] = correction @ pose_local[s:e, :3, :3]
+        # Steps run from the previous column, so a block's first step crosses from the last block.
+        first = max(s, 1)
+        mid = (t[first - 1 : e - 1] + t[first:e]) / 2
+        step = np.diff(position[first - 1 : e], axis=0)
+        rotated = (_rotvec_to_matrix(rotvec_at(mid)) @ step[:, :, None])[:, :, 0]
+        path = new_position + np.cumsum(rotated, axis=0)
+        levelled[first:e, :3, 3] = path
+        if path.shape[0]:
+            new_position = path[-1].copy()
+    moved_max = float(np.linalg.norm(levelled[:, :3, 3] - position, axis=1).max())
+    degrees = np.degrees(angle[has_samples])
+    return levelled, {
+        "gravity_level": True,
+        "gravity_window_s": float(window_s),
+        "gravity_sensor_offset_deg": [float(v) for v in sensor_offset_deg],
+        "gravity_imu_samples": int(imu_t.size),
+        "gravity_correction_median_deg": float(np.median(degrees)),
+        "gravity_correction_p95_deg": float(np.percentile(degrees, 95)),
+        "gravity_correction_max_deg": float(degrees.max()),
+        "gravity_path_moved_max_m": moved_max,
+        **tie_diagnostics,
+    }
+
+
+def _gravity_place_warp(
+    pose_ts: np.ndarray,
+    pose_before: np.ndarray,
+    pose_levelled: np.ndarray,
+    *,
+    spacing_m: float = GRAVITY_STATION_SPACING_M,
+    reach_s: float = GRAVITY_STATION_REACH_S,
+) -> Tuple[Callable[[np.ndarray, np.ndarray], np.ndarray], int]:
+    """
+    Carry a cloud placed with the unlevelled poses over to the levelled path, by place.
+
+    Giving each scan the levelled pose at its own time would thicken the ground: the
+    correction changes while the vehicle drives, so a patch 15 m ahead moves by that
+    change times 15 m between one sighting and the next. The surfaces SLAM drew agree
+    with each other locally, so here each point instead takes the correction of the
+    point of the path nearest to it, which is the same for every sighting.
+
+    Only path within `reach_s` of a point's own time is searched, so that a later pass of
+    the same street, which holds its own correction, is not picked.
+
+    Returns the function (points, times in unix seconds) -> points, and the number of
+    stations along the path, one per `spacing_m` driven, so that a stop adds none.
+    """
+    from scipy.spatial import cKDTree
+
+    every = max(1, int(np.searchsorted(pose_ts, pose_ts[0] + 50_000_000)))
+    coarse = np.arange(0, pose_ts.size, every)
+    arc = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(pose_before[coarse, :3, 3], axis=0), axis=1))]
+    picked = coarse[np.r_[True, np.diff(np.floor(arc / spacing_m)) > 0]]
+    station_t = pose_ts[picked].astype(np.float64) / 1e9
+    before_xyz = pose_before[picked, :3, 3].copy()
+    levelled_xyz = pose_levelled[picked, :3, 3].copy()
+    correction = pose_levelled[picked, :3, :3] @ np.transpose(pose_before[picked, :3, :3], (0, 2, 1))
+
+    def warp(points: np.ndarray, times_s: np.ndarray) -> np.ndarray:
+        first = np.searchsorted(station_t, times_s.min())
+        last = np.searchsorted(station_t, times_s.max())
+        # A long stop leaves no station within reach, so the ones either side always count.
+        lo = max(0, min(np.searchsorted(station_t, times_s.min() - reach_s), first - 1))
+        hi = min(station_t.size, max(np.searchsorted(station_t, times_s.max() + reach_s), last + 1))
+        _, k = cKDTree(before_xyz[lo:hi, :2]).query(points[:, :2], workers=-1)
+        k = k + lo
+        return (correction[k] @ (points - before_xyz[k])[:, :, None])[:, :, 0] + levelled_xyz[k]
+
+    return warp, int(picked.size)
 
 
 def _estimate_gps_time_offset(
@@ -1996,9 +2316,13 @@ def _build_point_cloud_from_raw_with_poses(
     map_voxel_size: float,
     emit_event: EventEmitter,
     should_cancel: CancelChecker,
+    point_warp: Optional[Callable[[np.ndarray, np.ndarray], np.ndarray]] = None,
 ) -> Tuple[np.ndarray, np.ndarray, Dict[str, int]]:
     """
     Build a global point cloud by replaying raw scans and dewarping with optimized poses.
+
+    `point_warp`, if given, moves each batch of points before it is thinned, taking the
+    points and their times in unix seconds.
 
     Returns (points, attributes, stats) where `attributes` is an Nx2 array holding
     per-point capture time in unix seconds and sensor reflectivity, aligned row-wise
@@ -2050,6 +2374,8 @@ def _build_point_cloud_from_raw_with_poses(
         merged_attrs = np.concatenate(pending_attrs, axis=0)
         pending_batches = []
         pending_attrs = []
+        if point_warp is not None:
+            merged = point_warp(merged, merged_attrs[:, 0])
         if points_accum.shape[0] == 0:
             points_accum = merged
             attrs_accum = merged_attrs
@@ -2629,6 +2955,680 @@ def slam_raw_to_single_las(
         raise
 
 
+def _path_along(xy: np.ndarray) -> np.ndarray:
+    """
+    Cumulative horizontal distance along a sequence of key frame positions.
+
+    Steps over `LOOP_MAX_KEY_FRAME_STEP_M` are not travel but a pose spike, and count as
+    nothing. On the 2026-07-21 chunk0000-1 a spike added 55 m, which made two key frames
+    0.05 s apart look like a revisit.
+    """
+    step = np.hypot(np.diff(xy[:, 0]), np.diff(xy[:, 1]))
+    step[step > LOOP_MAX_KEY_FRAME_STEP_M] = 0.0
+    return np.concatenate([[0.0], np.cumsum(step)])
+
+
+def _local_map_spans(key_poses: np.ndarray, length_m: float, every_m: float) -> List[Tuple[int, int]]:
+    """Key frame ranges (first, past last) covering `length_m` of path, one starting every `every_m`."""
+    along = np.concatenate(
+        [[0.0], np.cumsum(np.linalg.norm(np.diff(key_poses[:, :3, 3], axis=0), axis=1))]
+    )
+    spans: List[Tuple[int, int]] = []
+    start = 0.0
+    while start < along[-1]:
+        first = int(np.searchsorted(along, start))
+        past = int(np.searchsorted(along, start + length_m))
+        if past >= along.size:
+            spans.append((first, along.size - 1))
+            break
+        spans.append((first, past))
+        start += every_m
+    return spans
+
+
+def _find_map_closures(
+    key_ts: np.ndarray,
+    key_poses: np.ndarray,
+    spans: List[Tuple[int, int]],
+    sample_ts: np.ndarray,
+    sample_points: List[np.ndarray],
+) -> List[Tuple[int, int, np.ndarray]]:
+    """
+    Pairs of local maps that show the same place, found by MapClosures from the lidar
+    alone (Gupta et al., https://github.com/PRBonn/MapClosures).
+
+    Each map is built from SLAM's poses and fed in route order. Returned as
+    (earlier map, later map, 4x4 taking the earlier map's frame to the later one's).
+    Maps that share key frames overlap by construction, so they say nothing about a
+    revisit and are left out.
+
+    The maps overlap along the route because a closure depends on where a map happens
+    to start. With maps end to end, two SLAM runs of the 2026-10-28 101705 session that
+    differ by millimetres found 4 and 2 closures, 9 and 5 revisit pairs, and left 15 cm
+    between the passes where pairs were missing. With a map every 10 m, moving the
+    start by up to 7 m gave 8 to 10 pairs there, and 33 every time on 102349.
+    """
+    from map_closures.config import MapClosuresConfig
+    from map_closures.map_closures import MapClosures
+
+    finder = MapClosures(MapClosuresConfig())
+    closures: List[Tuple[int, int, np.ndarray]] = []
+    for index, (first, last) in enumerate(spans):
+        near = np.flatnonzero((sample_ts >= key_ts[first]) & (sample_ts < key_ts[last]))
+        if near.size == 0:
+            near = np.array([min(np.searchsorted(sample_ts, key_ts[first]), sample_ts.size - 1)])
+        merged = np.concatenate([sample_points[k] for k in near]).astype(np.float64)
+        pose = key_poses[first]
+        local = _voxel_thin((merged - pose[:3, 3]) @ pose[:3, :3], LOOP_LOCAL_MAP_VOXEL_M)
+        for closure in finder.get_closures(index, local):
+            if closure.number_of_inliers <= LOOP_CLOSURE_MIN_INLIERS:
+                continue
+            a, b = int(closure.source_id), int(closure.target_id)
+            transform = np.asarray(closure.pose, dtype=np.float64)
+            if a > b:
+                a, b, transform = b, a, np.linalg.inv(transform)
+            if spans[b][0] >= spans[a][1]:
+                closures.append((a, b, transform))
+    return closures
+
+
+def _find_loop_pairs(
+    key_poses: np.ndarray,
+    spans: List[Tuple[int, int]],
+    closures: List[Tuple[int, int, np.ndarray]],
+    *,
+    radius_m: float,
+    min_separation_m: float,
+    every_m: float,
+) -> List[Tuple[int, int, float, np.ndarray]]:
+    """
+    Key frames where the route comes back to a place it has already been.
+
+    A closure says where one local map lies against another, which SLAM's own poses
+    cannot say once they have drifted. Applying it, each key frame of the later map
+    is paired with the nearest key frame of the earlier map, if that lies within
+    `radius_m` and at least `min_separation_m` back along the path. Measuring the
+    separation along the path means a vehicle standing at a light does not pair with
+    itself. Pairs are spaced `every_m` apart along the later pass, which is enough for
+    the optimiser and keeps the number of ICP runs small.
+
+    The last key frame is never paired: the SDK's PoseOptimizer silently ignores a
+    constraint on it. A route that ends where it began would otherwise lose its closure.
+
+    Returns (j, i, distance, guess of pose i in the frame of pose j).
+    """
+    along = _path_along(key_poses[:, :2, 3])
+    last = key_poses.shape[0] - 1
+    best: Dict[int, Tuple[float, int, np.ndarray]] = {}
+    for earlier_map, later_map, transform in closures:
+        first_j, past_j = spans[earlier_map]
+        first_i, past_i = spans[later_map]
+        js = np.arange(first_j, past_j)
+        to_earlier = np.linalg.inv(transform) @ np.linalg.inv(key_poses[first_i])
+        in_earlier = np.linalg.inv(key_poses[first_j]) @ key_poses[js]
+        for i in range(first_i, min(past_i, last)):
+            here = to_earlier @ key_poses[i]
+            d = np.linalg.norm(in_earlier[:, :3, 3] - here[:3, 3], axis=1)
+            k = int(np.argmin(d))
+            if d[k] > radius_m or along[i] - along[js[k]] < min_separation_m:
+                continue
+            if i not in best or d[k] < best[i][0]:
+                best[i] = (float(d[k]), int(js[k]), np.linalg.inv(in_earlier[k]) @ here)
+    # Closest first. Taking them in path order instead picked the frame where a
+    # revisit first came within range, at the edge of the radius, and the spacing
+    # rule then skipped the frames that actually overlapped: on the 2026-10-28
+    # block loop that left one pair 9.7 m apart, which did not register.
+    chosen: List[int] = []
+    for i in sorted(best, key=lambda n: best[n][0]):
+        if all(abs(along[i] - along[k]) >= every_m for k in chosen):
+            chosen.append(i)
+    return [(best[i][1], i, best[i][0], best[i][2]) for i in sorted(chosen)]
+
+
+def _find_nearby_pairs(
+    key_poses: np.ndarray,
+    along: np.ndarray,
+    taken: List[int],
+    *,
+    radius_m: float,
+    min_separation_m: float,
+    every_m: float,
+) -> List[Tuple[int, int, float, np.ndarray]]:
+    """
+    Revisits that `key_poses` already place within `radius_m`, away from later key frames in `taken`.
+
+    This finds what closures miss. A route that touches an earlier street for only a few
+    metres gives local maps too little in common to close, yet SLAM's poses, or the poses
+    corrected from other revisits, put the two visits close enough to register. `along` is
+    SLAM's own distance travelled. Skips the last key frame and returns the same as
+    `_find_loop_pairs`.
+    """
+    candidates: List[Tuple[float, int, int]] = []
+    for i in range(key_poses.shape[0] - 1):
+        earlier = np.flatnonzero(along <= along[i] - min_separation_m)
+        if earlier.size == 0:
+            continue
+        d = np.linalg.norm(key_poses[earlier, :3, 3] - key_poses[i, :3, 3], axis=1)
+        k = int(np.argmin(d))
+        if d[k] <= radius_m:
+            candidates.append((float(d[k]), int(earlier[k]), i))
+    spaced = list(taken)
+    pairs: List[Tuple[int, int, float, np.ndarray]] = []
+    for d, j, i in sorted(candidates):
+        if all(abs(along[i] - along[k]) >= every_m for k in spaced):
+            spaced.append(i)
+            pairs.append((j, i, d, np.linalg.inv(key_poses[j]) @ key_poses[i]))
+    return sorted(pairs, key=lambda c: c[1])
+
+
+LOOP_SAMPLE_EVERY_N_SCANS = 4
+LOOP_SAMPLE_VOXEL_M = 0.3
+LOOP_SAMPLE_MAX_RANGE_M = 40.0
+LOOP_SUBMAP_HALF_LENGTH_M = 15.0
+LOOP_ICP_MIN_FITNESS = 0.3
+LOOP_ICP_MAX_RMSE_M = 0.15
+LOOP_ICP_MIN_POINTS = 2000
+LOOP_CONSTRAINT_WEIGHT = 10.0
+LOOP_LOCAL_MAP_M = 50.0
+LOOP_LOCAL_MAP_EVERY_M = 10.0
+LOOP_MAX_ROUNDS = 3
+LOOP_MAX_KEY_FRAME_STEP_M = 10.0
+LOOP_LOCAL_MAP_VOXEL_M = 0.5
+LOOP_CLOSURE_MIN_INLIERS = 5
+
+
+def _scan_sample_points(
+    scan: Any,
+    xyzlut: Any,
+    dewarp: Any,
+    voxel_downsample: Any,
+    ChanField: Any,
+    *,
+    min_range: float,
+) -> Optional[Tuple[int, np.ndarray]]:
+    """
+    A thinned copy of one SLAM-updated scan in the SLAM frame, for loop closure.
+
+    Loop closure registers the scans of two visits to the same place against each
+    other. Keeping a sparse copy while SLAM runs is far cheaper than reading the raw
+    capture a second time to find them afterwards.
+    """
+    if not _scan_has_range_field(scan, ChanField):
+        return None
+    timestamps = np.asarray(scan.timestamp, dtype=np.int64)
+    valid_cols = timestamps > 0
+    if not np.any(valid_cols):
+        return None
+    ranges = _scan_get_range_field(scan, ChanField)
+    ranges_m = np.asarray(ranges, dtype=np.float64) * 0.001
+    points = dewarp(xyzlut(ranges), np.asarray(scan.pose, dtype=np.float64))
+    keep = (
+        (ranges_m >= max(min_range, 0.5))
+        & (ranges_m <= LOOP_SAMPLE_MAX_RANGE_M)
+        & valid_cols[np.newaxis, :]
+    )
+    selected = np.asarray(points[keep], dtype=np.float64)
+    if selected.shape[0] == 0:
+        return None
+    selected, _ = voxel_downsample(
+        LOOP_SAMPLE_VOXEL_M, selected, np.zeros((selected.shape[0], 1), dtype=np.float64)
+    )
+    mid = int(timestamps[np.flatnonzero(valid_cols)[valid_cols.sum() // 2]])
+    return mid, np.asarray(selected, dtype=np.float32)
+
+
+def _voxel_thin(points: np.ndarray, voxel: float) -> np.ndarray:
+    """Keep one point per voxel."""
+    keys = np.floor(points / voxel).astype(np.int64)
+    _, first = np.unique(keys, axis=0, return_index=True)
+    return points[np.sort(first)]
+
+
+def _plane_normals(points: np.ndarray, tree: Any, k: int = 12) -> Tuple[np.ndarray, np.ndarray]:
+    """Per-point normals from the k nearest neighbours, and which points lie on a plane."""
+    _, idx = tree.query(points, k=k)
+    nbrs = points[idx]
+    centred = nbrs - nbrs.mean(axis=1, keepdims=True)
+    cov = np.einsum("nki,nkj->nij", centred, centred) / k
+    eigval, eigvec = np.linalg.eigh(cov)
+    normals = eigvec[:, :, 0]
+    planar = eigval[:, 0] <= 0.05 * np.maximum(eigval.sum(axis=1), 1e-12)
+    return normals, planar
+
+
+def _small_rotation(omega: np.ndarray) -> np.ndarray:
+    angle = float(np.linalg.norm(omega))
+    if angle < 1e-12:
+        return np.eye(3)
+    axis = omega / angle
+    cross = np.array(
+        [[0.0, -axis[2], axis[1]], [axis[2], 0.0, -axis[0]], [-axis[1], axis[0], 0.0]]
+    )
+    return np.eye(3) + np.sin(angle) * cross + (1.0 - np.cos(angle)) * (cross @ cross)
+
+
+def _target_index(target: np.ndarray) -> Tuple[Any, np.ndarray, np.ndarray]:
+    """KD-tree, normals and planarity of an ICP target, built once per target."""
+    from scipy.spatial import cKDTree
+
+    tree = cKDTree(target)
+    normals, planar = _plane_normals(target, tree)
+    return tree, normals, planar
+
+
+def _icp_point_to_plane(
+    source: np.ndarray,
+    target: np.ndarray,
+    initial: np.ndarray,
+    *,
+    schedule: Tuple[float, ...] = (4.0, 2.0, 1.0, 0.5, 0.3),
+    iterations: int = 15,
+    target_index: Optional[Tuple[Any, np.ndarray, np.ndarray]] = None,
+) -> Tuple[np.ndarray, Dict[str, float]]:
+    """
+    Point-to-plane ICP: the 4x4 that maps `source` onto `target`, starting from
+    `initial`, with the correspondence distance shrinking through `schedule`.
+
+    The coarse first stages are what let it start from a guess that can be a couple
+    of metres out. Returns the transform and, at the final distance, the
+    share of source points that found a plane (fitness), their RMS distance to it,
+    and the weakest direction of the translation information, which is small when
+    the scene cannot pin the translation down, as along a featureless corridor.
+    """
+    tree, normals, planar = target_index or _target_index(target)
+    transform = np.array(initial, dtype=np.float64, copy=True)
+    for max_dist in schedule:
+        for _ in range(iterations):
+            moved = _apply_transform(transform, source)
+            dist, idx = tree.query(moved, distance_upper_bound=max_dist)
+            ok = np.isfinite(dist)
+            ok[ok] &= planar[idx[ok]]
+            if ok.sum() < 50:
+                break
+            p = moved[ok]
+            n = normals[idx[ok]]
+            r = np.einsum("ij,ij->i", p - target[idx[ok]], n)
+            jac = np.hstack([np.cross(p, n), n])
+            huber = max_dist / 3.0
+            w = np.where(np.abs(r) <= huber, 1.0, huber / np.maximum(np.abs(r), 1e-12))
+            hessian = jac.T @ (w[:, None] * jac)
+            step = -np.linalg.solve(hessian + 1e-9 * np.eye(6), jac.T @ (w * r))
+            update = _rigid_transform_matrix(_small_rotation(step[:3]), step[3:])
+            transform = update @ transform
+            if np.linalg.norm(step[:3]) < 1e-5 and np.linalg.norm(step[3:]) < 1e-4:
+                break
+
+    moved = _apply_transform(transform, source)
+    final = schedule[-1]
+    dist, idx = tree.query(moved, distance_upper_bound=final)
+    ok = np.isfinite(dist)
+    ok[ok] &= planar[idx[ok]]
+    stats = {"fitness": float(ok.mean()) if ok.size else 0.0, "rmse_m": float("inf"),
+             "translation_information_min": 0.0}
+    if ok.sum() >= 50:
+        p = moved[ok]
+        n = normals[idx[ok]]
+        r = np.einsum("ij,ij->i", p - target[idx[ok]], n)
+        stats["rmse_m"] = float(np.sqrt(np.mean(r**2)))
+        stats["translation_information_min"] = float(
+            np.linalg.eigvalsh(n.T @ n / n.shape[0])[0]
+        )
+    return transform, stats
+
+
+def _register_multistart(
+    source: np.ndarray,
+    target: np.ndarray,
+    guesses: List[np.ndarray],
+    *,
+    grid_m: float = 2.0,
+    screen_points: int = 20000,
+) -> Tuple[np.ndarray, Dict[str, float]]:
+    """
+    ICP from several starting points, keeping the one that fits best.
+
+    A single start can settle in the wrong place: on the 2026-10-28 block loop one
+    start converged 1 m off, with walls visibly doubled, while starting from SLAM's
+    own guess found the alignment where they coincide. Each guess is tried as
+    given and shifted horizontally by `grid_m` in eight directions, on a thinned copy
+    of the source; the best by fitness is then refined on the full source.
+    """
+    starts: List[np.ndarray] = []
+    for guess in guesses:
+        for dx in (-grid_m, 0.0, grid_m):
+            for dy in (-grid_m, 0.0, grid_m):
+                start = np.array(guess, dtype=np.float64, copy=True)
+                start[0, 3] += dx
+                start[1, 3] += dy
+                starts.append(start)
+    if source.shape[0] > screen_points:
+        step = int(np.ceil(source.shape[0] / screen_points))
+        screen = source[::step]
+    else:
+        screen = source
+    index = _target_index(target)
+    best: Optional[Tuple[np.ndarray, Dict[str, float]]] = None
+    for start in starts:
+        transform, stats = _icp_point_to_plane(
+            screen, target, start, schedule=(2.0, 1.0, 0.5, 0.3), iterations=10,
+            target_index=index,
+        )
+        if best is None or stats["fitness"] > best[1]["fitness"]:
+            best = (transform, stats)
+    assert best is not None
+    return _icp_point_to_plane(
+        source, target, best[0], schedule=(0.5, 0.3), target_index=index
+    )
+
+
+def _keyframe_submap(
+    key_index: int,
+    key_poses: np.ndarray,
+    key_along: np.ndarray,
+    sample_along: np.ndarray,
+    sample_points: List[np.ndarray],
+) -> np.ndarray:
+    """
+    The sampled scans within `LOOP_SUBMAP_HALF_LENGTH_M` of a key frame along the
+    path, merged and expressed in that key frame's own coordinates.
+    """
+    near = np.flatnonzero(
+        np.abs(sample_along - key_along[key_index]) <= LOOP_SUBMAP_HALF_LENGTH_M
+    )
+    if near.size == 0:
+        return np.zeros((0, 3))
+    # One scan per metre travelled: a vehicle stopped at a light would otherwise
+    # stack dozens of identical scans into the submap.
+    _, first = np.unique(np.floor(sample_along[near]).astype(np.int64), return_index=True)
+    merged = np.concatenate([sample_points[k] for k in near[first]], axis=0).astype(np.float64)
+    pose = key_poses[key_index]
+    local = (merged - pose[:3, 3]) @ pose[:3, :3]
+    local = local[np.linalg.norm(local, axis=1) <= LOOP_SAMPLE_MAX_RANGE_M]
+    return _voxel_thin(local, 0.2)
+
+
+def _interpolate_corrections(
+    key_ts: np.ndarray,
+    corrections: np.ndarray,
+    pose_ts: np.ndarray,
+    poses: np.ndarray,
+    *,
+    block: int = 1_000_000,
+) -> np.ndarray:
+    """
+    Apply per-key-frame corrections to every column pose, interpolated in time.
+
+    Each correction is the left-multiplied 4x4 that moves a key frame from where
+    SLAM put it to where the loop-closed solution puts it. Between key frames it is
+    blended linearly in translation and by normalised quaternion interpolation in
+    rotation; adjacent key frames are a metre apart, so the corrections differ by
+    millimetres and the blend is exact for all practical purposes. The column poses
+    themselves are never re-derived, so the fine motion SLAM measured within each
+    50 ms frame survives untouched.
+    """
+    quats = np.array([_rotation_to_quaternion(c[:3, :3]) for c in corrections])
+    for k in range(1, quats.shape[0]):
+        if np.dot(quats[k], quats[k - 1]) < 0:
+            quats[k] = -quats[k]
+    trans = corrections[:, :3, 3]
+    out = np.empty_like(poses)
+    for start in range(0, pose_ts.size, block):
+        stop = min(start + block, pose_ts.size)
+        t = pose_ts[start:stop]
+        right = np.clip(np.searchsorted(key_ts, t), 1, key_ts.size - 1)
+        left = right - 1
+        span = (key_ts[right] - key_ts[left]).astype(np.float64)
+        u = np.clip((t - key_ts[left]).astype(np.float64) / np.where(span > 0, span, 1.0), 0.0, 1.0)
+        q = (1 - u)[:, None] * quats[left] + u[:, None] * quats[right]
+        q /= np.linalg.norm(q, axis=1, keepdims=True)
+        w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+        rot = np.stack(
+            [
+                np.stack([1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)], axis=1),
+                np.stack([2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)], axis=1),
+                np.stack([2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)], axis=1),
+            ],
+            axis=1,
+        )
+        shift = (1 - u)[:, None] * trans[left] + u[:, None] * trans[right]
+        correction = np.zeros((t.size, 4, 4))
+        correction[:, :3, :3] = rot
+        correction[:, :3, 3] = shift
+        correction[:, 3, 3] = 1.0
+        out[start:stop] = correction @ poses[start:stop]
+    return out
+
+
+def _close_loops(
+    osf_path: str,
+    *,
+    pose_ts: np.ndarray,
+    pose_local: np.ndarray,
+    sample_ts: np.ndarray,
+    sample_points: List[np.ndarray],
+    key_frame_distance: float,
+    radius_m: float,
+    min_separation_m: float,
+    every_m: float,
+    max_iterations: int,
+    emit_event: EventEmitter,
+    debug_dir: Optional[str] = None,
+    rotation_weight: float = 100.0,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """
+    Remove SLAM's accumulated drift where the route revisits a place.
+
+    SLAM chains each scan onto the last, so its error grows with distance: on the
+    2026-10-28 block loop the end of a 600 m lap sat 1.4 m from its start, and on
+    the 14-minute recording that drove its streets twice the second pass came back
+    8 m too low. Where the route returns to a place, the scans of the two visits are
+    registered directly, which measures the drift instead of guessing it.
+
+    Revisits are recognised from the lidar alone, by MapClosures: once SLAM has
+    drifted several metres its poses no longer say the two passes are on the same
+    street. Each closure also gives the registration its starting guess, and
+    point-to-plane ICP on the two submaps refines it. The Ouster SDK's own revisit
+    constraint cannot be used for this, because it starts its ICP from SLAM's drifted
+    poses and has no way to be given a better guess.
+
+    Closures miss short overlaps, so revisits are also taken from how close the poses
+    put two visits (`_find_nearby_pairs`), first SLAM's and then, after each solve, the
+    corrected ones, until a round adds nothing. On the 2026-10-28 102349 session the
+    last 20 m of a third pass went unrecognised and stayed 2.4 m off until this.
+
+    Each accepted registration becomes a pose-to-pose constraint and the SDK pose
+    graph is solved with those and SLAM's odometry alone. GPS plays no part in any of
+    this; it only places the finished trajectory afterwards.
+
+    The solution is used only as a correction: at each key frame, the transform
+    from SLAM's pose to the solved pose, interpolated onto SLAM's own column poses.
+    Taking the solver's column poses directly, as the first version did, replaced
+    SLAM's per-column motion with interpolation between key frames a metre apart and
+    thickened surfaces by a fifth on the 2026-10-28 block loop.
+
+    Returns the corrected column poses (unchanged when no revisit registers) and
+    diagnostics, including each pair's measured drift.
+    """
+    from ouster.sdk.mapping import PoseOptimizer, PoseToPoseConstraint, SamplingMode, SolverConfig
+
+    solver = SolverConfig()
+    solver.key_frame_distance = float(key_frame_distance)
+    solver.fix_first_node = True
+    solver.process_printout = False
+    solver.max_num_iterations = int(max_iterations)
+    solver.traj_rotation_weight = float(rotation_weight)
+    po = PoseOptimizer(osf_path, solver)
+
+    key_ts = np.asarray(po.get_timestamps(SamplingMode.KEY_FRAMES), dtype=np.int64)
+    key_poses = np.asarray(po.get_poses(SamplingMode.KEY_FRAMES), dtype=np.float64)
+    key_along = _path_along(key_poses[:, :2, 3])
+    sample_along = np.interp(sample_ts, key_ts, key_along)
+
+    spans = _local_map_spans(key_poses, LOOP_LOCAL_MAP_M, LOOP_LOCAL_MAP_EVERY_M)
+    closures = _find_map_closures(key_ts, key_poses, spans, sample_ts, sample_points)
+    pairs = _find_loop_pairs(
+        key_poses,
+        spans,
+        closures,
+        radius_m=radius_m,
+        min_separation_m=min_separation_m,
+        every_m=every_m,
+    )
+
+    records: List[Dict[str, Any]] = []
+    accepted = 0
+    current = key_poses
+    solves = 0
+    for _ in range(LOOP_MAX_ROUNDS):
+        taken = [p[1] for p in pairs] + [r["key_frames"][1] for r in records]
+        pairs = pairs + _find_nearby_pairs(
+            current,
+            key_along,
+            taken,
+            radius_m=radius_m,
+            min_separation_m=min_separation_m,
+            every_m=every_m,
+        )
+        added = 0
+        for j, i, nominated_distance, initial in pairs:
+            record: Dict[str, Any] = {
+                "unix_s_first": float(key_ts[j]) / 1e9,
+                "unix_s_second": float(key_ts[i]) / 1e9,
+                "nominated_distance_m": float(nominated_distance),
+                "accepted": False,
+                "key_frames": (j, i),
+            }
+            records.append(record)
+            target = _keyframe_submap(j, key_poses, key_along, sample_along, sample_points)
+            source = _keyframe_submap(i, key_poses, key_along, sample_along, sample_points)
+            if min(target.shape[0], source.shape[0]) < LOOP_ICP_MIN_POINTS:
+                record["reason"] = "too few points"
+                continue
+
+            relative, stats = _register_multistart(
+                source, target, [np.linalg.inv(key_poses[j]) @ key_poses[i], initial]
+            )
+            if debug_dir:
+                os.makedirs(debug_dir, exist_ok=True)
+                np.savez_compressed(
+                    os.path.join(debug_dir, f"pair_{len(records):03d}.npz"),
+                    source=source,
+                    target=target,
+                    initial=initial,
+                    relative=relative,
+                    slam_relative=np.linalg.inv(key_poses[j]) @ key_poses[i],
+                    key_ts=np.array([key_ts[j], key_ts[i]]),
+                )
+            record.update(stats)
+
+            slam_relative = np.linalg.inv(key_poses[j]) @ key_poses[i]
+            drift = np.linalg.inv(slam_relative) @ relative
+            record["drift_m"] = float(np.linalg.norm(drift[:3, 3]))
+            record["drift_deg"] = float(
+                np.degrees(np.arccos(np.clip((np.trace(drift[:3, :3]) - 1) / 2, -1.0, 1.0)))
+            )
+            record["refined_from_guess_m"] = float(
+                np.linalg.norm(relative[:3, 3] - initial[:3, 3])
+            )
+            if stats["fitness"] < LOOP_ICP_MIN_FITNESS or stats["rmse_m"] > LOOP_ICP_MAX_RMSE_M:
+                record["reason"] = "registration did not converge"
+                continue
+            po.add_constraint(
+                PoseToPoseConstraint(
+                    int(key_ts[j]),
+                    int(key_ts[i]),
+                    relative,
+                    LOOP_CONSTRAINT_WEIGHT,
+                    np.full(3, LOOP_CONSTRAINT_WEIGHT),
+                )
+            )
+            record["accepted"] = True
+            record["relative_pose"] = relative.tolist()
+            added += 1
+        pairs = []
+        accepted += added
+        if not added:
+            break
+        po.solve(int(max_iterations))
+        solves += 1
+        current = np.asarray(po.get_poses(SamplingMode.KEY_FRAMES), dtype=np.float64)
+
+    diagnostics: Dict[str, Any] = {
+        "loop_local_maps": len(spans),
+        "loop_map_closures": len(closures),
+        "loop_solves": solves,
+        "loop_pairs_found": len(records),
+        "loop_constraints_added": accepted,
+        "loop_constraints_failed": len(records) - accepted,
+    }
+    drifts = [r["drift_m"] for r in records if r["accepted"]]
+    if drifts:
+        diagnostics["loop_drift_median_m"] = float(np.median(drifts))
+        diagnostics["loop_drift_max_m"] = float(np.max(drifts))
+    _log_and_emit(
+        emit_event,
+        f"Loop closure: {len(closures)} closure(s) among {len(spans)} local maps gave "
+        f"{len(records)} revisit pair(s) within {radius_m:.1f} m over {solves} solve(s), "
+        f"{accepted} registered and added, {len(records) - accepted} rejected"
+        + (
+            f"; SLAM drift at the revisits {diagnostics['loop_drift_median_m']:.2f} m median, "
+            f"{diagnostics['loop_drift_max_m']:.2f} m max."
+            if drifts
+            else "."
+        ),
+    )
+
+    corrected = pose_local
+    if accepted:
+        diagnostics["loop_poseopt_cost"] = float(po.get_cost_value())
+        key_after = current
+        moved = np.linalg.norm(key_after[:, :3, 3] - key_poses[:, :3, 3], axis=1)
+        diagnostics["loop_key_frame_shift_median_m"] = float(np.median(moved))
+        diagnostics["loop_key_frame_shift_max_m"] = float(np.max(moved))
+
+        # How well the solved trajectory honours each registration.
+        residuals = []
+        for record in records:
+            if not record["accepted"]:
+                continue
+            j, i = record["key_frames"]
+            solved = np.linalg.inv(key_after[j]) @ key_after[i]
+            err = np.linalg.norm(solved[:3, 3] - np.asarray(record["relative_pose"])[:3, 3])
+            record["solved_residual_m"] = float(err)
+            residuals.append(float(err))
+        diagnostics["loop_solved_residual_median_m"] = float(np.median(residuals))
+        diagnostics["loop_solved_residual_max_m"] = float(np.max(residuals))
+
+        corrections = key_after @ np.linalg.inv(key_poses)
+        corrected = _interpolate_corrections(key_ts, corrections, pose_ts, pose_local)
+        if debug_dir:
+            # Everything needed to check the result afterwards on revisits the solve
+            # did not use, against the separate passes rather than the merged cloud.
+            np.savez_compressed(
+                os.path.join(debug_dir, "loop_state.npz"),
+                key_ts=key_ts,
+                key_poses=key_poses,
+                key_after=key_after,
+                sample_ts=sample_ts,
+                sample_counts=np.array([p.shape[0] for p in sample_points]),
+                sample_points=np.concatenate(sample_points, axis=0),
+            )
+        _log_and_emit(
+            emit_event,
+            "Loop closure solved: key frames moved by "
+            f"{diagnostics['loop_key_frame_shift_median_m']:.2f} m median, "
+            f"{diagnostics['loop_key_frame_shift_max_m']:.2f} m max; revisits now agree to "
+            f"{diagnostics['loop_solved_residual_median_m']:.2f} m median, "
+            f"{diagnostics['loop_solved_residual_max_m']:.2f} m max.",
+        )
+
+    for record in records:
+        record.pop("relative_pose", None)
+        record.pop("key_frames", None)
+    diagnostics["loop_pairs"] = records
+    return corrected, diagnostics
+
+
 def slam_raw_to_gps_anchored_las(
     raw_paths: List[str],
     gps_df: pd.DataFrame,
@@ -2646,6 +3646,16 @@ def slam_raw_to_gps_anchored_las(
     anchor_z_mode: str,
     anchor_tilt_min_span_m: float = 50.0,
     anchor_tilt_max_deg: float = 5.0,
+    loop_closure: bool = False,
+    loop_radius_m: float = 10.0,
+    loop_min_separation_m: float = 50.0,
+    loop_every_m: float = 10.0,
+    loop_key_frame_distance: float = 1.0,
+    loop_max_iterations: int = 100,
+    loop_rotation_weight: float = 100.0,
+    loop_debug_dir: Optional[str] = None,
+    gravity_level: bool = False,
+    gravity_sensor_offset_deg: Tuple[float, float] = GRAVITY_SENSOR_OFFSET_DEG,
     reflectivity_filter: bool,
     min_reflectivity: int,
     map_voxel_size: float,
@@ -2654,6 +3664,10 @@ def slam_raw_to_gps_anchored_las(
 ) -> Dict[str, Any]:
     """
     Run SLAM, then place the result in GPS coordinates with a single rigid transform.
+
+    With `loop_closure`, SLAM's drift is first removed wherever the route revisits a
+    place (see `_close_loops`); the placement is then fitted to the corrected
+    trajectory in the same way.
 
     The transform has four degrees of freedom - yaw, easting, northing and height -
     fitted by least squares over the whole trajectory. Because it is rigid, the
@@ -2705,6 +3719,30 @@ def slam_raw_to_gps_anchored_las(
     tmp_output_osf = _temp_osf_path(output_osf)
     if tmp_output_osf and os.path.exists(tmp_output_osf):
         os.remove(tmp_output_osf)
+    # Loop closure reads the scans back from an OSF, so one is written even when the
+    # caller did not ask for it, and removed afterwards.
+    loop_temp_dir = None
+    if loop_closure and not tmp_output_osf:
+        loop_temp_dir = tempfile.mkdtemp(prefix="lidar_loop_")
+        tmp_output_osf = os.path.join(loop_temp_dir, "slam.osf.partial")
+    loop_osf = output_osf if output_osf else (
+        os.path.join(loop_temp_dir, "slam.osf") if loop_temp_dir else None
+    )
+    loop_diagnostics: Dict[str, Any] = {}
+    loop_sample_ts: List[int] = []
+    loop_sample_points: List[np.ndarray] = []
+    loop_xyzlut = None
+    if loop_closure:
+        from ouster.sdk.core import ChanField, XYZLut, dewarp, voxel_downsample
+
+        # Found out here rather than after SLAM has run for an hour.
+        try:
+            import map_closures  # noqa: F401
+        except ImportError as exc:
+            raise ValueError(
+                "Loop closure needs map-closures (see requirements-offline.txt); "
+                "install it or pass --no-loop-closure."
+            ) from exc
 
     slam_engine = None
     total_scans = 0
@@ -2745,6 +3783,8 @@ def slam_raw_to_gps_anchored_las(
                     slam_engine = SlamEngine(infos=_source_infos(source), config=config)
                     if tmp_output_osf:
                         osf_writer = Writer(tmp_output_osf, _source_infos(source))
+                    if loop_closure:
+                        loop_xyzlut = XYZLut(_extract_first_sensor_info(source), use_extrinsics=True)
                     _emit(
                         emit_event,
                         "status",
@@ -2778,6 +3818,18 @@ def slam_raw_to_gps_anchored_las(
                                 column_pose_blocks.append(col_poses)
                         except Exception:
                             pass
+                        if loop_closure and total_scans % LOOP_SAMPLE_EVERY_N_SCANS == 0:
+                            sample = _scan_sample_points(
+                                scan,
+                                loop_xyzlut,
+                                dewarp,
+                                voxel_downsample,
+                                ChanField,
+                                min_range=min_range,
+                            )
+                            if sample is not None:
+                                loop_sample_ts.append(sample[0])
+                                loop_sample_points.append(sample[1])
 
                     total_scans += 1
                     if scan_idx % 10 == 0:
@@ -2821,14 +3873,18 @@ def slam_raw_to_gps_anchored_las(
         if osf_writer is not None:
             osf_writer.close()
             osf_writer = None
-            assert tmp_output_osf is not None and output_osf is not None
-            os.replace(tmp_output_osf, output_osf)
-            _log_and_emit(emit_event, f"Saved local SLAM OSF: {output_osf}")
-            _emit(
-                emit_event,
-                "status",
-                message="OSF stores local SLAM poses for rigid_fit backend (LAS is GPS-anchored output).",
-            )
+            if output_osf is not None:
+                assert tmp_output_osf is not None
+                os.replace(tmp_output_osf, output_osf)
+                _log_and_emit(emit_event, f"Saved local SLAM OSF: {output_osf}")
+                _emit(
+                    emit_event,
+                    "status",
+                    message="OSF stores local SLAM poses for rigid_fit backend (LAS is GPS-anchored output).",
+                )
+            else:
+                assert tmp_output_osf is not None and loop_osf is not None
+                os.replace(tmp_output_osf, loop_osf)
 
         if not column_pose_blocks:
             raise ValueError("No SLAM column poses were captured for the raw replay.")
@@ -2841,6 +3897,38 @@ def slam_raw_to_gps_anchored_las(
         unique = np.concatenate([[True], np.diff(pose_ts) > 0])
         pose_ts = pose_ts[unique]
         pose_local = pose_local[unique]
+
+        if loop_closure:
+            assert loop_osf is not None
+            _emit(emit_event, "status", message="Looking for places the route revisits...")
+            traj_t_all = np.asarray(traj_timestamps, dtype=np.int64)
+            sample_order = np.argsort(np.asarray(loop_sample_ts, dtype=np.int64), kind="stable")
+            pose_local, loop_diagnostics = _close_loops(
+                loop_osf,
+                pose_ts=pose_ts,
+                pose_local=pose_local,
+                sample_ts=np.asarray(loop_sample_ts, dtype=np.int64)[sample_order],
+                sample_points=[loop_sample_points[k] for k in sample_order],
+                key_frame_distance=loop_key_frame_distance,
+                radius_m=loop_radius_m,
+                min_separation_m=loop_min_separation_m,
+                every_m=loop_every_m,
+                max_iterations=loop_max_iterations,
+                rotation_weight=loop_rotation_weight,
+                emit_event=emit_event,
+                debug_dir=loop_debug_dir,
+            )
+            loop_sample_points = []
+            if loop_diagnostics.get("loop_constraints_added", 0) > 0:
+                # The per-scan samples that drive the GPS fit come from the same
+                # trajectory, so move them too.
+                sample_idx = np.clip(
+                    np.searchsorted(pose_ts, traj_t_all), 0, pose_ts.size - 1
+                )
+                traj_xyz_local = [pose_local[k, :3, 3].copy() for k in sample_idx]
+            if loop_temp_dir:
+                shutil.rmtree(loop_temp_dir, ignore_errors=True)
+                loop_temp_dir = None
 
         spike_windows, spike_steps = _find_transient_pose_spikes(pose_ts, pose_local[:, :3, 3])
         spike_records = []
@@ -2882,6 +3970,33 @@ def slam_raw_to_gps_anchored_las(
             traj_t = traj_t[keep]
             traj_xyz = traj_xyz[keep]
 
+        gravity_diagnostics: Dict[str, Any] = {"gravity_level": False}
+        if gravity_level:
+            _emit(emit_event, "status", message="Levelling the trajectory on the accelerometer...")
+            imu_ts, imu_accel = _read_imu_accel(raw_paths)
+            pose_unlevelled = pose_local
+            pose_local, gravity_diagnostics = _level_poses_on_gravity(
+                pose_ts,
+                pose_local,
+                imu_ts,
+                imu_accel,
+                sensor_offset_deg=gravity_sensor_offset_deg,
+                ties_ns=[
+                    (int(round(p["unix_s_first"] * 1e9)), int(round(p["unix_s_second"] * 1e9)))
+                    for p in loop_diagnostics.get("loop_pairs", [])
+                    if p.get("accepted")
+                ],
+            )
+            sample_idx = np.clip(np.searchsorted(pose_ts, traj_t), 0, pose_ts.size - 1)
+            traj_xyz = pose_local[sample_idx, :3, 3].copy()
+            _log_and_emit(
+                emit_event,
+                "Gravity levelling: correction median "
+                f"{gravity_diagnostics['gravity_correction_median_deg']:.2f} deg, largest "
+                f"{gravity_diagnostics['gravity_correction_max_deg']:.2f} deg; path moved at most "
+                f"{gravity_diagnostics['gravity_path_moved_max_m']:.2f} m.",
+            )
+
         slam_t, gps_t, chosen_time_mode = choose_time_mode(traj_t, gps_t_raw, time_mode)
         slam_t, in_range = _trim_query_to_gps_range(
             slam_t,
@@ -2915,7 +4030,11 @@ def slam_raw_to_gps_anchored_las(
 
         tilt_diagnostics: Dict[str, float] = {}
         tilt_method = "tilt_not_requested"
-        if anchor_z_mode == "tilt":
+        if gravity_level:
+            # The cloud is already level; a tilt fitted to GPS altitude would only add that
+            # altitude's own error back.
+            anchor_method = f"{anchor_method}+gravity"
+        elif anchor_z_mode == "tilt":
             placed = _apply_transform(transform, traj_xyz)
             levelling, tilt_method, tilt_diagnostics = _level_transform(
                 placed,
@@ -2947,6 +4066,9 @@ def slam_raw_to_gps_anchored_las(
             **tilt_diagnostics,
             "pose_spikes_repaired": spike_records,
             "pose_steps_unrepaired": len(spike_steps),
+            "loop_closure": bool(loop_closure),
+            **loop_diagnostics,
+            **gravity_diagnostics,
         }
 
         time_offset = _estimate_gps_time_offset(slam_t, slam_xy, gps_t, gps_e, gps_n)
@@ -2990,11 +4112,21 @@ def slam_raw_to_gps_anchored_las(
         # was fitted.
         pose_cols = transform @ pose_local
 
+        point_warp = None
+        if gravity_level:
+            # The scans are placed with the poses SLAM drew them with, then moved by place.
+            to_levelled, stations = _gravity_place_warp(pose_ts, pose_unlevelled, pose_local)
+            qa_extra["gravity_stations"] = stations
+
+            def point_warp(points: np.ndarray, times_s: np.ndarray) -> np.ndarray:
+                return _apply_transform(transform, to_levelled(points, times_s))
+
         _emit(emit_event, "status", message="Extracting point cloud from raw replay with anchored poses...")
         map_points, map_attrs, pose_lookup = _build_point_cloud_from_raw_with_poses(
             raw_paths,
             pose_timestamps_ns=pose_ts,
-            column_poses=pose_cols,
+            column_poses=pose_unlevelled if gravity_level else pose_cols,
+            point_warp=point_warp,
             min_range=min_range,
             max_range=max_range,
             reflectivity_filter=reflectivity_filter,
@@ -3087,6 +4219,8 @@ def slam_raw_to_gps_anchored_las(
             "qa_z_rmse_m": qa_metrics["z_rmse_m"],
             "output_osf": output_osf,
             "output_osf_kind": "local_slam_unanchored",
+            "loop_closure": bool(loop_closure),
+            **loop_diagnostics,
         }
     except Exception:
         if osf_writer is not None:
@@ -3095,6 +4229,8 @@ def slam_raw_to_gps_anchored_las(
             os.remove(tmp_output)
         if tmp_output_osf and os.path.exists(tmp_output_osf):
             os.remove(tmp_output_osf)
+        if loop_temp_dir:
+            shutil.rmtree(loop_temp_dir, ignore_errors=True)
         raise
 
 
@@ -3923,6 +5059,66 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Reject a fitted tilt larger than this rather than applying it.",
     )
     parser.add_argument(
+        "--loop-closure",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "rigid_fit only: where the route revisits a place, register the two "
+            "visits and remove SLAM's drift before placing the cloud. A route with "
+            "no revisit comes out as it would without this."
+        ),
+    )
+    parser.add_argument(
+        "--loop-radius-m",
+        type=float,
+        default=10.0,
+        help=(
+            "A later key frame this close to an earlier one's, once the local maps' "
+            "closure is applied, counts as a revisit."
+        ),
+    )
+    parser.add_argument(
+        "--loop-min-separation-m",
+        type=float,
+        default=50.0,
+        help="Distance along the path that must separate the two visits.",
+    )
+    parser.add_argument(
+        "--loop-debug-dir",
+        default=None,
+        help="Save each revisit's two submaps and registration here, for offline inspection.",
+    )
+    parser.add_argument(
+        "--loop-every-m",
+        type=float,
+        default=10.0,
+        help="Spacing of loop constraints along the revisiting stretch.",
+    )
+    parser.add_argument(
+        "--loop-rotation-weight",
+        type=float,
+        default=100.0,
+        help="Pose graph weight on SLAM's rotation between key frames. Raising it spreads the "
+        "correction less into rotation and more into translation.",
+    )
+    parser.add_argument(
+        "--gravity-level",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "rigid_fit only: keep the trajectory's up on the lidar's accelerometer along the "
+            "route, after loop closure. Replaces the tilt fitted to GPS altitude."
+        ),
+    )
+    parser.add_argument(
+        "--gravity-sensor-offset-deg",
+        type=float,
+        nargs=2,
+        default=list(GRAVITY_SENSOR_OFFSET_DEG),
+        metavar=("X", "Y"),
+        help="The accelerometer's fixed offset in the sensor's x and y axes.",
+    )
+    parser.add_argument(
         "--anchor-backend",
         choices=["pose_optimizer", "rigid_fit"],
         default="pose_optimizer",
@@ -4183,6 +5379,14 @@ def run_from_args(
                 anchor_z_mode=args.anchor_z_mode,
                 anchor_tilt_min_span_m=args.anchor_tilt_min_span_m,
                 anchor_tilt_max_deg=args.anchor_tilt_max_deg,
+                loop_closure=args.loop_closure,
+                loop_radius_m=args.loop_radius_m,
+                loop_min_separation_m=args.loop_min_separation_m,
+                loop_every_m=args.loop_every_m,
+                loop_rotation_weight=args.loop_rotation_weight,
+                gravity_level=args.gravity_level,
+                gravity_sensor_offset_deg=tuple(args.gravity_sensor_offset_deg),
+                loop_debug_dir=args.loop_debug_dir,
                 reflectivity_filter=(args.reflectivity_filter == "on"),
                 min_reflectivity=args.min_reflectivity,
                 map_voxel_size=args.poseopt_map_voxel_size,
