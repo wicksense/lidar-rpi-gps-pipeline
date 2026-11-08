@@ -17,6 +17,8 @@
 ouster-sdk==0.16.2
 
 laspy==2.7.0
+# Reads and writes .laz: the airborne lidar tiles are compressed.
+lazrs==0.8.2
 numpy==1.26.4
 pandas==3.0.5
 pyproj==3.7.2

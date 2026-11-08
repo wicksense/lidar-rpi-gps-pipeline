@@ -13,7 +13,8 @@ the folder name (`YYYYMMDD_hhmmss`). The steps, as in TUNING.md:
 5. acceptance checks (limits in VALIDATION.md).
 
 Output folders under `--output-dir`: `fused/<S>/`, `placed/`, `aligned/`, `final/` (the clouds
-to use) and `checks/` (CHECKS.md). A step whose output is already there is skipped, so a
+to use, overlap flagged), `no_overlap/` (the same without the flagged points, for the
+classification pipeline) and `checks/` (CHECKS.md). A step whose output is already there is skipped, so a
 stopped run continues where it stopped; delete a step's folder to redo it.
 """
 
@@ -145,7 +146,8 @@ def main(argv: Optional[List[str]] = None) -> None:
     final = os.path.join(out, "final")
     if not os.path.exists(os.path.join(final, "overlap_flags.json")):
         os.makedirs(final, exist_ok=True)
-        run(["flag_overlap.py", "--las"] + aligned_las + ["--output-dir", final], os.path.join(out, "flag_overlap.log"), a.threads)
+        run(["flag_overlap.py", "--las"] + aligned_las + ["--output-dir", final, "--unflagged-dir", os.path.join(out, "no_overlap")],
+            os.path.join(out, "flag_overlap.log"), a.threads)
         if len(sessions) > 1:
             shutil.copy2(os.path.join(aligned, "drive_alignment.json"), os.path.join(final, "drive_alignment.json"))
     log("overlap flags set")

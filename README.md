@@ -151,6 +151,47 @@ For the I2C/PPS GNSS stack used by the setup helper:
 - `i2c-tools`
 - `linuxptp`
 
+## Processing new drives on a new machine
+
+Everything needed is in this repository except the airborne lidar, which is downloaded
+by hand. Tested end to end only on Linux (the lab workstation, 32 cores, 123 GB RAM):
+seven drives, about 44 minutes of capture, took 7.2 h.
+
+1. **Environment** (Python 3.11):
+
+   ```bash
+   python3 -m venv .venv && source .venv/bin/activate
+   python -m pip install -r requirements-offline.txt
+   python -m pip install --no-deps map-closures==2.2.0
+   ```
+
+2. **Airborne lidar.** From the TxGIO DataHub (data.geographic.texas.gov), collection
+   *StratMap 2021 28cm-50cm Bexar & Travis*, download by hand the quads that cover the
+   drives; the site refuses scripted downloads. TxGIO's lidar index shows which quad
+   covers which streets. Then convert them once (feet and Texas State Plane to UTM metres,
+   ground and buildings only); the zips can be given as downloaded:
+
+   ```bash
+   python3 prepare_airborne_tiles.py --input <downloaded zips or folder> --output-dir airborne_utm14_m/
+   ```
+
+3. **Drives.** Copy each session from the Pi as it is: one folder per drive, named
+   `YYYYMMDD_hhmmss`, holding its `raw_lidar_*.pcap` files and `raw_gps_*.csv`.
+
+4. **Run** (in `tmux` or `screen`, since it takes hours):
+
+   ```bash
+   python3 process_drives.py --drives input/20261115_093000 input/20261115_094500 \
+     --tiles airborne_utm14_m/ --output-dir out/20261115/
+   ```
+
+   Use `out/20261115/final/`, the clouds with streets covered twice flagged, or
+   `out/20261115/no_overlap/`, the same without the flagged points, for the
+   classification pipeline. Read `out/20261115/checks/CHECKS.md` against the limits in
+   `VALIDATION.md`. If the run stops, run the same command again: finished steps are skipped.
+
+The steps and their settings are explained in `TUNING.md` ("After fusion").
+
 ## Offline fusion environment
 
 Create and activate a venv on the offline machine:

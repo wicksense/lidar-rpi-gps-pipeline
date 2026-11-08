@@ -15,7 +15,9 @@ of a crown.
 - Run after `drive_alignment`: before it, the passes of different drives are metres apart.
 
 Writes each input cloud, flags set, with its sidecar files to the output folder and
-`overlap_flags.json` there; the inputs are not touched.
+`overlap_flags.json` there; the inputs are not touched. With `--unflagged-dir`, also
+writes copies holding only the unflagged points, for tools that read every point (the
+classification pipeline); `--unflagged-only` makes just those copies from flagged clouds.
 """
 
 from __future__ import annotations
@@ -102,14 +104,43 @@ def flag_overlaps(las_paths: Sequence[str], out_dir: str, *, cell_m: float = CEL
     return report
 
 
+def write_unflagged(las_paths: Sequence[str], out_dir: str) -> Dict[str, int]:
+    """Copy each flagged cloud with its overlap-flagged points left out, for tools that cannot skip them."""
+    if os.path.abspath(out_dir) in {os.path.abspath(os.path.dirname(p)) for p in las_paths}:
+        raise ValueError("The output folder must differ from the inputs' folders; the inputs are not overwritten.")
+    os.makedirs(out_dir, exist_ok=True)
+    kept = {}
+    for p in las_paths:
+        las = laspy.read(p)
+        keep = ~np.asarray(las.overlap, dtype=bool)
+        las.points = las.points[keep]
+        las.write(os.path.join(out_dir, os.path.basename(p)))
+        for suffix in SIDECARS:
+            side = p[:-4] + suffix
+            if os.path.exists(side):
+                shutil.copy2(side, os.path.join(out_dir, os.path.basename(side)))
+        name = os.path.splitext(os.path.basename(p))[0]
+        kept[name] = int(keep.sum())
+        log(f"{name}: {keep.sum():,} of {len(keep):,} points kept")
+        del las
+    return kept
+
+
 def main(argv: Optional[List[str]] = None) -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0].strip(), formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--las", required=True, nargs="+", help="aligned clouds, with gps_time and range_m")
     ap.add_argument("--output-dir", required=True)
     ap.add_argument("--cell-m", type=float, default=CELL_M, help="size of the squares in which one pass is kept")
     ap.add_argument("--gap-s", type=float, default=GAP_S, help="time gap that starts a new pass of the same drive")
+    ap.add_argument("--unflagged-dir", help="also write copies without the flagged points here")
+    ap.add_argument("--unflagged-only", action="store_true", help="the inputs are flagged already: only write the copies")
     a = ap.parse_args(argv)
-    flag_overlaps(a.las, a.output_dir, cell_m=a.cell_m, gap_s=a.gap_s)
+    flagged = a.las
+    if not a.unflagged_only:
+        report = flag_overlaps(a.las, a.output_dir, cell_m=a.cell_m, gap_s=a.gap_s)
+        flagged = [d["output_las"] for d in report["drives"].values()]
+    if a.unflagged_dir or a.unflagged_only:
+        write_unflagged(flagged, a.unflagged_dir or a.output_dir)
 
 
 if __name__ == "__main__":

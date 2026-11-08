@@ -87,6 +87,9 @@ def read_corridor(
     lo, hi = track.mins - radius, track.maxes + radius
     for path in paths:
         with laspy.open(path) as f:
+            mins, maxs = f.header.mins[:2] + shift[:2], f.header.maxs[:2] + shift[:2]
+            if (maxs < lo).any() or (mins > hi).any():
+                continue  # a tile away from the route: a whole downloaded quad can be given
             for chunk in f.chunk_iterator(5_000_000):
                 x, y = np.asarray(chunk.x) + shift[0], np.asarray(chunk.y) + shift[1]
                 box = (x >= lo[0]) & (x <= hi[0]) & (y >= lo[1]) & (y <= hi[1])

@@ -33,6 +33,26 @@ def test_two_drives_and_a_square_seen_once() -> None:
     assert flagged.tolist() == [False, False, True, True, False, False]
 
 
+def test_unflagged_copy_holds_only_the_kept_points(tmp_path) -> None:
+    import laspy
+
+    from lidar_rpi_gps_pipeline.jobs.overlap_flags import write_unflagged
+
+    las = laspy.LasData(laspy.LasHeader(point_format=6, version="1.4"))
+    las.x, las.y, las.z = np.arange(4.0), np.zeros(4), np.zeros(4)
+    las.overlap = np.array([False, True, False, True])
+    src_dir = tmp_path / "final"
+    src_dir.mkdir()
+    las.write(str(src_dir / "drive.las"))
+    (src_dir / "drive_trajectory.csv").write_text("t\n")
+
+    kept = write_unflagged([str(src_dir / "drive.las")], str(tmp_path / "no_overlap"))
+
+    out = laspy.read(str(tmp_path / "no_overlap" / "drive.las"))
+    assert kept == {"drive": 2} and np.asarray(out.x).tolist() == [0.0, 2.0]
+    assert (tmp_path / "no_overlap" / "drive_trajectory.csv").exists()
+
+
 def test_a_continuous_pass_is_not_split() -> None:
     xy = np.zeros((50, 2)) + 0.5
     times = np.arange(50, dtype=float)  # one pass, 1 s steps

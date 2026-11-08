@@ -453,7 +453,11 @@ python3 process_drives.py --drives input/20261028_101153 input/20261028_101705 .
   --tiles <StratMap 2021 tiles covering every drive> --output-dir out/<name>/
 ```
 
-The clouds to use land in `final/`, the checks in `checks/CHECKS.md`. A step whose output
+The clouds to use land in `final/` (flagged) and `no_overlap/` (flagged points left out,
+for the classification pipeline, which reads every point), the checks in
+`checks/CHECKS.md`. The airborne tiles must first be converted once with
+`prepare_airborne_tiles.py` (StratMap comes in Texas State Plane feet); see the README's
+"Processing new drives on a new machine". A step whose output
 exists is skipped, so a stopped run is resumed by running the same command. Seven drives
 of 2026-10-28 took 7.2 h on housed-lab-2. Fusion is not bit-for-bit repeatable: a rerun
 gave the same QA to the centimetre and point counts within 0.3 %, and the alignment and
