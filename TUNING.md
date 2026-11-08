@@ -445,6 +445,20 @@ these has one.
 Since 2026-11-05 every fused cloud (`rigid_fit`, `--gravity-level`) goes through four more
 steps. GPS only gives a first position; the position delivered comes from airborne lidar.
 
+`process_drives.py` runs everything, fusion included, in one command (in the env with
+map-closures). It takes one folder per drive, named `YYYYMMDD_hhmmss` as copied from the Pi:
+
+```bash
+python3 process_drives.py --drives input/20261028_101153 input/20261028_101705 ... \
+  --tiles <StratMap 2021 tiles covering every drive> --output-dir out/<name>/
+```
+
+The clouds to use land in `final/`, the checks in `checks/CHECKS.md`. A step whose output
+exists is skipped, so a stopped run is resumed by running the same command. Seven drives
+of 2026-10-28 took 7.2 h on housed-lab-2. Fusion is not bit-for-bit repeatable: a rerun
+gave the same QA to the centimetre and point counts within 0.3 %, and the alignment and
+checks moved by a few centimetres. The steps one by one:
+
 ```bash
 python3 place_on_airborne.py --las <fused.las> --trajectory <fused>_trajectory.csv \
   --tiles <StratMap 2021 tiles> --epoch 2026.82 --output-dir placed/      # one per drive
