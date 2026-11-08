@@ -22,6 +22,10 @@ new machine.
 > - Section 5 predates loop closure, which `rigid_fit` now runs by default and which
 >   needs `map-closures`; see "Removing drift where a route revisits itself" in
 >   `TUNING.md`.
+> - Fusion is no longer the last step. Since 2026-11-05 the clouds are placed on
+>   airborne lidar, aligned with each other and flagged where streets are covered
+>   twice. `process_drives.py` runs all of it, fusion included, from raw capture;
+>   see "After fusion" in `TUNING.md`, and `VALIDATION.md` for the acceptance limits.
 >
 > **The repo defaults are known to produce unusable output.** Start from the
 > recommended invocation in `TUNING.md`, not from the defaults.

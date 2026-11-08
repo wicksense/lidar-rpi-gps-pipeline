@@ -103,8 +103,8 @@ What matters vs what does not:
    - one GPS CSV log
    - one capture manifest JSON
 3. Move files to an offline machine
-4. Run `offline_fuse_lidar_gps.py` to process into mapping output
-5. Get output `.las` (single merged file by default)
+4. Run `process_drives.py` on the drive folders. It fuses each drive (`offline_fuse_lidar_gps.py`), places it on airborne lidar, aligns the drives with each other, flags streets covered twice and writes the acceptance checks; see "After fusion" in `TUNING.md`
+5. Get one `.las` per drive in `final/`, with `checks/CHECKS.md`
 
 ## Repository Layout
 
@@ -115,7 +115,9 @@ What matters vs what does not:
 - `pi_gps_ptp_diagnostic.sh`: helper to verify I2C, PPS, chrony, PTP, and optional Ouster HTTP timing state
 - `ublox_i2c_chrony_bridge.py`: helper service that feeds UTC time from I2C GNSS into `chrony`'s SOCK refclock and publishes the latest decoded GPS fix for `pi_capture_ptp.py`
 - `systemd/pi-capture-web.service`: example `systemd` unit for starting the web UI automatically on boot
+- `process_drives.py`: one command from raw drives to finished, checked clouds (runs the five below)
 - `offline_fuse_lidar_gps.py`: offline processing (GPS fusion + SLAM map)
+- `place_on_airborne.py`, `align_drives.py`, `flag_overlap.py`, `check_drives.py`: the steps after fusion
 - `offline_gui.py`: desktop GUI launcher (MVP scaffold)
 - `src/lidar_rpi_gps_pipeline/`: package scaffold for modularization
 
