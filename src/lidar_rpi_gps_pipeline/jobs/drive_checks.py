@@ -264,6 +264,8 @@ def render_markdown(report: Dict[str, object]) -> str:
               f"Median horizontal disagreement where two drives cover the same streets (limit {L['between_drives_m']} m; "
               f"pairs with fewer than {report['min_clear_squares']} clear squares are not judged).", "",
               "| drives | median | within 0.5 m | clear / shared squares | verdict |", "|---|---|---|---|---|"]
+    if not report["between"]:
+        lines.append("| no two drives cover the same streets | - | - | - | not judged |")
     for pair, r in report["between"].items():
         med = f"{r['median_m']:.2f} m" if "median_m" in r else "-"
         w = f"{r['within_0p5']:.0%}" if "within_0p5" in r else "-"

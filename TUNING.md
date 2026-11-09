@@ -461,7 +461,12 @@ for the classification pipeline, which reads every point), the checks in
 exists is skipped, so a stopped run is resumed by running the same command. Seven drives
 of 2026-10-28 took 7.2 h on housed-lab-2. Fusion is not bit-for-bit repeatable: a rerun
 gave the same QA to the centimetre and point counts within 0.3 %, and the alignment and
-checks moved by a few centimetres. The steps one by one:
+checks moved by a few centimetres. Since 2026-11-08: the steps over all drives (alignment,
+flags, checks) record their drives in `drives.txt`, and a run with a different set in the same
+output folder (a drive added) removes and redoes them, keeping fusion and placement; before,
+they were silently skipped and kept the old set. A drive that cannot be placed on the airborne
+lidar is left out and listed in `skipped_drives.txt`, the rest are finished, and the command
+exits with 2; before, the whole run stopped. The steps one by one:
 
 ```bash
 python3 place_on_airborne.py --las <fused.las> --trajectory <fused>_trajectory.csv \
@@ -478,15 +483,27 @@ python3 check_drives.py --las aligned/*.las --placement-dir placed/ --output-dir
   rest are weighted down (`--robust-m 0.3`). Weighting all squares alike left 101705 and
   102349, which meet only at a bare junction, 1.1-1.6 m apart; with it, 0.40 m. Median over
   all held-out squares 0.13 m. The squares measured at the overpass junction of 104427 and
-  105703 stay 1.5-2 m apart and are set aside.
+  105703 stay 1.5-2 m apart and are set aside. A drive that shares no measured square with
+  any other is not moved and is listed under `unlinked_drives` in `drive_alignment.json`; it
+  relies on placement alone, which left the 2026-10-28 drives 1.13 m apart (median) before
+  alignment. Drives that share no street at all are written through unchanged (until
+  2026-11-08 the step stopped with "No two drives share a square").
 - **Streets covered twice** (`jobs/overlap_flags.py`). Within one drive (it comes back) and
   between drives alike: in every 2 m square, the pass that saw it from closest (smallest mean
   `range_m`) is kept, and every other pass's points there get the LAS overlap flag. A pass is
   one drive's points in the square with no time gap over 60 s. Nothing is deleted.
-  Classification skips flagged points, so each place is classified from one copy and a tree is
-  not counted twice. Where the kept pass changes from one drive to another, a tree on the seam
-  can be split between two files: when totalling trees, merge trees of different drives
-  closer than 1 m. Never remove overlap before alignment; the overlap is what aligns the drives.
+  Classify the `no_overlap/` clouds (flagged points left out), so each place is classified from
+  one copy. Where the kept pass changes from one drive to another, a tree on the seam is split
+  between two files; trees are therefore counted on the classified drives merged, by
+  `urban-pointcloud-analysis` (`run_trees.py`), not drive by drive. Merging tree lists of
+  different drives afterwards does not work: the two halves' tops lie metres apart, and a half
+  crown can be too small to count at all (until 2026-11-08 this file said to merge trees closer
+  than 1 m). Never remove overlap before alignment; the overlap is what aligns the drives.
+  The squares are in plan: where a drive passes over another road (a bridge), the level seen by
+  the farther pass would be flagged as a whole. No such place in 2026-10-28: no two passes come
+  within 5 m in plan at more than 4 m difference in height (checked 2026-11-08). The 104427 /
+  105703 junction set aside above lies under an elevated road, but both drives were at road
+  level there (heights within 0.2 m); the cause of their 0.9-3 m disagreement is not known.
 - **Checks**: limits in `VALIDATION.md`.
 
 ## Regression baseline

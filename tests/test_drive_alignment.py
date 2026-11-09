@@ -105,3 +105,47 @@ def test_solve_gives_both_passes_of_a_drive_the_same_shift() -> None:
     way_out = out_and_back.shift_at(nodes[0], np.array([200.0]))[0]
     way_back = out_and_back.shift_at(nodes[0], np.array([799.0]))[0]
     np.testing.assert_allclose(way_out, way_back, atol=0.1)
+
+
+def test_solve_leaves_a_drive_with_no_shared_square_where_it_was() -> None:
+    drives = [_Route(500.0), _Route(500.0), _Route(300.0)]
+    rows = _rows(np.arange(10.0, 490.0, 10.0), (0.0, 2.0))
+
+    nodes, _ = solve(drives, rows, smooth_m=0.5, prior_m=3.0)
+
+    np.testing.assert_allclose(nodes[2], 0.0, atol=1e-9)
+
+
+def _write_drive(folder, name: str, east: float) -> str:
+    import laspy
+    import pandas as pd
+
+    t = np.arange(0.0, 200.0, 1.0)
+    pd.DataFrame(dict(time_s=t, x=np.full(len(t), east), y=t)).to_csv(folder / f"{name}_trajectory.csv", index=False)
+    rng = np.random.default_rng(0)
+    las = laspy.LasData(laspy.LasHeader(point_format=6, version="1.4"))
+    n = 2000
+    las.header.scales = [0.01, 0.01, 0.01]
+    las.x, las.y, las.z = east + rng.uniform(-5, 5, n), rng.uniform(0, 200, n), rng.uniform(0, 3, n)
+    las.gps_time = rng.uniform(0, 200, n)
+    path = str(folder / f"{name}.las")
+    las.write(path)
+    return path
+
+
+def test_drives_that_share_no_street_are_written_through_unchanged(tmp_path) -> None:
+    import laspy
+
+    from lidar_rpi_gps_pipeline.jobs.drive_alignment import align_drives
+
+    placed = tmp_path / "placed"
+    placed.mkdir()
+    paths = [_write_drive(placed, "a", 500000.0), _write_drive(placed, "b", 505000.0)]
+
+    report = align_drives(paths, str(tmp_path / "aligned"))
+
+    assert report["unlinked_drives"] == ["a", "b"]
+    for p in paths:
+        before, after = laspy.read(p), laspy.read(str(tmp_path / "aligned" / os.path.basename(p)))
+        np.testing.assert_array_equal(np.asarray(before.X), np.asarray(after.X))
+    assert (tmp_path / "aligned" / "drive_alignment.json").exists()

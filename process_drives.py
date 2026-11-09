@@ -8,7 +8,7 @@ the folder name (`YYYYMMDD_hhmmss`). The steps, as in TUNING.md:
 
 1. fusion: SLAM with loop closure, rigid fit to GPS, gravity levelling, export voxel 0.1 m;
 2. placement on the airborne lidar tiles, one rigid shift per drive;
-3. alignment between drives that share streets;
+3. alignment between drives that share streets (a drive that shares none is left as placed);
 4. overlap flags on streets covered more than once;
 5. acceptance checks (limits in VALIDATION.md).
 
@@ -16,6 +16,14 @@ Output folders under `--output-dir`: `fused/<S>/`, `placed/`, `aligned/`, `final
 to use, overlap flagged), `no_overlap/` (the same without the flagged points, for the
 classification pipeline) and `checks/` (CHECKS.md). A step whose output is already there is skipped, so a
 stopped run continues where it stopped; delete a step's folder to redo it.
+
+The steps that use all drives together (alignment, flags, checks) belong to one set of drives, recorded in
+`drives.txt`. Run again with a different set in the same output folder, for instance with a drive added, and those
+folders are removed and redone; fusion and placement of the drives already done are kept.
+
+A drive that cannot be placed on the airborne lidar (outside the tiles given, or no building or road to fit to) is
+left out with its reason in the log and in `skipped_drives.txt`; the other drives are finished, and the command then
+exits with code 2.
 """
 
 from __future__ import annotations
@@ -96,16 +104,57 @@ def fuse(drive_dir: str, out: str, threads: int) -> None:
     log(f"{s}: fused")
 
 
-def place(s: str, out: str, tiles: List[str], epoch: float, threads: int) -> None:
+def place(s: str, out: str, tiles: List[str], epoch: float, threads: int) -> Optional[str]:
+    """Places one drive; returns None, or why it could not be placed (the last line of its log)."""
     d = os.path.join(out, "placed")
     if os.path.exists(os.path.join(d, stem(s) + "_placement.json")):
         log(f"{s}: placed already")
-        return
+        return None
     os.makedirs(d, exist_ok=True)
     src = os.path.join(out, "fused", s, stem(s))
-    run(["place_on_airborne.py", "--las", src + ".las", "--trajectory", src + "_trajectory.csv", "--tiles"] + tiles
-        + ["--epoch", str(epoch), "--output-dir", d], os.path.join(d, f"{s}.log"), threads)
+    log_path = os.path.join(d, f"{s}.log")
+    try:
+        run(["place_on_airborne.py", "--las", src + ".las", "--trajectory", src + "_trajectory.csv", "--tiles"] + tiles
+            + ["--epoch", str(epoch), "--output-dir", d], log_path, threads)
+    except RuntimeError:
+        with open(log_path) as fh:
+            lines = [ln.strip() for ln in fh if ln.strip()]
+        reason = lines[-1] if lines else "no output"
+        log(f"{s}: NOT PLACED, left out: {reason}")
+        return reason
     log(f"{s}: placed")
+    return None
+
+
+COMBINED_STEPS = ("aligned", "final", "no_overlap", "checks")
+
+
+def drives_of_previous_run(out: str) -> Optional[List[str]]:
+    """The drives the all-drive steps in `out` were made from: `drives.txt`, or for a folder made before it existed, the
+    drives in `final/`. None when those steps have not run."""
+    record = os.path.join(out, "drives.txt")
+    if os.path.exists(record):
+        with open(record) as fh:
+            return sorted(ln.strip() for ln in fh if ln.strip())
+    final = os.path.join(out, "final")
+    if os.path.isdir(final):
+        found = [re.fullmatch(r"geo_raw_lidar_(\d{8}_\d{6})_chunk0000_merged\.las", f) for f in os.listdir(final)]
+        return sorted(m.group(1) for m in found if m)
+    return None
+
+
+def start_drive_set(out: str, sessions: List[str]) -> None:
+    """Removes the all-drive steps when they were made from other drives, and records the drives they are now for."""
+    previous = drives_of_previous_run(out)
+    if previous is not None and previous != sorted(sessions):
+        log(f"drives changed ({', '.join(previous) or 'none'} -> {', '.join(sorted(sessions))}): "
+            f"redoing alignment, flags and checks")
+        for name in COMBINED_STEPS:
+            shutil.rmtree(os.path.join(out, name), ignore_errors=True)
+        if os.path.exists(os.path.join(out, "flag_overlap.log")):
+            os.remove(os.path.join(out, "flag_overlap.log"))
+    with open(os.path.join(out, "drives.txt"), "w") as fh:
+        fh.write("\n".join(sorted(sessions)) + "\n")
 
 
 def main(argv: Optional[List[str]] = None) -> None:
@@ -129,7 +178,18 @@ def main(argv: Optional[List[str]] = None) -> None:
     with ThreadPoolExecutor(a.jobs) as pool:
         list(pool.map(lambda d: fuse(d, out, per_job), a.drives))
     with ThreadPoolExecutor(a.jobs) as pool:
-        list(pool.map(lambda s: place(s, out, a.tiles, epoch, per_job), sessions))
+        reasons = list(pool.map(lambda s: place(s, out, a.tiles, epoch, per_job), sessions))
+    skipped = {s: r for s, r in zip(sessions, reasons) if r}
+    skipped_path = os.path.join(out, "skipped_drives.txt")
+    if skipped:
+        with open(skipped_path, "w") as fh:
+            fh.write("".join(f"{s}: not placed on the airborne lidar: {r} (see placed/{s}.log)\n" for s, r in skipped.items()))
+    elif os.path.exists(skipped_path):
+        os.remove(skipped_path)
+    sessions = [s for s in sessions if s not in skipped]
+    if not sessions:
+        raise SystemExit("No drive could be placed on the airborne lidar; see placed/*.log")
+    start_drive_set(out, sessions)
 
     placed = [os.path.join(out, "placed", stem(s) + ".las") for s in sessions]
     aligned = os.path.join(out, "aligned")
@@ -158,6 +218,9 @@ def main(argv: Optional[List[str]] = None) -> None:
         run(["check_drives.py", "--las"] + [os.path.join(final, stem(s) + ".las") for s in sessions] + ["--output-dir", checks],
             os.path.join(checks, "run.log"), a.threads)
     log(f"checks written to {os.path.join(checks, 'CHECKS.md')}; finished in {(time.time() - t0) / 3600:.1f} h")
+    if skipped:
+        log(f"{len(skipped)} drive(s) left out, see {skipped_path}: {', '.join(skipped)}")
+        sys.exit(2)
 
 
 if __name__ == "__main__":

@@ -30,6 +30,10 @@ along its route so that they agree where they overlap. Heights are not touched.
 A quarter of the shared squares, chosen by place, are left out of the solve and
 scored before and after, as a check on squares the solve did not see.
 
+A drive that shares no measured square with any other is not moved; it stays where the
+airborne placement put it, and `drive_alignment.json` lists it under `unlinked_drives`. When
+no two drives share a square, every drive is written through unchanged.
+
 Writes `<stem>.las` and `<stem>_trajectory.csv` per drive to the output folder and
 `drive_alignment.json` there; the inputs are not touched.
 """
@@ -320,15 +324,24 @@ def align_drives(las_paths: Sequence[str], out_dir: str, *, node_m: float = NODE
         log(f"{drives[-1].name}: {len(drives[-1].points):,} points within {radius_m:.0f} m, route {drives[-1].arc[-1]:.0f} m")
     log("measuring shared squares")
     before = measure(drives)
-    if not before:
-        raise ValueError("No two drives share a square that could be measured; nothing to align.")
-    nodes, ties = solve(drives, before, smooth_m, prior_m, robust_m)
-    log(f"solved: {len(before)} squares, {ties} revisit ties within drives")
-    after = measure(drives, [d.shift_at(n, d.point_arc) for d, n in zip(drives, nodes)])
+    used = [r for r in before if not _held_out(r["key"])]
+    linked = {r["a"] for r in used} | {r["b"] for r in used}
+    unlinked = [d.name for i, d in enumerate(drives) if i not in linked]
+    if used:
+        nodes, ties = solve(drives, before, smooth_m, prior_m, robust_m)
+        log(f"solved: {len(before)} squares, {ties} revisit ties within drives")
+        after = measure(drives, [d.shift_at(n, d.point_arc) for d, n in zip(drives, nodes)])
+    else:
+        # Drives that share no street: nothing to measure, so each keeps its airborne placement as it is.
+        log("no two drives share a square that could be measured; every drive keeps its airborne placement")
+        nodes, ties, after = [np.zeros((d.n_nodes, 2)) for d in drives], 0, []
+    if unlinked:
+        # The solve leaves a drive with no shared square where the airborne placement put it (zero shift).
+        log(f"sharing no measured square with another drive, not moved: {', '.join(unlinked)}")
     report: Dict[str, object] = dict(
         inputs=list(las_paths), square_m=SQUARE_M, node_m=node_m, smooth_m=smooth_m, prior_m=prior_m,
         measurement_m=MEASUREMENT_M, radius_m=radius_m, reach_s=REACH_S, self_tie_m=SELF_TIE_M, revisit_ties=ties,
-        robust_m=robust_m,
+        robust_m=robust_m, unlinked_drives=unlinked,
         before=dict(fitted=summary(before, False), held_out=summary(before, True)),
         after=dict(fitted=summary(after, False), held_out=summary(after, True)),
         drives={}, rows_before=before, rows_after=after,
